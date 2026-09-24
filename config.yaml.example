@@ -1,0 +1,42 @@
+# Copy to config.yaml and edit. All components read this via optimizer/config.py.
+project_id: "my-analytics-project"        # project holding optimizer_ops + workload
+ops_dataset: "optimizer_ops"
+regions: ["us"]                            # every region holding your data
+location: "US"                             # ops dataset location
+
+# Scope: JOBS (this project) or JOBS_BY_ORGANIZATION (needs org perms)
+jobs_view: "JOBS"
+
+# Reservation admin project (or null to skip capacity telemetry)
+reservation_admin_project: null
+
+# Enterprise Enterprise Governance & Billing Placeholders:
+# Set to custom tables, or leave null to use optimizer_ops.employee_hierarchy
+employee_hierarchy_table: null
+billing_export_table: null
+
+# Executor
+executor:
+  enable_class1: true
+  enable_class2: false          # phase 3
+  enable_class3: false          # phase 4 — keep off until rehearsed on scratch data
+  change_window_utc: [3, 9]     # applies allowed between 03:00-09:00 UTC
+  backup_hold_days: 7
+  max_structural_changes_per_table_per_days: 7
+
+# Approvals
+approval_ttl_days: 14
+evidence_stale_days: 45
+
+# Verification
+verify_window_days: 14
+regression_pct: 15.0
+min_family_execs: 20
+min_regressed_families: 3
+
+# Scoring
+amortization_months: 12
+risk_weights: {1: 1.0, 2: 1.3, 3: 2.0, 4: 1.5}
+
+# Slack webhook for notifications (optional)
+slack_webhook: null

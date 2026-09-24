@@ -1,0 +1,13 @@
+.git
+.gitignore
+*.md
+*.ipynb
+*.tar.gz
+__pycache__
+*.pyc
+.venv/
+.venv-bq/
+tests/
+terraform/
+!config.yaml
+!config.yaml.example

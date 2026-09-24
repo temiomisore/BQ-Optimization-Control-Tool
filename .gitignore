@@ -1,0 +1,28 @@
+# Local configuration (copy config.yaml.example -> config.yaml)
+config.yaml
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv
+.venv/
+.venv*
+venv/
+ENV/
+env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs & temporary files
+*.log
+*.sqlite
+.DS_Store
+*.metadata.json
+*.jar
+
+
