@@ -1493,28 +1493,35 @@ def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
 
 
 def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding]) -> list[Finding]:
-    """Engine 3: Vertex AI Gemini Schema-Aware SQL Judge + BigQuery Dry-Run Verifier."""
+    """Engine 3: Vertex AI Gemini 3 Schema-Aware SQL Judge + BigQuery Dry-Run Verifier."""
     ai_cfg = c.get("ai_judge", {})
     if not ai_cfg.get("enabled", True):
         return []
 
-    model_name = ai_cfg.get("model", "gemini-2.5-flash")
+    model_name = ai_cfg.get("model", "gemini-3-flash-preview")
     proj = c.get("project_id", "temi-project-408005")
 
     try:
         from google import genai
         from google.genai import types
+        creds = None
         try:
             from google.oauth2.credentials import Credentials
             res = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True, timeout=5)
             lines = [line.strip() for line in res.stdout.strip().split("\n") if line.strip()]
             token = next((l for l in lines if l.startswith("ya29.")), None)
             if token:
-                client = genai.Client(vertexai=True, project=proj, location="us-central1", credentials=Credentials(token))
-            else:
-                client = genai.Client(vertexai=True, project=proj, location="us-central1")
+                creds = Credentials(token)
         except Exception:
-            client = genai.Client(vertexai=True, project=proj, location="us-central1")
+            creds = None
+
+        def _make_client(loc: str):
+            if creds:
+                return genai.Client(vertexai=True, project=proj, location=loc, credentials=creds)
+            return genai.Client(vertexai=True, project=proj, location=loc)
+
+        client_global = _make_client("global")
+        client_regional = _make_client("us-central1")
     except Exception:
         return []
 
@@ -1565,14 +1572,31 @@ Respond strictly in JSON format with keys:
 "estimated_savings_ratio" (number between 0.15 and 0.85)."""
 
         try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
+            gen_cfg = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
             )
+            resp = None
+            active_model = model_name
+            for cand_model, cand_client in [
+                (model_name, client_global if model_name.startswith("gemini-3") else client_regional),
+                ("gemini-3-flash-preview", client_global),
+                ("gemini-3.1-pro-preview", client_global),
+                ("gemini-2.5-flash", client_regional),
+            ]:
+                try:
+                    resp = cand_client.models.generate_content(
+                        model=cand_model,
+                        contents=prompt,
+                        config=gen_cfg,
+                    )
+                    active_model = cand_model
+                    break
+                except Exception:
+                    continue
+            if resp is None:
+                continue
+            model_name = active_model
             data = json.loads(resp.text or "{}")
             if not data.get("has_antipattern") or not data.get("optimized_sql"):
                 continue

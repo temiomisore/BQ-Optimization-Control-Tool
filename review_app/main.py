@@ -291,7 +291,7 @@ def queue():
 
 @app.post("/api/finops-chat")
 def finops_chat():
-    """Gemini FinOps Copilot endpoint (building-data-apps pattern)."""
+    """Gemini 3 FinOps Copilot endpoint (building-data-apps pattern)."""
     c = cfg()
     payload = request.get_json(silent=True) or {}
     q = (payload.get("question") or "").strip()
@@ -307,7 +307,7 @@ def finops_chat():
     total_mo = sum(float(x.get("net_monthly_value_usd") or 0.0) for x in cards_raw)
     ql = q.lower()
 
-    # Fast, deterministic executive answers for core FinOps questions + Vertex AI Gemini augmentation
+    # Fast, deterministic executive answers for core FinOps questions + Vertex AI Gemini 3 augmentation
     if any(k in ql for k in ("w-02", "service account", "etl", "5,000", "5000", "guardrail", "break", "cap")):
         ans = (
             "🛡️ **How Rule `W-02` (Proactive Cost Guardrail) Protects Your Production ETL Pipelines:**\n\n"
@@ -315,7 +315,7 @@ def finops_chat():
             "2. **👤 Human Analysts Only**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human_adhoc_sandbox_pool`)** so an accidental `SELECT *` without a `WHERE` clause is stopped in 0ms before billing.\n"
             "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise_prod_pool`), guaranteeing **0% pipeline breakage**."
         )
-        return {"answer": ans}, 200
+        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
 
     if any(k in ql for k in ("w-01", "option 1", "option 2", "edition", "slot", "baseline", "autoscale")):
         ans = (
@@ -324,27 +324,48 @@ def finops_chat():
             "• **🏢 Option 1 (100-Slot Baseline + 200 Autoscaling Burst)**: **$3,850.00 / month** → Saves **$5,212.50/mo (58% reduction)**. Best for steady 24/7 enterprise ETL + daytime BI.\n"
             "• **⚡ Option 2 (0-Slot Baseline + Pure Autoscaling 0→300 Slots)**: **$1,170.00 / month** → Saves **$7,892.50/mo (87% reduction)**. Best for spiky or daytime-only workloads with **$0.00 overnight idle cost** and no annual commitment."
         )
-        return {"answer": ans}, 200
+        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
 
     if any(k in ql for k in ("engine", "class 4", "antipattern", "anti-pattern", "three", "zetasql")):
         ans = (
             "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
             "1. **Engine 1 — Fast Regex Pattern Scanner (`C4-01`..`C4-09`)**: Instantly catches obvious anti-patterns (`SELECT *`, `ORDER BY` without `LIMIT`, `WHERE DATE(col) = ...`).\n"
             "2. **Engine 2 — Google Official ZetaSQL AST Compiler (`bigquery-antipattern-recognition.jar`)**: Parses queries into an Abstract Syntax Tree (AST) to catch deep structural issues like CTEs evaluated multiple times and `ROW_NUMBER() = 1` sorts.\n"
-            "3. **Engine 3 — Vertex AI Gemini 2.5 Flash + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
+            "3. **Engine 3 — Vertex AI Gemini 3 Flash (`gemini-3-flash-preview`) + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
         )
-        return {"answer": ans}, 200
+        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
 
     top_lines = "\n".join(
         f"• **{i+1}. `{','.join(x.get('rule_ids') or [])}` on `{x.get('target_dataset')}.{x.get('target_table')}`** — **${float(x.get('net_monthly_value_usd') or 0):,.0f}/mo** (`Class {x.get('apply_class')}`, Owner: {x.get('director_name') or 'Platform'})"
         for i, x in enumerate(top_items)
     )
+    if not any(k in ql for k in ("highest", "top", "roi", "summary", "queue")):
+        try:
+            from google import genai
+            proj = c.get("project_id", "temi-project-408005")
+            sys_ctx = (
+                f"You are the Gemini 3 FinOps Copilot for project {proj}. "
+                f"Total active monthly savings in queue: ${total_mo:,.0f}/mo across {len(cards_raw)} cards. "
+                f"Top items:\n{top_lines}\n"
+                f"Answer the user's question concisely in markdown (max 120 words): {q}"
+            )
+            for cand_model, loc in [("gemini-3-flash-preview", "global"), ("gemini-3.1-pro-preview", "global"), ("gemini-2.5-flash", "us-central1")]:
+                try:
+                    gclient = genai.Client(vertexai=True, project=proj, location=loc)
+                    r = gclient.models.generate_content(model=cand_model, contents=sys_ctx)
+                    if r and r.text:
+                        return {"answer": r.text.strip(), "model": cand_model}, 200
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     ans = (
         f"📊 **Live Queue Executive Summary (`{c.project_id}`)**:\n\n"
         f"• **Total Identified Savings**: **${total_mo:,.0f} / month** (**${total_mo * 12:,.0f} / year**) across **{len(cards_raw)} active recommendations**.\n\n"
         f"**Top 5 Highest-ROI Recommendations Ready for Approval:**\n{top_lines}"
     )
-    return {"answer": ans}, 200
+    return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
 
 
 
