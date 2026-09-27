@@ -40,7 +40,8 @@ def _t(c: Config) -> str:
 def open_sets(c: Config) -> list[dict]:
     return bq.query(c, f"""
         SELECT change_set_id, rule_ids, apply_class, state,
-               target_project, target_dataset, target_table
+               target_project, target_dataset, target_table,
+               ARRAY_LENGTH(IFNULL(approvals, [])) AS n_approvals
         FROM {_t(c)}
         WHERE state IN ('PENDING_REVIEW','APPROVED','SCHEDULED','APPLYING','APPLIED','VERIFYING')
            OR (state IN ('REJECTED', 'ROLLED_BACK') AND snooze_until > CURRENT_TIMESTAMP())
@@ -83,6 +84,28 @@ def recent_structural_change(c: Config, target: tuple, days: int) -> bool:
 # ---------------------------------------------------------------------------
 # Insert
 # ---------------------------------------------------------------------------
+
+def refresh_pending(c: Config, change_set_id: str, f: Finding, actor: str = "rules-engine") -> None:
+    """Refresh evidence/sizing/savings of a PENDING_REVIEW card that nobody has approved yet,
+    so reviewers always see the latest telemetry instead of a stale duplicate-suppressed card."""
+    bq.execute(c, f"""
+        UPDATE {_t(c)} SET
+          finding_summary = @summary, evidence_json = @evidence, proposed_change_json = @proposed,
+          gross_monthly_savings_usd = CAST(@gross AS NUMERIC),
+          net_monthly_value_usd = CAST(@net AS NUMERIC),
+          savings_basis = @basis,
+          state_history = ARRAY_CONCAT(state_history,
+              [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @actor AS actor,
+                      'Evidence refreshed from latest telemetry' AS note)])
+        WHERE change_set_id = @id AND state = 'PENDING_REVIEW'
+          AND ARRAY_LENGTH(IFNULL(approvals, [])) = 0""",
+        {"id": change_set_id, "summary": f.get("finding_summary"),
+         "evidence": bq.dumps(f.get("evidence") or {}),
+         "proposed": bq.dumps(f.get("proposed_change") or {}),
+         "gross": float(f.get("gross_monthly_savings_usd") or 0),
+         "net": float(f.get("net_monthly_value_usd") or 0),
+         "basis": f.get("savings_basis"), "actor": actor})
+
 
 def insert(c: Config, sets: Iterable[Finding], actor: str = "rules-engine") -> int:
     n = 0

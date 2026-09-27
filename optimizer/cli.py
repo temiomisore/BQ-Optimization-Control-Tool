@@ -97,7 +97,21 @@ def cmd_rules(c) -> None:
         scoring.score(f, c, table_spend=spend, table_cv=cv, rule_history=hist)
         f["execution_route"], _ = router.route(c, f.get("target_dataset"), f)
         f["owner_principal"], f["owner_source"] = router.resolve_owner(c, f)
-    sets, notes = compiler.compile(findings, store.open_sets(c))
+    open_sets = store.open_sets(c)
+    # Refresh (not duplicate) W-01 capacity cards still awaiting their first approval
+    refreshed = 0
+    for f in findings:
+        if f.get("rule_id") != "W-01":
+            continue
+        for cs in open_sets:
+            if ("W-01" in (cs.get("rule_ids") or []) and cs.get("state") == "PENDING_REVIEW"
+                    and not cs.get("n_approvals")
+                    and cs.get("target_project") == f.get("target_project")):
+                store.refresh_pending(c, cs["change_set_id"], f)
+                refreshed += 1
+    if refreshed:
+        print(f"[*] Refreshed {refreshed} pending W-01 card(s) with latest slot sizing")
+    sets, notes = compiler.compile(findings, open_sets)
     n = store.insert(c, sets)
     print(f"expired={expired} findings={len(findings)} inserted={n} suppressed={len(notes)}")
     for note in notes:
