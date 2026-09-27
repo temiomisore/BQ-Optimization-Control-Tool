@@ -30,3 +30,4 @@ env/
 # Frontend (built inside Docker)
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
