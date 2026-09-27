@@ -70,15 +70,15 @@ def _default_reviewer() -> str:
     return _CACHED_REVIEWER
 
 
-def _who() -> str:
+def _who(principal: str | None = None) -> str:
     # 1. IAP sets X-Goog-Authenticated-User-Email: accounts.google.com:user@x
     hdr = request.headers.get("X-Goog-Authenticated-User-Email", "")
     if hdr:
         u = hdr.split(":")[-1].strip()
         if u:
             return u
-    # 2. Explicit form submission from UI
-    form_user = request.form.get("principal", "").strip()
+    # 2. Explicit principal (JSON API) or form submission from UI
+    form_user = (principal or request.form.get("principal", "")).strip()
     if form_user:
         return form_user
     # 3. Explicit query parameter
@@ -89,9 +89,8 @@ def _who() -> str:
     return _default_reviewer()
 
 
-@app.get("/")
-def queue():
-    c = cfg()
+def _dashboard_data(c) -> dict:
+    """Everything the review UI shows. Shared by the classic Jinja page and /api/dashboard."""
     try:
         client = bq.client(c)
         client.get_dataset(f"{c['project_id']}.{c['ops_dataset']}")
@@ -292,8 +291,7 @@ def queue():
     except Exception:
         w01 = None
 
-    return render_template(
-        "index.html",
+    return dict(
         w01=w01,
         cards=cards,
         blocked_cards=blocked_cards,
@@ -307,6 +305,89 @@ def queue():
         projects=projects_list,
         datasets=datasets_list,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pages: React SPA at "/", classic Jinja page kept at "/classic"
+# ---------------------------------------------------------------------------
+
+_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
+
+
+@app.get("/classic")
+def queue():
+    return render_template("index.html", **_dashboard_data(cfg()))
+
+
+@app.get("/")
+def home():
+    if os.path.isfile(os.path.join(_DIST, "index.html")):
+        from flask import send_from_directory
+        resp = send_from_directory(_DIST, "index.html")
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+    return queue()
+
+
+@app.get("/assets/<path:filename>")
+def spa_assets(filename):
+    from flask import send_from_directory
+    resp = send_from_directory(os.path.join(_DIST, "assets"), filename)
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"   # hashed filenames
+    return resp
+
+
+def _jsonable(o):
+    """BigQuery rows -> JSON: Decimal -> float, datetime/date -> ISO string."""
+    import datetime as _dt
+    from decimal import Decimal
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_jsonable(v) for v in o]
+    if isinstance(o, Decimal):
+        return float(o)
+    if isinstance(o, (_dt.datetime, _dt.date)):
+        return o.isoformat()
+    if isinstance(o, (bytes, bytearray)):
+        return o.decode("utf-8", "replace")
+    return o
+
+
+_JSON_BLOBS = ("evidence_json", "proposed_change_json", "confidence_factors_json", "progress_json",
+               "rollback_plan_json", "verification_plan_json", "verification_result_json", "blast_radius_json")
+
+
+@app.get("/api/dashboard")
+def api_dashboard():
+    from flask import jsonify
+    data = _dashboard_data(cfg())
+    for key in ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards"):
+        for cs in data[key]:
+            for blob in _JSON_BLOBS:          # already parsed into evidence/proposed/factors
+                cs.pop(blob, None)
+    data["personas"] = [
+        {"email": data["reviewer_email"], "label": "Active Identity / Platform Lead", "role": "platform_approver"},
+        {"email": "alice-owner@company.com", "label": "Data Owner / Dataset Lead", "role": "owner_approver"},
+        {"email": "gcp-admin@company.com", "label": "GCP Project Admin", "role": "platform_approver"},
+    ]
+    data["reason_snooze_days"] = dict(store.REJECTION_SNOOZE_DAYS)
+    return jsonify(_jsonable(data))
+
+
+@app.post("/api/decisions")
+def api_decisions():
+    from flask import jsonify
+    body = request.get_json(silent=True) or {}
+    if not body.get("change_set_id"):
+        return jsonify({"ok": False, "error": "change_set_id is required"}), 400
+    c = cfg()
+    who = _who(body.get("principal"))
+    try:
+        result = _apply_decision(c, body, who)
+    except Exception as e:  # noqa: BLE001 — surfaced to the reviewer, card left retryable
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, **result})
 
 
 # Product reference material for the FinOps Copilot. These are background facts
@@ -482,26 +563,26 @@ def finops_chat():
 
 
 
-@app.post("/decision")
-def decision():
-    c = cfg()
-    cs_id = request.form["change_set_id"]
-    who = _who()
-    action = request.form.get("action", "reject")
+def _apply_decision(c, form, who: str) -> dict:
+    """Single implementation of every reviewer action (classic form and JSON API).
+    `form` is any mapping with .get(). Raises on failure; rollback failures leave the
+    card in ROLLING_BACK so it can be retried."""
+    cs_id = form.get("change_set_id")
+    action = form.get("action", "reject")
 
     if action == "approve":
         cs = store.get(c, cs_id)
         if not cs:
-            return redirect(url_for("queue"))
+            raise ValueError(f"change set {cs_id} not found")
 
         cls = int(cs.get("apply_class") or 1)
         existing_approvals = cs.get("approvals") or []
-        role = request.form.get("role")
-        if not role:
+        role = form.get("role")
+        if not role or cls == 3:
             if cls == 3:
                 role = "platform_approver" if len(existing_approvals) > 0 else "owner_approver"
             else:
-                role = "approver"
+                role = role or "approver"
 
         # Determine Active Assist claim note for audit trail
         native_recs = cs.get("native_rec_names") or []
@@ -516,8 +597,8 @@ def decision():
         change = bq.loads(cs.get("proposed_change_json")) or {}
         if change.get("action") == "CAPACITY_PRICING_MIGRATION":
             try:
-                opt = int(request.form.get("selected_option") or change.get("selected_option") or 1)
-            except ValueError:
+                opt = int(form.get("selected_option") or change.get("selected_option") or 1)
+            except (TypeError, ValueError):
                 opt = 1
             opt = 2 if opt == 2 else 1
             store.set_selected_option(c, cs_id, opt)
@@ -527,27 +608,37 @@ def decision():
         if status == "APPROVED":
             verifier.freeze_baseline(c, cs)                      # baseline frozen at full approval
             recommender_sync.mark(cs.get("native_rec_names"), "CLAIMED")
-    elif action == "reset":
-        note = request.form.get("note") or "Reset to PENDING_REVIEW from blocked state"
+        return {"action": action, "status": status}
+    if action == "reset":
+        note = form.get("note") or "Reset to PENDING_REVIEW from blocked state"
         store.unsnooze(c, cs_id, who, note=note)
-    elif action == "unsnooze":
-        note = request.form.get("note") or f"Un-snoozed from ROLLED_BACK by {who} for re-evaluation"
+        return {"action": action, "status": "PENDING_REVIEW"}
+    if action == "unsnooze":
+        note = form.get("note") or f"Un-snoozed from ROLLED_BACK by {who} for re-evaluation"
         store.unsnooze(c, cs_id, who, note=note)
-    elif action == "rollback":
-        category = request.form.get("category", "REGRESSION_PERFORMANCE")
-        note = request.form.get("note") or f"Rollback requested via Web UI by {who}"
+        return {"action": action, "status": "PENDING_REVIEW"}
+    if action == "rollback":
+        category = form.get("category", "REGRESSION_PERFORMANCE")
+        note = form.get("note") or f"Rollback requested via Web UI by {who}"
         from optimizer import cli
-        try:
-            cli.cmd_rollback(c, cs_id, reason=note, category=category, snooze_days=90, actor=who)
-        except Exception as e:  # stays ROLLING_BACK -> button remains available for retry
-            from markupsafe import escape
-            return (f"<h3>Rollback failed</h3><pre>{escape(str(e))}</pre>"
-                    f"<p>The change set is left in ROLLING_BACK; fix the cause and click Rollback again.</p>"
-                    f"<a href='{url_for('queue')}'>Back to review queue</a>"), 500
-    else:  # reject
-        store.reject(c, cs_id, who,
-                     request.form.get("reason", "OTHER"),
-                     request.form.get("note") or None)
+        cli.cmd_rollback(c, cs_id, reason=note, category=category, snooze_days=90, actor=who)
+        return {"action": action, "status": "ROLLED_BACK"}
+    # reject
+    store.reject(c, cs_id, who, form.get("reason", "OTHER"), form.get("note") or None)
+    return {"action": "reject", "status": "REJECTED"}
+
+
+@app.post("/decision")
+def decision():
+    """Classic HTML form endpoint (used by /classic)."""
+    c = cfg()
+    try:
+        _apply_decision(c, request.form, _who())
+    except Exception as e:  # noqa: BLE001
+        from markupsafe import escape
+        return (f"<h3>Action failed</h3><pre>{escape(str(e))}</pre>"
+                f"<p>If this was a rollback, the change set is left in ROLLING_BACK; fix the cause and retry.</p>"
+                f"<a href='{url_for('queue')}'>Back to review queue</a>"), 500
     return redirect(url_for("queue"))
 
 

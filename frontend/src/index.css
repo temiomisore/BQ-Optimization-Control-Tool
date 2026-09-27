@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    @apply bg-zinc-50 text-zinc-900 antialiased dark:bg-ink-950 dark:text-zinc-100 font-sans;
+  }
+  /* soft futuristic backdrop: faint grid + top glow (dark mode) */
+  .dark body {
+    background-image:
+      radial-gradient(1200px 500px at 15% -10%, rgba(56, 189, 248, 0.10), transparent 60%),
+      radial-gradient(900px 400px at 95% -5%, rgba(139, 92, 246, 0.10), transparent 60%),
+      linear-gradient(rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px);
+    background-size: auto, auto, 36px 36px, 36px 36px;
+    background-attachment: fixed;
+  }
+  ::selection { @apply bg-sky-500/30; }
+  * { scrollbar-width: thin; scrollbar-color: rgba(113, 113, 122, 0.4) transparent; }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-ink-800 dark:bg-ink-900/80 dark:backdrop-blur-sm;
+  }
+  .glass {
+    @apply border border-white/10 bg-white/80 backdrop-blur-xl dark:bg-ink-900/70;
+  }
+  .label {
+    @apply text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400;
+  }
+  .gradient-text {
+    @apply bg-gradient-to-r from-sky-400 via-cyan-300 to-violet-400 bg-clip-text text-transparent;
+  }
+  .code-block {
+    @apply max-h-80 overflow-auto rounded-lg border border-zinc-200 bg-zinc-950 p-4 font-mono text-[12px] leading-relaxed text-emerald-300 dark:border-ink-800;
+  }
+  .input {
+    @apply w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm transition-all focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40 dark:border-ink-800 dark:bg-ink-950 dark:text-zinc-100;
+  }
+  .md p { @apply my-1.5; }
+  .md ul { @apply my-1.5 list-disc pl-5; }
+  .md ol { @apply my-1.5 list-decimal pl-5; }
+  .md code { @apply rounded bg-zinc-200 px-1 py-0.5 font-mono text-[11.5px] dark:bg-ink-800; }
+  .md strong { @apply font-semibold text-zinc-950 dark:text-white; }
+}

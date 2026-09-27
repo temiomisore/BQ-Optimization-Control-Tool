@@ -98,6 +98,18 @@ auth of its own — put IAP in front; it reads the IAP identity header for the
 approvals audit trail. Schedules in `terraform/main.tf` place `execute` inside
 the change window on purpose.
 
+## Review UI (React) 
+
+- `/` — React + Vite + Tailwind + ECharts app in `frontend/` (built inside the
+  Docker image; Node stage → `frontend/dist`, served by Flask).
+- `/classic` — the original Jinja page, kept as a fallback.
+- JSON API used by the React app: `GET /api/dashboard`, `POST /api/decisions`
+  (`approve | reject | reset | unsnooze | rollback`), `POST /api/finops-chat`.
+- Local dev: `.venv/bin/python3 review_app/main.py --port 8080` then
+  `cd frontend && npm install && npm run dev` (Vite on :5173 proxies `/api`).
+- Gunicorn timeout is 900s because a W-01 reservation rollback waits for queries
+  to route back to on-demand.
+
 ## Verify-before-trust checklist (first week)
 
 - Run `rules` and eyeball `v_pending_review` — do the dollar figures pass the

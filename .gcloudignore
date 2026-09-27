@@ -11,3 +11,5 @@ tests/
 terraform/
 !config.yaml
 !config.yaml.example
+frontend/node_modules/
+frontend/dist/

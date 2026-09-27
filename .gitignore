@@ -26,3 +26,7 @@ env/
 *.jar
 
 
+
+# Frontend (built inside Docker)
+frontend/node_modules/
+frontend/dist/
