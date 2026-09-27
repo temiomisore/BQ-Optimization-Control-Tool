@@ -295,8 +295,8 @@ _COPILOT_REFERENCE = {
     "W-02": (
         "🛡️ **How Rule `W-02` (Proactive Cost Guardrail) Protects Your Production ETL Pipelines:**\n\n"
         "1. **Smart `user_email` Filtering**: Every BigQuery job in `INFORMATION_SCHEMA.JOBS` stamps `user_email`. Our optimizer separates **Human Ad-Hoc Users** (`user_email NOT LIKE '%.gserviceaccount.com'`) from **Service Accounts & Production ETL** (`*.iam.gserviceaccount.com`, `airflow`, `dbt`, `dataform`).\n"
-        "2. **👤 Human Analysts Only**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human_adhoc_sandbox_pool`)** so an accidental `SELECT *` without a `WHERE` clause is stopped in 0ms before billing.\n"
-        "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise_prod_pool`), guaranteeing **0% pipeline breakage**."
+        "2. **👤 Human Analysts Only**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human-adhoc-sandbox-pool`)** so an accidental `SELECT *` without a `WHERE` clause is stopped in 0ms before billing.\n"
+        "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise-prod-pool`), guaranteeing **0% pipeline breakage**."
     ),
     "W-01": (
         "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison:**\n\n"
@@ -488,6 +488,17 @@ def decision():
             rule_id = (cs.get("rule_ids") or ["custom"])[0]
             target_obj = cs.get("target_table") or cs.get("target_dataset") or "rule"
             claim_note = f"CLAIMED:projects/{c.project_id}/locations/{cs.get('target_region') or 'us'}/recommenders/optimizer.{rule_id}/recommendations/rec-{target_obj}-001"
+
+        # Capacity migrations (W-01) carry two options; persist the one the reviewer picked
+        change = bq.loads(cs.get("proposed_change_json")) or {}
+        if change.get("action") == "CAPACITY_PRICING_MIGRATION":
+            try:
+                opt = int(request.form.get("selected_option") or change.get("selected_option") or 1)
+            except ValueError:
+                opt = 1
+            opt = 2 if opt == 2 else 1
+            store.set_selected_option(c, cs_id, opt)
+            claim_note = f"{claim_note} | OPTION:{opt}"
 
         status = store.approve(c, cs_id, who, role=role, note=claim_note)
         if status == "APPROVED":

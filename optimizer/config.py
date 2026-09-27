@@ -23,6 +23,7 @@ _DEFAULTS: dict[str, Any] = {
         "enable_class1": True,
         "enable_class2": False,
         "enable_class3": False,
+        "enable_reservation_changes": False,   # W-01: real CREATE RESERVATION + ASSIGNMENT (changes project billing)
         "change_window_utc": [3, 9],
         "backup_hold_days": 7,
         "max_structural_changes_per_table_per_days": 7,

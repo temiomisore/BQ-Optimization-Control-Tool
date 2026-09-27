@@ -156,6 +156,18 @@ def transition(c: Config, change_set_id: str, new_state: str, actor: str,
     bq.execute(c, f"UPDATE {_t(c)} SET {', '.join(sets)} WHERE change_set_id = @id", params)
 
 
+def set_selected_option(c: Config, change_set_id: str, option: int) -> None:
+    """Record which option the reviewer chose (e.g. W-01 Option 1 vs 2) inside
+    proposed_change_json, so the executor applies exactly what was approved."""
+    cs = get(c, change_set_id)
+    if not cs:
+        return
+    change = bq.loads(cs.get("proposed_change_json")) or {}
+    change["selected_option"] = int(option)
+    bq.execute(c, f"UPDATE {_t(c)} SET proposed_change_json = @p WHERE change_set_id = @id",
+               {"p": bq.dumps(change), "id": change_set_id})
+
+
 def approve(c: Config, change_set_id: str, principal: str, role: str = "approver",
             note: str | None = None) -> str:
     """Records an approval. For Class 3 changes, requires two-person approval per Design Doc §8

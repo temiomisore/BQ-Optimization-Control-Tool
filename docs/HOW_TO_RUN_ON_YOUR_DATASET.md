@@ -421,6 +421,6 @@ This pulls query logs from `region-{location}.INFORMATION_SCHEMA.JOBS_BY_ORGANIZ
 
 ### Q: How does Rule `W-02` ("Proactive Cost Guardrail") stop a $5,000 ad-hoc query without failing our Service Accounts or ETL pipelines?
 **A:** Rule `W-02` automatically inspects `user_email` in `optimizer_ops.jobs_events` (`INFORMATION_SCHEMA.JOBS`) and separates **Human Ad-Hoc Users** (`user_email NOT LIKE '%.gserviceaccount.com'`) from **Production Service Accounts & ETL Pipelines** (`*.iam.gserviceaccount.com`, `airflow`, `dbt`, `dataform`).
-- **👤 Human Ad-Hoc Users**: Assigned a **50 GiB per-query safety cap (`SET @@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human_adhoc_sandbox_pool`)** so an accidental `SELECT *` without a `WHERE` clause fails fast in 0ms before billing.
+- **👤 Human Ad-Hoc Users**: Assigned a **50 GiB per-query safety cap (`SET @@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human-adhoc-sandbox-pool`)** so an accidental `SELECT *` without a `WHERE` clause fails fast in 0ms before billing.
 - **🤖 Service Accounts & Production ETL (`*.gserviceaccount.com`)**: Explicitly marked **100% EXEMPT** from query byte caps so nightly multi-terabyte ETL jobs never fail.
 

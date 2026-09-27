@@ -1599,6 +1599,8 @@ function selectReservationOption(cardId, optNum, btnEl) {
   if (!preEl) return;
   const sql = optNum === 2 ? preEl.getAttribute('data-opt2-sql') : preEl.getAttribute('data-opt1-sql');
   if (sql) preEl.innerText = sql;
+  const selOpt = document.getElementById('selopt-' + cardId);
+  if (selOpt) selOpt.value = String(optNum);
   const container = btnEl.parentElement;
   if (container) {
     container.querySelectorAll('.opt-toggle-btn').forEach(b => {
@@ -2816,6 +2818,7 @@ function sendCopilotQuestion(questionText) {
   <!-- Form Actions Strip -->
   <form class="card-actions" method="post" action="/decision">
     <input type="hidden" name="change_set_id" value="{{ c.change_set_id }}">
+    <input type="hidden" name="selected_option" id="selopt-{{ c.change_set_id }}" value="{{ c.proposed.selected_option or 1 }}">
     <input type="hidden" name="principal" class="reviewer-principal-field" value="{{ reviewer_email }}">
     <input type="hidden" name="role" class="reviewer-role-field" data-is-class3="{% if c.apply_class == 3 %}true{% else %}false{% endif %}" value="{% if c.apply_class == 3 %}{% if c.approvals and c.approvals|length > 0 %}platform_approver{% else %}owner_approver{% endif %}{% else %}approver{% endif %}">
     

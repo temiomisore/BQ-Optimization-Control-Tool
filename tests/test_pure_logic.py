@@ -209,6 +209,28 @@ class TestRollbackSnooze(unittest.TestCase):
         )
         self.assertIn("CREATE TEMP TABLE tmp_cte", rewrite)
 
+    def test_capacity_plan_options(self):
+        import os
+        from optimizer.executor import class3
+        os.environ.pop("BQOPT_RESERVATION_OPTION", None)
+        cfg = {"location": "US"}
+        cs = {"target_project": "p1", "target_region": "US"}
+        ch = {"recommended_baseline_slots": 100, "recommended_autoscale_max_slots": 300}
+        p1 = class3.capacity_plan(cfg, cs, ch)
+        self.assertEqual((p1["option"], p1["baseline_slots"], p1["autoscale_max_slots"]), (1, 100, 200))
+        self.assertEqual(p1["reservation_fq"], "p1.region-us.enterprise-prod-pool")
+        self.assertIn("slot_capacity = 100", p1["create_reservation_sql"])
+        self.assertIn("assign-project", p1["create_assignment_sql"])
+        p2 = class3.capacity_plan(cfg, cs, {**ch, "selected_option": 2})
+        self.assertEqual((p2["option"], p2["baseline_slots"], p2["autoscale_max_slots"]), (2, 0, 300))
+        self.assertEqual(p2["reservation_name"], "enterprise-autoscale-only-pool")
+        os.environ["BQOPT_RESERVATION_OPTION"] = "2"
+        try:
+            self.assertEqual(class3.capacity_plan(cfg, cs, ch)["option"], 2)
+        finally:
+            os.environ.pop("BQOPT_RESERVATION_OPTION", None)
+        self.assertNotIn("_", p1["reservation_name"] + p2["reservation_name"])
+
 
 if __name__ == "__main__":
     unittest.main()
