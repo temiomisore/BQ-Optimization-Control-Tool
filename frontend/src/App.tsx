@@ -139,7 +139,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           <>
             <Toolbar data={data} f={f} setF={setF} shown={shown.length} total={cards.length} />
             <div className="flex items-start gap-6">
-              <div className={cn("min-w-0 transition-all duration-300", selected ? "hidden w-3/5 lg:block" : "w-full")}>
+              <div className={cn("min-w-0 transition-all duration-300", selected ? "hidden lg:block lg:flex-[2] xl:flex-[5]" : "w-full")}>
                 {shown.length === 0 ? (
                   <Empty icon={<Inbox className="h-5 w-5" />} title="No recommendations match" hint="Try clearing filters or lowering the minimum savings." />
                 ) : (
@@ -159,7 +159,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
               </div>
               <AnimatePresence mode="wait">
                 {selected && (
-                  <div className="w-full lg:w-2/5">
+                  <div className="w-full min-w-0 self-start lg:sticky lg:top-20 lg:flex-[3] xl:flex-[8]">
                     <CardDetail c={selected} data={data} onClose={() => setSelectedId(null)} onPr={setPrCard} />
                   </div>
                 )}

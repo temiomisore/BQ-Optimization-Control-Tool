@@ -10,24 +10,9 @@ import {
 } from "@/lib/utils";
 import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
+import { Rich, StateCompare } from "./StateCompare";
 
 const num = (v: unknown) => Number(v || 0);
-
-function KV({ obj }: { obj: unknown }) {
-  if (!obj || typeof obj !== "object") return <div className="text-sm text-zinc-500">{String(obj ?? "—")}</div>;
-  return (
-    <dl className="space-y-1.5">
-      {Object.entries(obj as Record<string, unknown>).map(([k, v]) => (
-        <div key={k} className="text-xs">
-          <dt className="label !text-[10px]">{titleize(k)}</dt>
-          <dd className="mt-0.5 break-words text-zinc-700 dark:text-zinc-300">
-            {typeof v === "object" ? JSON.stringify(v) : String(v)}
-          </dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
 
 function Section({ title, icon, children }: { title: string; icon?: React.ReactNode; children: React.ReactNode }) {
   return (
@@ -127,7 +112,7 @@ export function CardDetail({
       animate={{ opacity: 1, x: 0 }}
       exit={{ opacity: 0, x: 24 }}
       transition={{ duration: 0.22 }}
-      className="panel sticky top-4 flex max-h-[calc(100vh-2rem)] flex-col overflow-hidden"
+      className="panel flex max-h-[calc(100vh-6rem)] flex-col overflow-hidden"
     >
       {/* header */}
       <div className="border-b border-zinc-200 p-5 dark:border-ink-800">
@@ -194,10 +179,16 @@ export function CardDetail({
               {bullets.map((b, i) => (
                 <li key={i} className="flex gap-2 text-sm leading-relaxed text-zinc-700 dark:text-zinc-300">
                   <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-sky-400" />
-                  <span>{b}</span>
+                  <span><Rich text={b} /></span>
                 </li>
               ))}
             </ul>
+          </Section>
+        )}
+
+        {(ev.current_state || ev.proposed_state) && (
+          <Section title="Before vs. after">
+            <StateCompare before={ev.current_state} after={ev.proposed_state} />
           </Section>
         )}
 
@@ -222,18 +213,6 @@ export function CardDetail({
           </div>
         )}
 
-        {(ev.current_state || ev.proposed_state) && (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="rounded-lg border border-rose-500/20 bg-rose-500/5 p-3">
-              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-rose-400">Before</div>
-              <KV obj={ev.current_state} />
-            </div>
-            <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3">
-              <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-emerald-400">After</div>
-              <KV obj={ev.proposed_state} />
-            </div>
-          </div>
-        )}
 
         {ev.current_sql && ev.proposed_sql && (
           <Section title="SQL rewrite">
