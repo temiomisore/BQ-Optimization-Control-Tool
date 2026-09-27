@@ -7,12 +7,12 @@ import { cn } from "@/lib/utils";
 
 export function Header({
   data,
-  onCopilot,
+  onAssist,
   showAnalytics,
   onToggleAnalytics,
 }: {
   data?: Dashboard;
-  onCopilot: () => void;
+  onAssist: () => void;
   showAnalytics: boolean;
   onToggleAnalytics: () => void;
 }) {
@@ -97,8 +97,8 @@ export function Header({
               <ExternalLink className="h-4 w-4" /> Classic
             </Button>
           </a>
-          <Button variant="primary" size="sm" onClick={onCopilot}>
-            <Sparkles className="h-4 w-4" /> Ask FinOps AI
+          <Button variant="primary" size="sm" onClick={onAssist}>
+            <Sparkles className="h-4 w-4" /> Ask Gemini
           </Button>
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="Toggle theme" className="px-2">
             {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}

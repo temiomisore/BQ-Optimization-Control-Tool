@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, Inbox, RefreshCw } from "lucide-react";
@@ -12,7 +12,8 @@ import { DEFAULT_FILTERS, Toolbar, type Filters } from "@/components/Toolbar";
 import { CardRow } from "@/components/CardRow";
 import { CardDetail } from "@/components/CardDetail";
 import { BlockedList, ReceiptsTable, RegressedBanner, RegressedList, RolledBackList } from "@/components/OpsViews";
-import { CopilotDrawer } from "@/components/CopilotDrawer";
+import { GeminiAssistDrawer } from "@/components/GeminiAssistDrawer";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PrModal } from "@/components/PrModal";
 import { Button, Empty, Skeleton } from "@/components/ui";
 
@@ -55,9 +56,10 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
   const [f, setFState] = useState<Filters>(DEFAULT_FILTERS);
   const setF = (p: Partial<Filters>) => setFState((s) => ({ ...s, ...p }));
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [copilot, setCopilot] = useState(false);
+  const [assistOpen, setAssistOpen] = useState(false);
   const [analytics, setAnalytics] = useState(true);
   const [prCard, setPrCard] = useState<ChangeSet | null>(null);
+  const closeAssist = useCallback(() => setAssistOpen(false), []);
 
   const cards = data?.cards || [];
   const shown = useMemo(() => applyFilters(cards, f), [cards, f]);
@@ -73,7 +75,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
 
   return (
     <div className="min-h-screen">
-      <Header data={data} onCopilot={() => setCopilot(true)} showAnalytics={analytics} onToggleAnalytics={() => setAnalytics((a) => !a)} />
+      <Header data={data} onAssist={() => setAssistOpen(true)} showAnalytics={analytics} onToggleAnalytics={() => setAnalytics((a) => !a)} />
 
       <main className="mx-auto max-w-[1600px] space-y-6 px-4 pb-16 pt-6 sm:px-6">
         {error && (
@@ -172,7 +174,9 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
         {data && tab === "receipts" && <ReceiptsTable receipts={data.receipts} />}
       </main>
 
-      <CopilotDrawer open={copilot} onClose={() => setCopilot(false)} />
+      <ErrorBoundary where="assist-drawer" fallback={() => null}>
+        <GeminiAssistDrawer open={assistOpen} onClose={closeAssist} />
+      </ErrorBoundary>
       <PrModal c={prCard} onClose={() => setPrCard(null)} />
     </div>
   );

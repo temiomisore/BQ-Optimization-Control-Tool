@@ -390,7 +390,7 @@ def api_decisions():
     return jsonify({"ok": True, **result})
 
 
-# Product reference material for the FinOps Copilot. These are background facts
+# Product reference material for Gemini FinOps Assist. These are background facts
 # the model can draw on; they are NOT returned verbatim for unrelated questions.
 _COPILOT_REFERENCE = {
     "W-02": (
@@ -508,9 +508,20 @@ def _copilot_offline_answer(c, cards: list[dict], q: str) -> str:
     )
 
 
+@app.post("/api/client-error")
+def client_error():
+    """Browser-side crash report from the React ErrorBoundary -> Cloud Run logs (severity ERROR)."""
+    p = request.get_json(silent=True, force=True) or {}
+    app.logger.error(
+        "CLIENT_ERROR where=%s message=%s url=%s ua=%s\nstack=%s\ncomponentStack=%s",
+        str(p.get("where"))[:100], str(p.get("message"))[:1000], str(p.get("url"))[:300],
+        str(p.get("ua"))[:300], str(p.get("stack"))[:4000], str(p.get("componentStack"))[:4000])
+    return {"ok": True}, 200
+
+
 @app.post("/api/finops-chat")
 def finops_chat():
-    """Gemini FinOps Copilot: answers the user's actual question, grounded in the live queue."""
+    """Gemini FinOps Assist: answers the user's actual question, grounded in the live queue."""
     c = cfg()
     payload = request.get_json(silent=True) or {}
     q = (payload.get("question") or "").strip()[:2000]
@@ -525,11 +536,11 @@ def finops_chat():
     # Optional short conversation history from the UI: [{"role": "user"|"ai", "text": "..."}]
     history = payload.get("history") or []
     history_txt = "\n".join(
-        f"{'User' if h.get('role') == 'user' else 'Copilot'}: {str(h.get('text') or '')[:800]}"
+        f"{'User' if h.get('role') == 'user' else 'Assistant'}: {str(h.get('text') or '')[:800]}"
         for h in history[-6:] if isinstance(h, dict))
 
     system_instruction = (
-        f"You are the Gemini FinOps Copilot for the BigQuery Optimization Control Plane (project {c.project_id}).\n"
+        f"You are Gemini FinOps Assist for the BigQuery Optimization Control Plane (project {c.project_id}).\n"
         "RULES:\n"
         "1. Answer EXACTLY the question the user asked. Put the direct answer (e.g. the number, name or yes/no) in the first sentence.\n"
         "2. For anything about the queue, counts, dollars, tables, rules or owners, use ONLY the LIVE QUEUE DATA below. "
@@ -555,9 +566,9 @@ def finops_chat():
                 if r and r.text:
                     return {"answer": r.text.strip(), "model": model}, 200
             except Exception as e:  # try the next model
-                app.logger.warning("FinOps Copilot model %s@%s failed: %s", model, loc, e)
+                app.logger.warning("Gemini FinOps Assist model %s@%s failed: %s", model, loc, e)
     except Exception as e:
-        app.logger.warning("FinOps Copilot: google-genai unavailable: %s", e)
+        app.logger.warning("Gemini FinOps Assist: google-genai unavailable: %s", e)
 
     return {"answer": _copilot_offline_answer(c, cards, q), "model": "offline-fallback"}, 200
 

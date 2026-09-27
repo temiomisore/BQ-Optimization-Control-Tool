@@ -132,7 +132,7 @@
     transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* building-data-apps Gemini FinOps Copilot Slide-out Drawer */
+  /* building-data-apps Gemini FinOps Assist Slide-out Drawer */
   .btn-copilot-trigger {
     background: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
     color: #ffffff;
@@ -2106,7 +2106,7 @@ function sendCopilotQuestion(questionText) {
       container.scrollTop = container.scrollHeight;
     })
     .catch(() => {
-      loadingDiv.innerText = '⚠️ Unable to reach FinOps Copilot endpoint.';
+      loadingDiv.innerText = '⚠️ Unable to reach Gemini FinOps Assist.';
     });
 }
 </script>
@@ -2147,10 +2147,10 @@ function sendCopilotQuestion(questionText) {
         📊 Analytics
       </button>
 
-      <!-- Gemini FinOps Copilot Trigger -->
+      <!-- Gemini FinOps Assist Trigger -->
       <button type="button" class="btn-copilot-trigger" onclick="toggleCopilotDrawer()">
         <span>✨</span>
-        <span>Ask FinOps AI</span>
+        <span>Ask Gemini</span>
       </button>
 
       <!-- Theme Switcher -->
@@ -2159,20 +2159,20 @@ function sendCopilotQuestion(questionText) {
   </div>
 </header>
 
-<!-- Gemini FinOps Copilot Slide-out Drawer (building-data-apps AI Chat Pattern) -->
+<!-- Gemini FinOps Assist Slide-out Drawer (building-data-apps AI Chat Pattern) -->
 <aside class="copilot-drawer" id="copilotDrawer">
   <div class="copilot-header">
     <div style="display:flex; align-items:center; gap:8px;">
       <span style="font-size:18px;">✨</span>
       <div>
-        <div style="font-family:var(--font-display); font-weight:700; font-size:14px; color:var(--text-primary);">Gemini FinOps Copilot</div>
+        <div style="font-family:var(--font-display); font-weight:700; font-size:14px; color:var(--text-primary);">Gemini FinOps Assist</div>
         <div style="font-size:11px; color:var(--text-secondary);">Live Context: {{ kpis.project_id or 'temi-project-408005' }} · {{ cards|length }} Active Cards</div>
       </div>
     </div>
     <button type="button" onclick="toggleCopilotDrawer()" style="background:transparent; border:1px solid var(--card-border); color:var(--text-secondary); border-radius:6px; padding:4px 8px; cursor:pointer; font-weight:700;">✕</button>
   </div>
   <div class="copilot-messages" id="copilotMessages">
-    <div class="copilot-msg ai">👋 Hi! I'm your **BigQuery FinOps Copilot**. I have live telemetry context for **{{ kpis.project_id or 'temi-project-408005' }}** (${{ '%.0f'|format(kpis.monthly_savings or 0) }}/mo in identified net savings across {{ cards|length }} cards). Click a question below or type your own!</div>
+    <div class="copilot-msg ai">👋 Hi! I'm your **Gemini FinOps Assist**. I have live telemetry context for **{{ kpis.project_id or 'temi-project-408005' }}** (${{ '%.0f'|format(kpis.monthly_savings or 0) }}/mo in identified net savings across {{ cards|length }} cards). Click a question below or type your own!</div>
   </div>
   <div class="copilot-chips">
     <button type="button" class="copilot-chip" onclick="askCopilotChip('Will W-02 break our Service Accounts or ETL jobs?')">🛡️ Will W-02 break ETL / Service Accounts?</button>

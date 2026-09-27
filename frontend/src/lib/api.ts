@@ -148,7 +148,7 @@ export interface ChatTurn {
   model?: string;
 }
 
-export async function askCopilot(question: string, history: ChatTurn[]): Promise<{ answer: string; model?: string }> {
+export async function askAssist(question: string, history: ChatTurn[]): Promise<{ answer: string; model?: string }> {
   return asJson(
     await fetch("/api/finops-chat", {
       method: "POST",
