@@ -1622,7 +1622,7 @@ function selectReservationOption(cardId, optNum, btnEl) {
     if (optLbl) optLbl.textContent = ' · Option ' + optNum;
   }
 
-  showToast(optNum === 2 ? '⚡ Switched to Option 2: 0-Baseline Pure Autoscaling DDL' : '🏢 Switched to Option 1: 100-Slot Baseline + Autoscaling DDL');
+  showToast(optNum === 2 ? '⚡ Switched to Option 2: 0-Baseline Pure Autoscaling DDL' : '🏢 Switched to Option 1: Baseline + Autoscaling DDL');
 }
 
 // Search & Multi-Dimensional Filtering + Sorting
@@ -2348,33 +2348,35 @@ function sendCopilotQuestion(questionText) {
   </div>
 
   <!-- Panel 2: W-01 Project-Wide Billing Architecture Comparison -->
+  {% if w01 %}
   <div class="analytics-card">
     <div class="analytics-title">
       <span>🏢 Project-Wide Billing Fit (W-01)</span>
-      <span style="font-family:var(--font-mono); font-size:11px; color:var(--accent-primary);">1,450 TiB / 30d</span>
+      <span style="font-family:var(--font-mono); font-size:11px; color:var(--accent-primary);">{{ '{:,.0f}'.format(w01.tib) }} TiB / 30d</span>
     </div>
     <div class="bar-row">
       <div class="bar-meta">
         <span>🔴 Current On-Demand ($6.25/TiB)</span>
-        <span style="font-family:var(--font-mono); color:var(--danger);">$9,062 / mo</span>
+        <span style="font-family:var(--font-mono); color:var(--danger);">${{ '{:,.0f}'.format(w01.od) }} / mo</span>
       </div>
       <div class="bar-track"><div class="bar-fill" style="width:100%; background:var(--danger);"></div></div>
     </div>
     <div class="bar-row">
       <div class="bar-meta">
-        <span>🏢 Option 1: 100-Slot Baseline + Autoscale</span>
-        <span style="font-family:var(--font-mono); color:var(--success);">$3,850 / mo (-58%)</span>
+        <span>🏢 Option 1: {{ w01.baseline }}-Slot Baseline + Autoscale to {{ w01.max }}</span>
+        <span style="font-family:var(--font-mono); color:var(--success);">${{ '{:,.0f}'.format(w01.o1) }} / mo (-{{ 100 - w01.o1_pct }}%)</span>
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:42%; background:var(--accent-primary);"></div></div>
+      <div class="bar-track"><div class="bar-fill" style="width:{{ [w01.o1_pct, 3]|max }}%; background:var(--accent-primary);"></div></div>
     </div>
     <div class="bar-row" style="margin-bottom:0;">
       <div class="bar-meta">
-        <span>⚡ Option 2: 0-Baseline Pure Autoscale</span>
-        <span style="font-family:var(--font-mono); color:var(--success);">$1,170 / mo (-87%)</span>
+        <span>⚡ Option 2: 0-Baseline Autoscale to {{ w01.max }}</span>
+        <span style="font-family:var(--font-mono); color:var(--success);">${{ '{:,.0f}'.format(w01.o2) }} / mo (-{{ 100 - w01.o2_pct }}%)</span>
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:13%; background:var(--success);"></div></div>
+      <div class="bar-track"><div class="bar-fill" style="width:{{ [w01.o2_pct, 3]|max }}%; background:var(--success);"></div></div>
     </div>
   </div>
+  {% endif %}
 
   <!-- Panel 3: W-02 Workload Actor & Pipeline Protection Matrix -->
   <div class="analytics-card">
@@ -2620,15 +2622,22 @@ function sendCopilotQuestion(questionText) {
       <ul class="finding-bullets">
         <li>
           <span class="finding-bullet-icon">📊</span>
-          <div><strong>Current 30-Day Workload:</strong> Scanned <strong><code>1,450 TiB</code></strong> across all datasets &amp; tables (<strong><code>$9,062 / mo</code></strong> at On-Demand <code>$6.25/TiB</code> pricing).</div>
+          <div><strong>Current 30-Day Workload:</strong> Scanned <strong><code>{{ '{:,.0f}'.format((c.evidence.bytes_scanned_tib_30d or 0)|float) }} TiB</code></strong> across all datasets &amp; tables (<strong><code>${{ '{:,.0f}'.format((c.evidence.on_demand_spend_monthly or 0)|float) }} / mo</code></strong> at On-Demand <code>$6.25/TiB</code> pricing).</div>
         </li>
         <li>
           <span class="finding-bullet-icon">🏢</span>
-          <div><strong>Option 1 (Steady 24/7 Enterprise Pool):</strong> <code>100 Baseline Slots</code> + <code>200 Autoscaling Burst Slots</code> at <strong><code>$3,850 / mo</code></strong> &rarr; <span class="finding-highlight-green">Saves $5,212 / mo (58% reduction)</span></div>
+          {% set w01_b = c.proposed.recommended_baseline_slots or 0 %}{% set w01_m = c.proposed.recommended_autoscale_max_slots or 0 %}{% set w01_od = (c.evidence.on_demand_spend_monthly or 1)|float %}
+          <div><strong>Option 1 (Steady 24/7 Enterprise Pool):</strong> <code>{{ w01_b }} Baseline Slots</code> + <code>{{ w01_m - w01_b }} Autoscaling Burst Slots</code> at <strong><code>${{ '{:,.0f}'.format((c.evidence.option_1_monthly_cost_usd or 0)|float) }} / mo</code></strong> &rarr; <span class="finding-highlight-green">Saves ${{ '{:,.0f}'.format((c.evidence.option_1_savings_usd or 0)|float) }} / mo ({{ '%.0f'|format(100 * (c.evidence.option_1_savings_usd or 0)|float / w01_od) }}% reduction)</span></div>
         </li>
         <li>
           <span class="finding-bullet-icon">⚡</span>
-          <div><strong>Option 2 (Spiky / Daytime Pure Autoscale):</strong> <code>0 Baseline Slots</code> ($0 idle cost) + <code>0 &rarr; 300 Autoscaling Slots</code> at <strong><code>$1,170 / mo</code></strong> &rarr; <span class="finding-highlight-green">Saves $7,892 / mo (87% reduction)</span></div>
+          <div><strong>Option 2 (Spiky / Daytime Pure Autoscale):</strong> <code>0 Baseline Slots</code> ($0 idle cost) + <code>0 &rarr; {{ w01_m }} Autoscaling Slots</code> at <strong><code>${{ '{:,.0f}'.format((c.evidence.option_2_monthly_cost_usd or 0)|float) }} / mo</code></strong> &rarr; <span class="finding-highlight-green">Saves ${{ '{:,.0f}'.format((c.evidence.option_2_savings_usd or 0)|float) }} / mo ({{ '%.0f'|format(100 * (c.evidence.option_2_savings_usd or 0)|float / w01_od) }}% reduction)</span></div>
+        </li>
+        {% if c.evidence.capacity_sizing %}{% set sz = c.evidence.capacity_sizing %}
+        <li>
+          <span class="finding-bullet-icon">📐</span>
+          <div><strong>Sized from real slot usage ({{ sz.source }}):</strong> median <code>{{ sz.p50_slots_all_minutes }}</code> slots · p99 busy-minute <code>{{ sz.p99_slots_busy_minutes }}</code> · 1-min peak <code>{{ sz.peak_slots_1min }}</code> · busy {{ sz.busy_minutes_pct }}% of minutes &rarr; baseline <code>{{ sz.recommended_baseline_slots }}</code>, max <code>{{ sz.recommended_max_slots }}</code>.</div>
+        {% endif %}
         </li>
       </ul>
       {% elif 'W-02' in (c.rule_ids or []) %}
@@ -2761,8 +2770,8 @@ function sendCopilotQuestion(questionText) {
               <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 1, this)" style="background:var(--accent-primary); color:#fff; border:1px solid var(--accent-primary); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">🛡️ Option 1: 50-Slot Human Sandbox + 50 GB Cap (ETL 100% Exempt)</button>
               <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 2, this)" style="background:var(--card-subtle); color:var(--text-secondary); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">🔍 Option 2: Audit SQL (Verify Human vs. Service Account Split)</button>
               {% else %}
-              <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 1, this)" style="background:var(--accent-primary); color:#fff; border:1px solid var(--accent-primary); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">🏢 Option 1: 100-Slot Baseline + Autoscale ($3,850/mo)</button>
-              <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 2, this)" style="background:var(--card-subtle); color:var(--text-secondary); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">⚡ Option 2: 0-Baseline Pure Autoscale ($1,170/mo)</button>
+              <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 1, this)" style="background:var(--accent-primary); color:#fff; border:1px solid var(--accent-primary); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">🏢 Option 1: {{ c.proposed.recommended_baseline_slots or 0 }}-Slot Baseline + Autoscale to {{ c.proposed.recommended_autoscale_max_slots or 0 }} (${{ '{:,.0f}'.format((c.evidence.option_1_monthly_cost_usd or 0)|float) }}/mo)</button>
+              <button type="button" class="opt-toggle-btn" onclick="selectReservationOption('{{ c.change_set_id }}', 2, this)" style="background:var(--card-subtle); color:var(--text-secondary); border:1px solid var(--border); padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer;">⚡ Option 2: 0-Baseline Autoscale to {{ c.proposed.recommended_autoscale_max_slots or 0 }} (${{ '{:,.0f}'.format((c.evidence.option_2_monthly_cost_usd or 0)|float) }}/mo)</button>
               {% endif %}
             {% endif %}
             <button type="button" class="btn-copy-sql" onclick="copySqlCode(this, 'sql-card-{{ c.change_set_id }}')">📋 Copy SQL</button>
@@ -3001,7 +3010,7 @@ function sendCopilotQuestion(questionText) {
         </td>
         <td>
           {% if r.state in ('APPLIED', 'VERIFYING', 'VERIFIED', 'REGRESSED', 'ROLLING_BACK') %}
-          <form method="post" action="/decision" style="display:inline;" onsubmit="return onRollbackSubmit(this, 'Initiate 1-Click Rollback for {{ r.target_dataset }}.{{ r.target_table }}? This will restore original tables and auto-snooze for 90 days.');">
+          <form method="post" action="/decision" style="display:inline;" onsubmit="return onRollbackSubmit(this, {% if r.target_dataset == 'PROJECT_WIDE_BILLING' %}'Roll back the Enterprise reservation? This drops the reservation assignment (and the reservation the tool created) and returns the project to On-Demand billing.'{% else %}'Initiate 1-Click Rollback for {{ r.target_dataset }}.{{ r.target_table }}? This will restore original tables and auto-snooze for 90 days.'{% endif %});">
             <input type="hidden" name="change_set_id" value="{{ r.change_set_id }}">
             <input type="hidden" name="principal" class="reviewer-principal-field" value="{{ reviewer_email }}">
             <input type="hidden" name="action" value="rollback">

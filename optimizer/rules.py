@@ -596,6 +596,74 @@ def _sql_editions_fit(c: Config) -> str:
     """
 
 
+def _ceil50(x: float) -> int:
+    import math
+    return int(math.ceil(max(float(x), 0.0) / 50.0)) * 50
+
+
+def _floor50(x: float) -> int:
+    import math
+    return int(math.floor(max(float(x), 0.0) / 50.0)) * 50
+
+
+def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | None:
+    """Per-minute slot usage for QUERY jobs from INFORMATION_SCHEMA.JOBS_TIMELINE.
+
+    Every minute in the window is counted (idle minutes = 0 slots), so:
+      * p50_all  = the load that is present at least half of the time -> steady baseline
+      * p99_busy = the top of normal busy-minute demand (ignores the rarest 1% spikes) -> ceiling
+    Returns None if JOBS_TIMELINE cannot be read (caller falls back to defaults)."""
+    try:
+        rows = bq.query(c, f"""
+          WITH busy AS (
+            SELECT TIMESTAMP_TRUNC(period_start, MINUTE) AS minute,
+                   SUM(period_slot_ms) / 60000.0       AS slots
+            FROM `{proj}.region-{region.lower()}.INFORMATION_SCHEMA.JOBS_TIMELINE`
+            WHERE job_creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days) + 1} DAY)
+              AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
+              AND job_type = 'QUERY'
+              AND (statement_type IS NULL OR statement_type != 'SCRIPT')
+            GROUP BY 1
+          ),
+          all_minutes AS (
+            SELECT m AS minute, COALESCE(b.slots, 0) AS slots
+            FROM UNNEST(GENERATE_TIMESTAMP_ARRAY(
+                   TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY), MINUTE),
+                   TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MINUTE), INTERVAL 1 MINUTE)) AS m
+            LEFT JOIN busy b ON b.minute = m
+          )
+          SELECT
+            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(50)] FROM all_minutes) AS p50_all,
+            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(95)] FROM all_minutes) AS p95_all,
+            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(99)] FROM busy)        AS p99_busy,
+            (SELECT MAX(slots) FROM busy)                                     AS peak,
+            (SELECT COUNT(*) FROM busy)                                       AS busy_minutes,
+            (SELECT COUNT(*) FROM all_minutes)                                AS total_minutes,
+            (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours
+        """)
+    except Exception:
+        return None
+    if not rows or not rows[0].get("total_minutes"):
+        return None
+    r = rows[0]
+    return {k: float(r.get(k) or 0.0) for k in
+            ("p50_all", "p95_all", "p99_busy", "peak", "busy_minutes", "total_minutes", "slot_hours")}
+
+
+def size_capacity(profile: dict | None) -> tuple[int, int, str]:
+    """Pure: (baseline_slots, max_slots, sizing_source) from a slot profile.
+    baseline = steady median load rounded DOWN to 50 (never pay for idle baseline);
+    max      = p99 busy-minute demand rounded UP to 50, at least 50 and >= baseline + 50,
+               capped at 2x the observed peak (rounded up) so we don't over-provision."""
+    if not profile or profile.get("busy_minutes", 0) <= 0:
+        return 100, 300, "DEFAULT_NO_TELEMETRY"
+    baseline = _floor50(profile["p50_all"])
+    ceiling = max(_ceil50(profile["p99_busy"]), 50)
+    ceiling = min(ceiling, max(_ceil50(profile["peak"] * 2), 50))
+    ceiling = max(ceiling, baseline + 50)
+    return baseline, ceiling, "JOBS_TIMELINE_30D"
+
+
 def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
     raw_bytes_tib = float(row.get("total_bytes_billed_30d") or 0.0) / _TIB
     # Ensure realistic enterprise scan volume if running on synthetic demo seed
@@ -606,15 +674,15 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
     proj = row["project_id"]
     region = c.get("location", "US")
 
-    # Enterprise Sizing: 100 Baseline Slots (24/7 1-Yr Commitment) + 200 Autoscaling Burst Slots
-    rec_baseline = 100
-    rec_autoscale_add = 200
-    rec_max = rec_baseline + rec_autoscale_add
+    # Enterprise Sizing from REAL per-minute slot usage (INFORMATION_SCHEMA.JOBS_TIMELINE, 30d)
+    profile = _slot_profile(c, proj, region)
+    rec_baseline, rec_max, sizing_source = size_capacity(profile)
+    rec_autoscale_add = rec_max - rec_baseline
 
     commit_rate = float(prices.get("slot_hour_usd_enterprise_1yr", 0.048))
     payg_rate = float(prices.get("slot_hour_usd_enterprise", 0.06))
 
-    # --- OPTION 1: 100-Slot Baseline (1-Yr Commit) + 200 Autoscaling Burst ---
+    # --- OPTION 1: Baseline (1-Yr Commit rate) + Autoscaling Burst up to rec_max ---
     baseline_slot_hours = rec_baseline * 730.0
     baseline_monthly_cost = round(baseline_slot_hours * commit_rate, 2)  # $3,504.00/mo
 
@@ -685,8 +753,8 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
         "target_region": region,
         "finding_summary": (
             f"Project-wide workload scanned {bytes_tib:,.0f} TiB in 30d (${on_demand_cost:,.0f}/mo On-Demand). "
-            f"Choose Option 1: 100-Slot Baseline + Autoscaling (${opt1_cost:,.0f}/mo → saves ${opt1_savings:,.0f}/mo) "
-            f"OR Option 2: 0-Baseline Pure Autoscaling (${opt2_cost:,.0f}/mo → saves ${opt2_savings:,.0f}/mo)."
+            f"Choose Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → saves ${opt1_savings:,.0f}/mo) "
+            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → saves ${opt2_savings:,.0f}/mo)."
         ),
         "evidence": {
             "bytes_scanned_tib_30d": round(bytes_tib, 1),
@@ -697,6 +765,20 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
             "option_1_savings_usd": opt1_savings,
             "option_2_monthly_cost_usd": opt2_cost,
             "option_2_savings_usd": opt2_savings,
+            "capacity_sizing": {
+                "source": sizing_source,
+                "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
+                           "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
+                "p50_slots_all_minutes": round((profile or {}).get("p50_all", 0.0), 1),
+                "p95_slots_all_minutes": round((profile or {}).get("p95_all", 0.0), 1),
+                "p99_slots_busy_minutes": round((profile or {}).get("p99_busy", 0.0), 1),
+                "peak_slots_1min": round((profile or {}).get("peak", 0.0), 1),
+                "busy_minutes_pct": round(100.0 * (profile or {}).get("busy_minutes", 0.0)
+                                          / max((profile or {}).get("total_minutes", 1.0), 1.0), 2),
+                "measured_slot_hours_30d": round((profile or {}).get("slot_hours", 0.0), 1),
+                "recommended_baseline_slots": rec_baseline,
+                "recommended_max_slots": rec_max,
+            },
             "recommended_pricing_model": "BigQuery Enterprise Edition (Option 1: Baseline+Autoscale OR Option 2: 0-Baseline Autoscale)",
             "current_state": {
                 "billing_model": "On-Demand ($6.25 per TiB scanned)",
@@ -705,7 +787,8 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
                 "cost_driver": "High scan volume (wide tables & unpartitioned scans) billed per Terabyte",
             },
             "proposed_state": {
-                "option_1_steady_24x7": f"100 Baseline Slots ($3,504/mo) + 200 Autoscaling Slots ($346/mo) = ${opt1_cost:,.2f} / month",
+                "option_1_steady_24x7": (f"{rec_baseline} Baseline Slots (${baseline_monthly_cost:,.0f}/mo) + up to "
+                                         f"{rec_autoscale_add} Autoscaling Slots (${autoscale_monthly_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"),
                 "option_1_net_savings": f"${opt1_savings:,.2f} / month ({opt1_pct}% reduction · 1-Yr Commit rate + predictable capacity)",
                 "option_2_spiky_0_baseline": f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month",
                 "option_2_net_savings": f"${opt2_savings:,.2f} / month ({opt2_pct}% reduction · $0 idle cost overnight & no lock-in)",

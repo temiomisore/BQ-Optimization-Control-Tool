@@ -164,17 +164,28 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
     if plan.get("assignment_fq"):
         bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{plan['assignment_fq']}`")
         dropped.append(plan["assignment_fq"])
+    # Keep the reservation alive until routing has propagated back to on-demand; dropping it
+    # immediately makes queries fail for a few minutes ("project does not have the reservation").
+    res_short = (plan.get("reservation_fq") or "").split(".")[-1]
+    routed_back = False
+    for _ in range(18):                      # up to ~3 minutes
+        rid = bq.probe_reservation(c)
+        if not rid or not res_short or not str(rid).endswith(res_short):
+            routed_back = True
+            break
+        time.sleep(10)
     if plan.get("created_reservation") and plan.get("reservation_fq"):
-        for attempt in range(3):   # assignment removal can take a moment to propagate
+        for attempt in range(6):
             try:
                 bq.execute(c, f"DROP RESERVATION IF EXISTS `{plan['reservation_fq']}`")
                 dropped.append(plan["reservation_fq"])
                 break
             except Exception:
-                if attempt == 2:
+                if attempt == 5:
                     raise
                 time.sleep(10)
-    _progress(c, cs, "ROLLED_BACK", {"dropped": dropped, "billing_model": "ON_DEMAND"})
+    _progress(c, cs, "ROLLED_BACK", {"dropped": dropped, "billing_model": "ON_DEMAND",
+                                     "routing_confirmed_on_demand": routed_back})
 
 
 # ---------------------------------------------------------------------------

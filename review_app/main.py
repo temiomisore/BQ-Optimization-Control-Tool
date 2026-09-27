@@ -273,8 +273,28 @@ def queue():
         "class_counts": class_counts,
     }
 
+    # Latest W-01 sizing (any state) for the Project-Wide Billing Fit panel
+    w01 = None
+    try:
+        w_rows = bq.query(c, f"""SELECT evidence_json, proposed_change_json FROM `{c.ops}.change_sets`
+                                 WHERE 'W-01' IN UNNEST(rule_ids) ORDER BY created_at DESC LIMIT 1""")
+        if w_rows:
+            ev = bq.loads(w_rows[0].get("evidence_json")) or {}
+            pr = bq.loads(w_rows[0].get("proposed_change_json")) or {}
+            od = float(ev.get("on_demand_spend_monthly") or 0.0)
+            o1 = float(ev.get("option_1_monthly_cost_usd") or 0.0)
+            o2 = float(ev.get("option_2_monthly_cost_usd") or 0.0)
+            w01 = {"tib": float(ev.get("bytes_scanned_tib_30d") or 0.0), "od": od, "o1": o1, "o2": o2,
+                   "o1_pct": int(round(100 * o1 / od)) if od else 0,
+                   "o2_pct": int(round(100 * o2 / od)) if od else 0,
+                   "baseline": int(pr.get("recommended_baseline_slots") or 0),
+                   "max": int(pr.get("recommended_autoscale_max_slots") or 0)}
+    except Exception:
+        w01 = None
+
     return render_template(
         "index.html",
+        w01=w01,
         cards=cards,
         blocked_cards=blocked_cards,
         regressed_cards=regressed_cards,
@@ -300,9 +320,12 @@ _COPILOT_REFERENCE = {
     ),
     "W-01": (
         "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison:**\n\n"
-        "• **Current On-Demand Spend**: **$9,062.50 / month** (`1,450 TiB` scanned @ `$6.25/TiB`).\n"
-        "• **🏢 Option 1 (100-Slot Baseline + 200 Autoscaling Burst)**: **$3,850.00 / month** → Saves **$5,212.50/mo (58% reduction)**. Best for steady 24/7 enterprise ETL + daytime BI.\n"
-        "• **⚡ Option 2 (0-Slot Baseline + Pure Autoscaling 0→300 Slots)**: **$1,170.00 / month** → Saves **$7,892.50/mo (87% reduction)**. Best for spiky or daytime-only workloads with **$0.00 overnight idle cost** and no annual commitment."
+        "• Compares the project's On-Demand spend ($6.25/TiB scanned) with two Enterprise reservation options.\n"
+        "• **Sizing comes from real per-minute slot usage** in `INFORMATION_SCHEMA.JOBS_TIMELINE` (30 days): "
+        "baseline = median slots across ALL minutes (idle = 0) rounded down to 50; max = p99 busy-minute slots rounded up to 50.\n"
+        "• **🏢 Option 1**: baseline slots (always billed) + autoscale up to the max. Best for steady 24/7 load.\n"
+        "• **⚡ Option 2**: 0 baseline + autoscale up to the max — $0 idle cost, no commitment. Best for spiky workloads.\n"
+        "• Use the live card's evidence (`capacity_sizing`, `option_1/2_monthly_cost_usd`, `option_1/2_savings_usd`) for exact numbers."
     ),
     "CLASS4_ENGINES": (
         "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
@@ -514,7 +537,13 @@ def decision():
         category = request.form.get("category", "REGRESSION_PERFORMANCE")
         note = request.form.get("note") or f"Rollback requested via Web UI by {who}"
         from optimizer import cli
-        cli.cmd_rollback(c, cs_id, reason=note, category=category, snooze_days=90, actor=who)
+        try:
+            cli.cmd_rollback(c, cs_id, reason=note, category=category, snooze_days=90, actor=who)
+        except Exception as e:  # stays ROLLING_BACK -> button remains available for retry
+            from markupsafe import escape
+            return (f"<h3>Rollback failed</h3><pre>{escape(str(e))}</pre>"
+                    f"<p>The change set is left in ROLLING_BACK; fix the cause and click Rollback again.</p>"
+                    f"<a href='{url_for('queue')}'>Back to review queue</a>"), 500
     else:  # reject
         store.reject(c, cs_id, who,
                      request.form.get("reason", "OTHER"),

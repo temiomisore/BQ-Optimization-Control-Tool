@@ -232,6 +232,21 @@ class TestRollbackSnooze(unittest.TestCase):
         self.assertNotIn("_", p1["reservation_name"] + p2["reservation_name"])
 
 
+    def test_size_capacity_from_profile(self):
+        from optimizer import rules
+        self.assertEqual(rules.size_capacity(None), (100, 300, "DEFAULT_NO_TELEMETRY"))
+        # spiky, mostly idle: baseline 0, ceiling from p99 busy minutes
+        b, m, src = rules.size_capacity({"p50_all": 0.4, "p99_busy": 212, "peak": 480, "busy_minutes": 900})
+        self.assertEqual((b, m, src), (0, 250, "JOBS_TIMELINE_30D"))
+        # steady load: baseline rounded down, ceiling >= baseline + 50
+        b, m, _ = rules.size_capacity({"p50_all": 130, "p99_busy": 140, "peak": 160, "busy_minutes": 40000})
+        self.assertEqual((b, m), (100, 150))
+        # tiny workload: minimum 50-slot ceiling
+        self.assertEqual(rules.size_capacity({"p50_all": 0, "p99_busy": 3, "peak": 5, "busy_minutes": 10})[:2], (0, 50))
+        # ceiling capped at 2x peak
+        self.assertEqual(rules.size_capacity({"p50_all": 0, "p99_busy": 900, "peak": 100, "busy_minutes": 10})[:2], (0, 200))
+
+
 if __name__ == "__main__":
     unittest.main()
 

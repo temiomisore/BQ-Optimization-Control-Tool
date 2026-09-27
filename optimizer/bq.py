@@ -71,6 +71,23 @@ def _params(named: dict[str, Any] | None):
     return out
 
 
+_RESERVATION_TRANSIENT = ("does not have the reservation", "no slots are configured")
+
+
+def _with_reservation_retry(fn, attempts: int = 12, delay_s: float = 10.0):
+    """After a reservation assignment is created/dropped, BigQuery can reject queries for a
+    few minutes ('project does not have the reservation in the data region or no slots are
+    configured') while routing propagates. Retry those — and only those — errors."""
+    import time
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            if i == attempts - 1 or not any(s in str(e) for s in _RESERVATION_TRANSIENT):
+                raise
+            time.sleep(delay_s)
+
+
 def query(c: Config, sql: str, params: dict[str, Any] | None = None) -> list[dict]:
     """Run a SELECT, return rows as plain dicts with optional maximum_bytes_billed cost guardrail."""
     from google.cloud import bigquery
@@ -78,22 +95,38 @@ def query(c: Config, sql: str, params: dict[str, Any] | None = None) -> list[dic
     jc_kwargs: dict[str, Any] = {"query_parameters": _params(params)}
     if max_bytes:
         jc_kwargs["maximum_bytes_billed"] = int(max_bytes)
-    job = client(c).query(sql, job_config=bigquery.QueryJobConfig(**jc_kwargs))
-    return [dict(r) for r in job.result()]
+
+    def _run():
+        job = client(c).query(sql, job_config=bigquery.QueryJobConfig(**jc_kwargs))
+        return [dict(r) for r in job.result()]
+    return _with_reservation_retry(_run)
 
 
 def execute(c: Config, sql: str, params: dict[str, Any] | None = None) -> int:
     """Run DML / DDL; return affected row count when the API reports one."""
     from google.cloud import bigquery
-    job = client(c).query(sql, job_config=bigquery.QueryJobConfig(query_parameters=_params(params)))
-    job.result()
-    return job.num_dml_affected_rows or 0
+
+    def _run():
+        job = client(c).query(sql, job_config=bigquery.QueryJobConfig(query_parameters=_params(params)))
+        job.result()
+        return job.num_dml_affected_rows or 0
+    return _with_reservation_retry(_run)
+
+
+def probe_reservation(c: Config) -> str | None:
+    """Run a trivial query and return the reservation it ran on (None = on-demand)."""
+    def _run():
+        job = client(c).query("SELECT 1")
+        job.result()
+        return (job._properties.get("statistics") or {}).get("reservation_id")
+    return _with_reservation_retry(_run)
 
 
 def run_file(c: Config, path: str) -> None:
     """Submit a whole .sql file as one multi-statement job (scripts supported)."""
     with open(path) as f:
-        client(c).query(f.read()).result()
+        sql = f.read()
+    _with_reservation_retry(lambda: client(c).query(sql).result())
 
 
 def dumps(obj: Any) -> str:
