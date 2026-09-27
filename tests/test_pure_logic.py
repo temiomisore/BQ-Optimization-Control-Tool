@@ -251,3 +251,22 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestPrHandoff(unittest.TestCase):
+    def test_build_package(self):
+        from optimizer.executor import pr_handoff
+        cs = {
+            "change_set_id": "8723f618-988e-4ba1-8912-3f1efeb9a7b8",
+            "rule_ids": ["R-SQL-01"],
+            "target_project": "p", "target_dataset": "queries", "target_table": "hash_logs_audit_query",
+            "evidence": {"current_sql": "SELECT * FROM t", "proposed_sql": "SELECT a FROM t"},
+            "proposed": {}, "net_monthly_value_usd": 1234.5,
+        }
+        pkg = pr_handoff.build(None, cs)
+        self.assertEqual(pkg["branch"], "bqopt/r-sql-01-8723f618")
+        self.assertEqual(pkg["file_path"], "models/analytics/queries/hash_logs_audit_query.sql")
+        self.assertIn("gh pr create --base main --head bqopt/r-sql-01-8723f618", pkg["gh_command"])
+        self.assertIn("$1,234/mo", pkg["pr_title"])
+        self.assertEqual(pkg["proposed_sql"], "SELECT a FROM t")
+        self.assertEqual(pr_handoff.HANDOFF_STATE, "PR_HANDED_OFF")

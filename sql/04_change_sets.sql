@@ -61,6 +61,7 @@ CLUSTER BY state, target_dataset;
 --   DETECTED -> SCORED -> PENDING_REVIEW -> {APPROVED | REJECTED | EXPIRED | SUPERSEDED}
 --   APPROVED -> SCHEDULED -> APPLYING -> APPLIED -> VERIFYING -> {VERIFIED | REGRESSED}
 --   REGRESSED -> ROLLING_BACK -> ROLLED_BACK ;  APPLYING -> FAILED (clean abort)
+--   CI_PULL_REQUEST (Class 4): APPROVED -> PR_HANDED_OFF -> (PR merged) -> APPLIED -> VERIFYING
 
 -- Rolling realized/predicted per rule — feeds the d_history confidence factor.
 CREATE TABLE IF NOT EXISTS optimizer_ops.rule_accuracy (

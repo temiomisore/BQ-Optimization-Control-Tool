@@ -16,7 +16,7 @@ import sys
 
 from . import bq, collector_driver, compiler, rules, scoring, store, verifier
 from .config import cfg
-from .executor import class1, class2, class3, recommender_sync, router
+from .executor import class1, class2, class3, pr_handoff, recommender_sync, router
 
 
 def cmd_init(c) -> None:
@@ -136,8 +136,18 @@ def cmd_execute(c) -> None:
             continue
         target = f"{cs['target_dataset']}.{cs.get('target_table') or '*'}"
         if cs.get("execution_route") == "CI_PULL_REQUEST":
-            print(f"skip {cs['change_set_id']} ({target}): CI_PULL_REQUEST route — "
-                  f"emit the MR from proposed_change_json (phase-4 wiring)")
+            # Code changes (Class 4 SQL rewrites) are never applied directly: hand them off
+            # to an engineer as a ready-to-open pull request instead of skipping forever.
+            try:
+                pkg = pr_handoff.hand_off(c, cs)
+                print(f"handed off {cs['change_set_id']} ({target}) for code review -> {pr_handoff.HANDOFF_STATE}\n"
+                      f"    branch : {pkg['branch']}\n"
+                      f"    file   : {pkg['file_path']}\n"
+                      f"    open PR: {pkg['gh_command']}\n"
+                      f"    next   : after the PR merges, click 'Mark PR merged' in the review UI "
+                      f"(PR hand-offs tab) to start savings verification")
+            except Exception as e:
+                print(f"failed  {cs['change_set_id']} ({target}): PR hand-off error: {e}", file=sys.stderr)
             continue
         try:
             router.check_window(c)
@@ -229,7 +239,13 @@ def cmd_rollback(c, change_set_id: str, reason: str = "Manual 1-Click Rollback v
     actor_name = actor or _get_user_actor()
     store.transition(c, change_set_id, "ROLLING_BACK", actor_name, note=reason)
     try:
-        (class3 if int(cs["apply_class"]) == 3 else class1).rollback(c, cs)
+        if cs.get("execution_route") == "CI_PULL_REQUEST" or int(cs["apply_class"]) == 4:
+            # Code change shipped via PR: nothing to undo in BigQuery; the PR must be reverted in git.
+            plan = bq.loads(cs.get("rollback_plan_json")) or {}
+            print(f"[!] Class 4 code change: revert the PR in git"
+                  f"{' (' + plan['pr_url'] + ')' if plan.get('pr_url') else ''}; no BigQuery objects to restore")
+        else:
+            (class3 if int(cs["apply_class"]) == 3 else class1).rollback(c, cs)
     except Exception as e:
         if "Not found" in str(e) or "404" in str(e):
             print(f"[!] Note: backup table already restored or absent ({e}); completing state transition to ROLLED_BACK")

@@ -205,8 +205,20 @@ def _dashboard_data(c) -> dict:
         cs["snooze_until_display"] = cs.get("snooze_until")
         rolled_back_cards.append(cs)
 
+    # Class 4 code changes handed off for a pull request, awaiting "Mark PR merged"
+    handoff_cards = []
+    try:
+        for cs in store.in_state(c, "PR_HANDED_OFF"):
+            cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
+            cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
+            cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
+            cs["handoff"] = bq.loads(cs.get("progress_json")) or {}
+            handoff_cards.append(cs)
+    except Exception:
+        handoff_cards = []
+
     # Associate director and department mapping from v_director_recommendations if available
-    all_items = cards + blocked_cards + regressed_cards + rolled_back_cards
+    all_items = cards + blocked_cards + regressed_cards + rolled_back_cards + handoff_cards
     try:
         dir_rows = bq.query(c, f"SELECT change_set_id, director_name, department, team_readers_count, team_queries_count, team_billed_gb FROM `{c.ops}.v_director_recommendations`")
         dir_map = {r["change_set_id"]: r for r in dir_rows}
@@ -262,6 +274,7 @@ def _dashboard_data(c) -> dict:
         "blocked_count": blocked_count,
         "regressed_count": regressed_count,
         "rolled_back_count": rolled_back_count,
+        "handoff_count": len(handoff_cards),
         "directors_count": len(directors_set),
         "departments_count": len(departments_set),
         "applied_count": len(receipts),
@@ -297,6 +310,7 @@ def _dashboard_data(c) -> dict:
         blocked_cards=blocked_cards,
         regressed_cards=regressed_cards,
         rolled_back_cards=rolled_back_cards,
+        handoff_cards=handoff_cards,
         receipts=receipts,
         reasons=REASONS,
         reviewer_email=reviewer_email,
@@ -362,7 +376,7 @@ _JSON_BLOBS = ("evidence_json", "proposed_change_json", "confidence_factors_json
 def api_dashboard():
     from flask import jsonify
     data = _dashboard_data(cfg())
-    for key in ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards"):
+    for key in ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards", "handoff_cards"):
         for cs in data[key]:
             for blob in _JSON_BLOBS:          # already parsed into evidence/proposed/factors
                 cs.pop(blob, None)
@@ -580,6 +594,14 @@ def _apply_decision(c, form, who: str) -> dict:
     card in ROLLING_BACK so it can be retried."""
     cs_id = form.get("change_set_id")
     action = form.get("action", "reject")
+
+    if action == "pr_merged":
+        from optimizer.executor import pr_handoff
+        cs = store.get(c, cs_id)
+        if not cs:
+            raise ValueError(f"change set {cs_id} not found")
+        pr_handoff.mark_merged(c, cs, who, form.get("pr_url"))
+        return {"action": action, "status": "VERIFYING"}
 
     if action == "approve":
         cs = store.get(c, cs_id)

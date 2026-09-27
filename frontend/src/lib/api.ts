@@ -47,6 +47,23 @@ export interface ChangeSet {
   rollback_actor?: string;
   forensics_table?: string | null;
   rejection_reason?: string | null;
+  handoff?: PrHandoff;
+}
+
+/** Class 4 PR hand-off package (optimizer/executor/pr_handoff.py). */
+export interface PrHandoff {
+  type?: string;
+  handed_off_at?: string;
+  branch?: string;
+  file_path?: string;
+  commit_message?: string;
+  pr_title?: string;
+  pr_body?: string;
+  git_commands?: string;
+  gh_command?: string;
+  current_sql?: string;
+  proposed_sql?: string;
+  pr_url?: string | null;
 }
 
 export interface Receipt {
@@ -72,6 +89,7 @@ export interface Dashboard {
   blocked_cards: ChangeSet[];
   regressed_cards: ChangeSet[];
   rolled_back_cards: ChangeSet[];
+  handoff_cards: ChangeSet[];
   receipts: Receipt[];
   reasons: string[];
   reason_snooze_days: Record<string, number>;
@@ -84,6 +102,7 @@ export interface Dashboard {
     blocked_count: number;
     regressed_count: number;
     rolled_back_count: number;
+    handoff_count?: number;
     directors_count: number;
     departments_count: number;
     applied_count: number;
@@ -102,7 +121,7 @@ export interface Dashboard {
   datasets: string[];
 }
 
-export type DecisionAction = "approve" | "reject" | "reset" | "unsnooze" | "rollback";
+export type DecisionAction = "approve" | "reject" | "reset" | "unsnooze" | "rollback" | "pr_merged";
 
 export interface DecisionRequest {
   change_set_id: string;
@@ -113,6 +132,7 @@ export interface DecisionRequest {
   reason?: string;
   category?: string;
   note?: string;
+  pr_url?: string;
 }
 
 async function asJson<T>(res: Response): Promise<T> {

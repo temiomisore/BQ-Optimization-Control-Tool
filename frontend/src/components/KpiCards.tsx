@@ -4,7 +4,7 @@ import type { Dashboard } from "@/lib/api";
 import { AnimatedNumber, Skeleton } from "./ui";
 import { cn, usd } from "@/lib/utils";
 
-export type TabKey = "queue" | "blocked" | "regressed" | "rolled_back" | "receipts";
+export type TabKey = "queue" | "handoffs" | "blocked" | "regressed" | "rolled_back" | "receipts";
 
 export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey) => void }) {
   if (!data) {

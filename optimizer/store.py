@@ -43,7 +43,7 @@ def open_sets(c: Config) -> list[dict]:
                target_project, target_dataset, target_table,
                ARRAY_LENGTH(IFNULL(approvals, [])) AS n_approvals
         FROM {_t(c)}
-        WHERE state IN ('PENDING_REVIEW','APPROVED','SCHEDULED','APPLYING','APPLIED','VERIFYING')
+        WHERE state IN ('PENDING_REVIEW','APPROVED','SCHEDULED','PR_HANDED_OFF','APPLYING','APPLIED','VERIFYING')
            OR (state IN ('REJECTED', 'ROLLED_BACK') AND snooze_until > CURRENT_TIMESTAMP())
            OR (state = 'VERIFIED' AND applied_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY))""")
 

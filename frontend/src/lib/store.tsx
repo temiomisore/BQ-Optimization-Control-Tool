@@ -28,6 +28,7 @@ const LABELS: Record<string, [string, string]> = {
   reject: ["Rejecting…", "Rejected & snoozed"],
   reset: ["Resetting…", "Moved back to the review queue"],
   unsnooze: ["Un-snoozing…", "Back in the review queue"],
+  pr_merged: ["Recording merge…", "PR marked merged — savings verification started"],
   rollback: ["Rolling back… (can take up to ~3 min for reservations)", "Rolled back"],
 };
 

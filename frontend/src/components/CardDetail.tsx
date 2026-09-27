@@ -61,7 +61,9 @@ export function CardDetail({
     ? approvals.length === 0
       ? "Approve (Sign-off 1/2: Data Owner)"
       : "Sign-off 2/2: Platform"
-    : "Approve Change";
+    : isPr
+      ? "Approve for PR hand-off"
+      : "Approve Change";
   const optLabels = w02
     ? ["Option 1: 50-Slot Human Sandbox + 50 GB Cap", "Option 2: Audit SQL"]
     : ["Option 1: Baseline + Autoscale", "Option 2: 0-Baseline Autoscale"];

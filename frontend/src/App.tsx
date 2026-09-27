@@ -15,6 +15,7 @@ import { BlockedList, ReceiptsTable, RegressedBanner, RegressedList, RolledBackL
 import { GeminiAssistDrawer } from "@/components/GeminiAssistDrawer";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PrModal } from "@/components/PrModal";
+import { HandoffList } from "@/components/HandoffList";
 import { Button, Empty, Skeleton } from "@/components/ui";
 
 function applyFilters(cards: ChangeSet[], f: Filters) {
@@ -67,6 +68,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
 
   const tabs: { key: TabKey; label: string; count: number; tone?: string }[] = [
     { key: "queue", label: "Review queue", count: cards.length },
+    { key: "handoffs", label: "PR hand-offs", count: data?.handoff_cards?.length || 0, tone: "text-violet-400" },
     { key: "blocked", label: "Blocked", count: data?.blocked_cards.length || 0, tone: "text-amber-400" },
     { key: "regressed", label: "Regressed", count: data?.regressed_cards.length || 0, tone: "text-rose-400" },
     { key: "rolled_back", label: "Rolled back", count: data?.rolled_back_cards.length || 0 },
@@ -168,6 +170,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           </>
         )}
 
+        {data && tab === "handoffs" && <HandoffList cards={data.handoff_cards || []} />}
         {data && tab === "blocked" && <BlockedList cards={data.blocked_cards} data={data} />}
         {data && tab === "regressed" && <RegressedList cards={data.regressed_cards} />}
         {data && tab === "rolled_back" && <RolledBackList cards={data.rolled_back_cards} />}
