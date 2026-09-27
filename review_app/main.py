@@ -289,83 +289,173 @@ def queue():
     )
 
 
+# Product reference material for the FinOps Copilot. These are background facts
+# the model can draw on; they are NOT returned verbatim for unrelated questions.
+_COPILOT_REFERENCE = {
+    "W-02": (
+        "🛡️ **How Rule `W-02` (Proactive Cost Guardrail) Protects Your Production ETL Pipelines:**\n\n"
+        "1. **Smart `user_email` Filtering**: Every BigQuery job in `INFORMATION_SCHEMA.JOBS` stamps `user_email`. Our optimizer separates **Human Ad-Hoc Users** (`user_email NOT LIKE '%.gserviceaccount.com'`) from **Service Accounts & Production ETL** (`*.iam.gserviceaccount.com`, `airflow`, `dbt`, `dataform`).\n"
+        "2. **👤 Human Analysts Only**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human_adhoc_sandbox_pool`)** so an accidental `SELECT *` without a `WHERE` clause is stopped in 0ms before billing.\n"
+        "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise_prod_pool`), guaranteeing **0% pipeline breakage**."
+    ),
+    "W-01": (
+        "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison:**\n\n"
+        "• **Current On-Demand Spend**: **$9,062.50 / month** (`1,450 TiB` scanned @ `$6.25/TiB`).\n"
+        "• **🏢 Option 1 (100-Slot Baseline + 200 Autoscaling Burst)**: **$3,850.00 / month** → Saves **$5,212.50/mo (58% reduction)**. Best for steady 24/7 enterprise ETL + daytime BI.\n"
+        "• **⚡ Option 2 (0-Slot Baseline + Pure Autoscaling 0→300 Slots)**: **$1,170.00 / month** → Saves **$7,892.50/mo (87% reduction)**. Best for spiky or daytime-only workloads with **$0.00 overnight idle cost** and no annual commitment."
+    ),
+    "CLASS4_ENGINES": (
+        "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
+        "1. **Engine 1 — Fast Regex Pattern Scanner (`C4-01`..`C4-09`)**: Instantly catches obvious anti-patterns (`SELECT *`, `ORDER BY` without `LIMIT`, `WHERE DATE(col) = ...`).\n"
+        "2. **Engine 2 — Google Official ZetaSQL AST Compiler (`bigquery-antipattern-recognition.jar`)**: Parses queries into an Abstract Syntax Tree (AST) to catch deep structural issues like CTEs evaluated multiple times and `ROW_NUMBER() = 1` sorts.\n"
+        "3. **Engine 3 — Vertex AI Gemini 3 Flash (`gemini-3-flash-preview`) + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
+    ),
+    "APPLY_CLASSES": (
+        "Apply classes: Class 1 = in-place metadata DDL (clustering, require_partition_filter, expirations, "
+        "storage billing model, W-02 guardrail); Class 2 = additive objects (materialized views with max_staleness "
+        "+ cost watchdog); Class 3 = structural rebuilds via the S0-S9 copy-swap-rebind state machine "
+        "(repartitioning, shard consolidation, archive) and W-01 reservation sizing; Class 4 = SQL anti-pattern "
+        "rewrites delivered as CI pull requests (route CI_PULL_REQUEST), never applied directly to BigQuery."
+    ),
+}
+
+_COPILOT_MODELS = [("gemini-3-flash-preview", "global"), ("gemini-2.5-flash", "us-central1")]
+
+
+def _as_float(v) -> float:
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _copilot_context(c, cards: list[dict]) -> str:
+    """Compact, factual snapshot of the live queue used to ground the model."""
+    from collections import Counter
+
+    total_mo = sum(_as_float(x.get("net_monthly_value_usd")) for x in cards)
+    by_class = Counter(str(x.get("apply_class")) for x in cards)
+    by_rule = Counter(r for x in cards for r in (x.get("rule_ids") or []))
+    by_route = Counter(str(x.get("execution_route")) for x in cards)
+    value_by_class: dict[str, float] = {}
+    for x in cards:
+        k = str(x.get("apply_class"))
+        value_by_class[k] = value_by_class.get(k, 0.0) + _as_float(x.get("net_monthly_value_usd"))
+
+    lines = [
+        f"PROJECT: {c.project_id}",
+        f"PENDING REVIEW QUEUE: {len(cards)} cards, total net value ${total_mo:,.2f}/mo (${total_mo * 12:,.2f}/yr)",
+        "CARDS BY APPLY CLASS: " + ", ".join(
+            f"Class {k}: {by_class[k]} cards (${value_by_class[k]:,.2f}/mo)" for k in sorted(by_class)),
+        "CARDS BY RULE: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_rule.items())),
+        "CARDS BY EXECUTION ROUTE: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_route.items())),
+    ]
+    # Lifecycle counts across ALL change sets (not just the pending queue)
+    try:
+        rows = bq.query(c, f"SELECT apply_class, state, COUNT(*) AS n FROM `{c.ops}.change_sets` GROUP BY 1, 2 ORDER BY 1, 2")
+        lines.append("ALL CHANGE SETS BY CLASS & STATE (every lifecycle state): " + ", ".join(
+            f"Class {r['apply_class']} {r['state']}: {r['n']}" for r in rows))
+    except Exception:
+        pass
+
+    lines.append("\nPENDING CARDS (sorted by net monthly value, highest first):")
+    for x in sorted(cards, key=lambda x: _as_float(x.get("net_monthly_value_usd")), reverse=True):
+        summary = (x.get("finding_summary") or "").replace("\n", " ")[:220]
+        lines.append(
+            f"- id={x.get('change_set_id')} | rules={','.join(x.get('rule_ids') or [])} | class={x.get('apply_class')} "
+            f"| target={x.get('target_dataset')}.{x.get('target_table')} | net=${_as_float(x.get('net_monthly_value_usd')):,.2f}/mo "
+            f"| confidence={x.get('confidence')} | route={x.get('execution_route')} | state={x.get('state')} "
+            f"| owner={x.get('director_name') or x.get('owner_principal') or 'unassigned'} | summary={summary}"
+        )
+    return "\n".join(lines)
+
+
+def _copilot_offline_answer(c, cards: list[dict], q: str) -> str:
+    """Deterministic fallback used only when Gemini is unreachable. Answers from real queue data."""
+    import re
+    from collections import Counter
+
+    ql = q.lower()
+    total_mo = sum(_as_float(x.get("net_monthly_value_usd")) for x in cards)
+    by_class = Counter(str(x.get("apply_class")) for x in cards)
+    note = "\n\n_⚠️ Gemini is currently unreachable — this is an offline answer computed from the live queue._"
+
+    m = re.search(r"class\s*([1-4])", ql)
+    if m and any(k in ql for k in ("how many", "count", "number of", "total")):
+        k = m.group(1)
+        return f"You have **{by_class.get(k, 0)} Class {k}** change set(s) pending review (out of {len(cards)} total)." + note
+    if any(k in ql for k in ("w-02", "service account")):
+        return _COPILOT_REFERENCE["W-02"] + note
+    if any(k in ql for k in ("w-01", "option 1", "option 2", "edition")):
+        return _COPILOT_REFERENCE["W-01"] + note
+    if "class 4" in ql and any(k in ql for k in ("engine", "zetasql", "how do", "how does", "work")):
+        return _COPILOT_REFERENCE["CLASS4_ENGINES"] + note
+
+    top = sorted(cards, key=lambda x: _as_float(x.get("net_monthly_value_usd")), reverse=True)[:5]
+    top_lines = "\n".join(
+        f"• **{i + 1}. `{','.join(x.get('rule_ids') or [])}` on `{x.get('target_dataset')}.{x.get('target_table')}`** — "
+        f"**${_as_float(x.get('net_monthly_value_usd')):,.0f}/mo** (Class {x.get('apply_class')})"
+        for i, x in enumerate(top))
+    class_line = ", ".join(f"Class {k}: {by_class[k]}" for k in sorted(by_class))
+    return (
+        f"📊 **Live Queue Summary (`{c.project_id}`)**\n\n"
+        f"• **{len(cards)} pending cards** worth **${total_mo:,.0f}/mo** ({class_line})\n\n"
+        f"**Top 5 by net monthly value:**\n{top_lines}" + note
+    )
+
+
 @app.post("/api/finops-chat")
 def finops_chat():
-    """Gemini 3 FinOps Copilot endpoint (building-data-apps pattern)."""
+    """Gemini FinOps Copilot: answers the user's actual question, grounded in the live queue."""
     c = cfg()
     payload = request.get_json(silent=True) or {}
-    q = (payload.get("question") or "").strip()
+    q = (payload.get("question") or "").strip()[:2000]
     if not q:
         return {"answer": "Ask me anything about your active BigQuery optimization queue, W-01 Edition Sizing, W-02 Human vs. Service Account Guardrails, or Class 4 SQL rewrites!"}, 200
 
     try:
-        cards_raw = store.pending(c)
+        cards = store.pending(c)
     except Exception:
-        cards_raw = []
+        cards = []
 
-    top_items = sorted(cards_raw, key=lambda x: float(x.get("net_monthly_value_usd") or 0.0), reverse=True)[:5]
-    total_mo = sum(float(x.get("net_monthly_value_usd") or 0.0) for x in cards_raw)
-    ql = q.lower()
+    # Optional short conversation history from the UI: [{"role": "user"|"ai", "text": "..."}]
+    history = payload.get("history") or []
+    history_txt = "\n".join(
+        f"{'User' if h.get('role') == 'user' else 'Copilot'}: {str(h.get('text') or '')[:800]}"
+        for h in history[-6:] if isinstance(h, dict))
 
-    # Fast, deterministic executive answers for core FinOps questions + Vertex AI Gemini 3 augmentation
-    if any(k in ql for k in ("w-02", "service account", "etl", "5,000", "5000", "guardrail", "break", "cap")):
-        ans = (
-            "🛡️ **How Rule `W-02` (Proactive Cost Guardrail) Protects Your Production ETL Pipelines:**\n\n"
-            "1. **Smart `user_email` Filtering**: Every BigQuery job in `INFORMATION_SCHEMA.JOBS` stamps `user_email`. Our optimizer separates **Human Ad-Hoc Users** (`user_email NOT LIKE '%.gserviceaccount.com'`) from **Service Accounts & Production ETL** (`*.iam.gserviceaccount.com`, `airflow`, `dbt`, `dataform`).\n"
-            "2. **👤 Human Analysts Only**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human_adhoc_sandbox_pool`)** so an accidental `SELECT *` without a `WHERE` clause is stopped in 0ms before billing.\n"
-            "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise_prod_pool`), guaranteeing **0% pipeline breakage**."
-        )
-        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
-
-    if any(k in ql for k in ("w-01", "option 1", "option 2", "edition", "slot", "baseline", "autoscale")):
-        ans = (
-            "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison:**\n\n"
-            "• **Current On-Demand Spend**: **$9,062.50 / month** (`1,450 TiB` scanned @ `$6.25/TiB`).\n"
-            "• **🏢 Option 1 (100-Slot Baseline + 200 Autoscaling Burst)**: **$3,850.00 / month** → Saves **$5,212.50/mo (58% reduction)**. Best for steady 24/7 enterprise ETL + daytime BI.\n"
-            "• **⚡ Option 2 (0-Slot Baseline + Pure Autoscaling 0→300 Slots)**: **$1,170.00 / month** → Saves **$7,892.50/mo (87% reduction)**. Best for spiky or daytime-only workloads with **$0.00 overnight idle cost** and no annual commitment."
-        )
-        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
-
-    if any(k in ql for k in ("engine", "class 4", "antipattern", "anti-pattern", "three", "zetasql")):
-        ans = (
-            "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
-            "1. **Engine 1 — Fast Regex Pattern Scanner (`C4-01`..`C4-09`)**: Instantly catches obvious anti-patterns (`SELECT *`, `ORDER BY` without `LIMIT`, `WHERE DATE(col) = ...`).\n"
-            "2. **Engine 2 — Google Official ZetaSQL AST Compiler (`bigquery-antipattern-recognition.jar`)**: Parses queries into an Abstract Syntax Tree (AST) to catch deep structural issues like CTEs evaluated multiple times and `ROW_NUMBER() = 1` sorts.\n"
-            "3. **Engine 3 — Vertex AI Gemini 3 Flash (`gemini-3-flash-preview`) + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
-        )
-        return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
-
-    top_lines = "\n".join(
-        f"• **{i+1}. `{','.join(x.get('rule_ids') or [])}` on `{x.get('target_dataset')}.{x.get('target_table')}`** — **${float(x.get('net_monthly_value_usd') or 0):,.0f}/mo** (`Class {x.get('apply_class')}`, Owner: {x.get('director_name') or 'Platform'})"
-        for i, x in enumerate(top_items)
+    system_instruction = (
+        f"You are the Gemini FinOps Copilot for the BigQuery Optimization Control Plane (project {c.project_id}).\n"
+        "RULES:\n"
+        "1. Answer EXACTLY the question the user asked. Put the direct answer (e.g. the number, name or yes/no) in the first sentence.\n"
+        "2. For anything about the queue, counts, dollars, tables, rules or owners, use ONLY the LIVE QUEUE DATA below. "
+        "Count carefully from the data. Never invent numbers, tables or IDs.\n"
+        "3. If the data does not contain the answer, say so plainly and suggest where to look.\n"
+        "4. Use the PRODUCT REFERENCE only when the user asks how something works; do not paste it for unrelated questions.\n"
+        "5. Be concise: markdown, at most ~150 words, bullets when listing items.\n\n"
+        "=== LIVE QUEUE DATA ===\n" + _copilot_context(c, cards) + "\n\n"
+        "=== PRODUCT REFERENCE ===\n" + "\n\n".join(f"[{k}]\n{v}" for k, v in _COPILOT_REFERENCE.items())
     )
-    if not any(k in ql for k in ("highest", "top", "roi", "summary", "queue")):
-        try:
-            from google import genai
-            proj = c.get("project_id", "temi-project-408005")
-            sys_ctx = (
-                f"You are the Gemini 3 FinOps Copilot for project {proj}. "
-                f"Total active monthly savings in queue: ${total_mo:,.0f}/mo across {len(cards_raw)} cards. "
-                f"Top items:\n{top_lines}\n"
-                f"Answer the user's question concisely in markdown (max 120 words): {q}"
-            )
-            for cand_model, loc in [("gemini-3-flash-preview", "global"), ("gemini-3.1-pro-preview", "global"), ("gemini-2.5-flash", "us-central1")]:
-                try:
-                    gclient = genai.Client(vertexai=True, project=proj, location=loc)
-                    r = gclient.models.generate_content(model=cand_model, contents=sys_ctx)
-                    if r and r.text:
-                        return {"answer": r.text.strip(), "model": cand_model}, 200
-                except Exception:
-                    continue
-        except Exception:
-            pass
+    contents = (f"Conversation so far:\n{history_txt}\n\n" if history_txt else "") + f"User question: {q}"
 
-    ans = (
-        f"📊 **Live Queue Executive Summary (`{c.project_id}`)**:\n\n"
-        f"• **Total Identified Savings**: **${total_mo:,.0f} / month** (**${total_mo * 12:,.0f} / year**) across **{len(cards_raw)} active recommendations**.\n\n"
-        f"**Top 5 Highest-ROI Recommendations Ready for Approval:**\n{top_lines}"
-    )
-    return {"answer": ans, "model": "gemini-3-flash-preview"}, 200
+    try:
+        from google import genai
+        from google.genai import types
+
+        gen_cfg = types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2)
+        for model, loc in _COPILOT_MODELS:
+            try:
+                gclient = genai.Client(vertexai=True, project=c.project_id, location=loc,
+                                       http_options=types.HttpOptions(timeout=30_000))
+                r = gclient.models.generate_content(model=model, contents=contents, config=gen_cfg)
+                if r and r.text:
+                    return {"answer": r.text.strip(), "model": model}, 200
+            except Exception as e:  # try the next model
+                app.logger.warning("FinOps Copilot model %s@%s failed: %s", model, loc, e)
+    except Exception as e:
+        app.logger.warning("FinOps Copilot: google-genai unavailable: %s", e)
+
+    return {"answer": _copilot_offline_answer(c, cards, q), "model": "offline-fallback"}, 200
 
 
 

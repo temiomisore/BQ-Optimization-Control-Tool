@@ -1610,6 +1610,16 @@ function selectReservationOption(cardId, optNum, btnEl) {
   btnEl.style.background = 'var(--accent-primary)';
   btnEl.style.color = '#fff';
   btnEl.style.borderColor = 'var(--accent-primary)';
+
+  // Update the card's headline savings figure to match the selected option (W-01 cards carry both values)
+  const moneyEl = document.getElementById('money-' + cardId);
+  if (moneyEl && moneyEl.dataset.opt1Savings && moneyEl.dataset.opt2Savings) {
+    const val = parseFloat(optNum === 2 ? moneyEl.dataset.opt2Savings : moneyEl.dataset.opt1Savings);
+    if (!isNaN(val)) moneyEl.textContent = '$' + Math.floor(val);
+    const optLbl = document.getElementById('money-opt-' + cardId);
+    if (optLbl) optLbl.textContent = ' · Option ' + optNum;
+  }
+
   showToast(optNum === 2 ? '⚡ Switched to Option 2: 0-Baseline Pure Autoscaling DDL' : '🏢 Switched to Option 1: 100-Slot Baseline + Autoscaling DDL');
 }
 
@@ -2049,6 +2059,21 @@ function onCopilotSubmit(e) {
   sendCopilotQuestion(q);
 }
 
+// Safe minimal markdown renderer: escape HTML first, then apply bold/italic/code/line breaks.
+function renderCopilotMd(text) {
+  const esc = String(text || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return esc
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*\w])_([^_\n]+)_(?=[^\w]|$)/g, '$1<em>$2</em>')
+    .replace(/^\s*[-*]\s+/gm, '• ')
+    .replace(/\n/g, '<br>');
+}
+
+const copilotHistory = [];  // [{role: 'user'|'ai', text}]
+
 function sendCopilotQuestion(questionText) {
   const container = document.getElementById('copilotMessages');
   if (!container) return;
@@ -2064,14 +2089,18 @@ function sendCopilotQuestion(questionText) {
   container.appendChild(loadingDiv);
   container.scrollTop = container.scrollHeight;
 
+  const history = copilotHistory.slice(-6);
   fetch('/api/finops-chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question: questionText })
+    body: JSON.stringify({ question: questionText, history: history })
   })
     .then(r => r.json())
     .then(data => {
-      loadingDiv.innerText = data.answer || 'Ready.';
+      const answer = data.answer || 'Ready.';
+      loadingDiv.innerHTML = renderCopilotMd(answer);
+      if (data.model) loadingDiv.title = 'Answered by: ' + data.model;
+      copilotHistory.push({ role: 'user', text: questionText }, { role: 'ai', text: answer });
       container.scrollTop = container.scrollHeight;
     })
     .catch(() => {
@@ -2547,8 +2576,9 @@ function sendCopilotQuestion(questionText) {
   <div class="card-strip">
     <div class="card-money-box">
       <span class="card-index-pill" title="Recommendation {{ loop.index }} of {{ cards|length }}">#{{ loop.index }}</span>
-      <div class="card-money">${{ '%.0f'|format(c.net_monthly_value_usd or 0) }}</div>
-      <div class="card-money-sub">net / month · confidence {{ '%.2f'|format(c.confidence or 0) }}</div>
+      {% set has_opt_savings = c.evidence and c.evidence.option_1_savings_usd is number and c.evidence.option_2_savings_usd is number %}
+      <div class="card-money" id="money-{{ c.change_set_id }}"{% if has_opt_savings %} data-opt1-savings="{{ c.evidence.option_1_savings_usd }}" data-opt2-savings="{{ c.evidence.option_2_savings_usd }}"{% endif %}>${{ '%.0f'|format(c.net_monthly_value_usd or 0) }}</div>
+      <div class="card-money-sub">net / month · confidence {{ '%.2f'|format(c.confidence or 0) }}<span id="money-opt-{{ c.change_set_id }}">{% if has_opt_savings %} · Option 1{% endif %}</span></div>
     </div>
     <div class="badges">
       <span class="badge class-{{ c.apply_class }}">CLASS {{ c.apply_class }}</span>
