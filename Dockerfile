@@ -36,6 +36,7 @@ COPY --from=web /web/dist /app/frontend/dist
 RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Multi-threaded Gunicorn worker config for concurrent Cloud Run requests + BigQuery dry-run latency.
+# Single-process multi-threaded Gunicorn config so all requests share the in-memory dashboard cache.
 # Timeout 900s: a W-01 reservation rollback waits for queries to route back to on-demand (can exceed 2 min).
-CMD ["gunicorn", "--bind", ":8080", "--workers", "2", "--threads", "8", "--timeout", "900", "review_app.main:app"]
+CMD ["gunicorn", "--bind", ":8080", "--workers", "1", "--threads", "16", "--timeout", "900", "review_app.main:app"]
+

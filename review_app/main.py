@@ -34,6 +34,23 @@ app = Flask(__name__)
 REASONS = list(store.REJECTION_SNOOZE_DAYS)
 _CACHED_REVIEWER: str | None = None
 
+import copy
+import datetime as _dt
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+_DASHBOARD_LOCK = threading.Lock()
+_DASHBOARD_CACHE: dict[str, dict] = {}   # key -> {"ts": float, "data": dict, "refreshing": bool}
+_CACHE_FRESH_SEC = 45.0                  # Serve instantly from memory; trigger background refresh after 45s
+_CACHE_MAX_STALE_SEC = 900.0             # Hard expiry (15 min) if background refresh hasn't run
+
+
+def invalidate_dashboard_cache() -> None:
+    """Clear cached dashboard snapshot immediately when any decision (approve/reject/rollback) is applied."""
+    with _DASHBOARD_LOCK:
+        _DASHBOARD_CACHE.clear()
+
 
 @app.after_request
 def _apply_security_headers(response):
@@ -56,6 +73,9 @@ def _default_reviewer() -> str:
     if os.environ.get("REVIEWER_EMAIL"):
         return os.environ["REVIEWER_EMAIL"]
     if _CACHED_REVIEWER:
+        return _CACHED_REVIEWER
+    if os.environ.get("K_SERVICE"):
+        _CACHED_REVIEWER = "finops-lead@company.com"
         return _CACHED_REVIEWER
     try:
         import subprocess
@@ -89,161 +109,204 @@ def _who(principal: str | None = None) -> str:
     return _default_reviewer()
 
 
-def _dashboard_data(c) -> dict:
-    """Everything the review UI shows. Shared by the classic Jinja page and /api/dashboard."""
+def _enrich_repartition(cs: dict) -> None:
+    if cs["proposed"].get("action") == "REPARTITION":
+        if not cs["proposed"].get("generated_ddl"):
+            pcol = cs["proposed"].get("partition_column") or "_PARTITIONTIME"
+            gran = cs["proposed"].get("granularity", "DAY")
+            expr = f"DATE({pcol})" if gran == "DAY" else f"TIMESTAMP_TRUNC({pcol}, {gran})"
+            cs["proposed"]["generated_ddl"] = (
+                f"CREATE OR REPLACE TABLE `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`\n"
+                f"PARTITION BY {expr}\n"
+                f"AS SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`;"
+            )
+        if not cs["evidence"].get("current_state") and cs["evidence"].get("current_partitions"):
+            cur_parts = cs["evidence"].get("current_partitions")
+            avg_mb = cs["evidence"].get("avg_partition_size_mb", 0)
+            gran = cs["proposed"].get("granularity", "MONTH")
+            cs["evidence"]["current_state"] = {
+                "partition_granularity": "DAY",
+                "total_partitions": f"{cur_parts:,} partitions",
+                "avg_partition_size": f"{avg_mb} MB (< 10 MB overhead limit)",
+            }
+            cs["evidence"]["proposed_state"] = {
+                "partition_granularity": gran,
+                "target_partitions": f"~{max(1, cur_parts // 30):,} partitions",
+                "optimization": "Reduced metadata scan overhead by ~97%",
+            }
+
+
+def _fetch_dashboard_data_uncached(c) -> dict:
+    """Fetch and compute dashboard state using 2 concurrent BigQuery queries instead of 9 sequential calls."""
+    all_cs_sql = f"""
+        SELECT *
+        FROM `{c.ops}.change_sets`
+        WHERE state IN (
+            'PENDING_REVIEW', 'FAILED', 'REGRESSED', 'ROLLED_BACK',
+            'PR_HANDED_OFF', 'VERIFYING', 'VERIFIED', 'ROLLING_BACK'
+        )
+           OR 'W-01' IN UNNEST(rule_ids)
+    """
+    dir_sql = f"""
+        SELECT change_set_id, director_name, department,
+               team_readers_count, team_queries_count, team_billed_gb
+        FROM `{c.ops}.v_director_recommendations`
+    """
     try:
-        client = bq.client(c)
-        client.get_dataset(f"{c['project_id']}.{c['ops_dataset']}")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_cs = pool.submit(bq.query, c, all_cs_sql)
+            f_dir = pool.submit(bq.query, c, dir_sql)
+            raw_rows = f_cs.result()
+            try:
+                dir_rows = f_dir.result()
+            except Exception:
+                dir_rows = []
     except Exception:
         from optimizer import cli
         cli.cmd_init(c)
+        raw_rows = bq.query(c, all_cs_sql)
+        try:
+            dir_rows = bq.query(c, dir_sql)
+        except Exception:
+            dir_rows = []
+
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+
+    def _is_active_pending(r: dict) -> bool:
+        if r.get("state") != "PENDING_REVIEW":
+            return False
+        exp = r.get("expires_at")
+        if isinstance(exp, _dt.datetime):
+            exp_utc = exp if exp.tzinfo else exp.replace(tzinfo=_dt.timezone.utc)
+            if exp_utc <= now_utc:
+                return False
+        snz = r.get("snooze_until")
+        if isinstance(snz, _dt.datetime):
+            snz_utc = snz if snz.tzinfo else snz.replace(tzinfo=_dt.timezone.utc)
+            if snz_utc >= now_utc:
+                return False
+        return True
+
     cards = []
-    try:
-        cards_raw = store.pending(c)
-    except Exception:
-        from optimizer import cli
-        cli.cmd_init(c)
-        cards_raw = store.pending(c)
-    for cs in cards_raw:
-        cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
-        cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
-        cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
-        if cs["proposed"].get("action") == "REPARTITION":
-            if not cs["proposed"].get("generated_ddl"):
-                pcol = cs["proposed"].get("partition_column") or "_PARTITIONTIME"
-                gran = cs["proposed"].get("granularity", "DAY")
-                expr = f"DATE({pcol})" if gran == "DAY" else f"TIMESTAMP_TRUNC({pcol}, {gran})"
-                cs["proposed"]["generated_ddl"] = f"CREATE OR REPLACE TABLE `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`\nPARTITION BY {expr}\nAS SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`;"
-            if not cs["evidence"].get("current_state") and cs["evidence"].get("current_partitions"):
-                cur_parts = cs["evidence"].get("current_partitions")
-                avg_mb = cs["evidence"].get("avg_partition_size_mb", 0)
-                gran = cs["proposed"].get("granularity", "MONTH")
-                cs["evidence"]["current_state"] = {
-                    "partition_granularity": "DAY",
-                    "total_partitions": f"{cur_parts:,} partitions",
-                    "avg_partition_size": f"{avg_mb} MB (< 10 MB overhead limit)",
-                }
-                cs["evidence"]["proposed_state"] = {
-                    "partition_granularity": gran,
-                    "target_partitions": f"~{max(1, cur_parts // 30):,} partitions",
-                    "optimization": "Reduced metadata scan overhead by ~97%",
-                }
-        cards.append(cs)
-    # Sort strictly by Net Savings Realized ($) DESC
-    cards.sort(key=lambda x: float(x.get("net_monthly_value_usd") or 0.0), reverse=True)
-
-    # Fetch any blocked/failed change sets requiring human resolution
     blocked_cards = []
-    for cs in store.in_state(c, "FAILED"):
-        cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
-        cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
-        cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
-        if cs["proposed"].get("action") == "REPARTITION":
-            if not cs["proposed"].get("generated_ddl"):
-                pcol = cs["proposed"].get("partition_column") or "_PARTITIONTIME"
-                gran = cs["proposed"].get("granularity", "DAY")
-                expr = f"DATE({pcol})" if gran == "DAY" else f"TIMESTAMP_TRUNC({pcol}, {gran})"
-                cs["proposed"]["generated_ddl"] = f"CREATE OR REPLACE TABLE `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`\nPARTITION BY {expr}\nAS SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}`;"
-            if not cs["evidence"].get("current_state") and cs["evidence"].get("current_partitions"):
-                cur_parts = cs["evidence"].get("current_partitions")
-                avg_mb = cs["evidence"].get("avg_partition_size_mb", 0)
-                gran = cs["proposed"].get("granularity", "MONTH")
-                cs["evidence"]["current_state"] = {
-                    "partition_granularity": "DAY",
-                    "total_partitions": f"{cur_parts:,} partitions",
-                    "avg_partition_size": f"{avg_mb} MB (< 10 MB overhead limit)",
-                }
-                cs["evidence"]["proposed_state"] = {
-                    "partition_granularity": gran,
-                    "target_partitions": f"~{max(1, cur_parts // 30):,} partitions",
-                    "optimization": "Reduced metadata scan overhead by ~97%",
-                }
-        hist = cs.get("state_history") or []
-        blocker_msg = "Execution stopped by safety guardrail."
-        for h in reversed(hist):
-            if h.get("state") == "FAILED" and h.get("note"):
-                blocker_msg = h.get("note")
-                break
-        cs["blocker_message"] = blocker_msg
-        blocked_cards.append(cs)
-
-    # Fetch any active REGRESSED change sets requiring immediate 1-click rollback
     regressed_cards = []
-    for cs in store.in_state(c, "REGRESSED"):
-        cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
-        cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
-        cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
-        hist = cs.get("state_history") or []
-        reg_msg = "P95 latency or bytes billed spiked >15% vs baseline across recurring query families."
-        for h in reversed(hist):
-            if h.get("state") == "REGRESSED" and h.get("note"):
-                reg_msg = h.get("note")
-                break
-        cs["regression_message"] = reg_msg
-        regressed_cards.append(cs)
-
-    # Fetch rolled-back change sets for incident & post-mortem review
     rolled_back_cards = []
-    for cs in store.in_state(c, "ROLLED_BACK"):
-        cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
-        cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
-        cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
-        prog = bq.loads(cs.get("progress_json")) or {}
-        cs["forensics_table"] = prog.get("steps", {}).get("ROLLED_BACK", {}).get("kept_for_forensics")
-        hist = cs.get("state_history") or []
-        rollback_msg = cs.get("rejection_note") or "Rolled back by operator"
-        rollback_actor = "operator"
-        for h in reversed(hist):
-            if h.get("state") == "ROLLED_BACK":
-                if h.get("note"):
-                    rollback_msg = h.get("note")
-                if h.get("actor"):
-                    rollback_actor = h.get("actor")
-                break
-        cs["rollback_message"] = rollback_msg
-        cs["rollback_actor"] = rollback_actor
-        cs["snooze_until_display"] = cs.get("snooze_until")
-        rolled_back_cards.append(cs)
-
-    # Class 4 code changes handed off for a pull request, awaiting "Mark PR merged"
     handoff_cards = []
-    try:
-        for cs in store.in_state(c, "PR_HANDED_OFF"):
+    receipt_candidates = []
+    w01_candidates = []
+
+    for r in raw_rows:
+        st = r.get("state")
+        r_ids = r.get("rule_ids") or []
+        if "W-01" in r_ids:
+            w01_candidates.append(r)
+        if st in ("VERIFYING", "VERIFIED", "REGRESSED", "ROLLING_BACK", "ROLLED_BACK"):
+            receipt_candidates.append(r)
+
+        if _is_active_pending(r):
+            cs = dict(r)
+            cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
+            cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
+            cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
+            _enrich_repartition(cs)
+            cards.append(cs)
+        elif st == "FAILED":
+            cs = dict(r)
+            cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
+            cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
+            cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
+            _enrich_repartition(cs)
+            hist = cs.get("state_history") or []
+            blocker_msg = "Execution stopped by safety guardrail."
+            for h in reversed(hist):
+                if h.get("state") == "FAILED" and h.get("note"):
+                    blocker_msg = h.get("note")
+                    break
+            cs["blocker_message"] = blocker_msg
+            blocked_cards.append(cs)
+        elif st == "REGRESSED":
+            cs = dict(r)
+            cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
+            cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
+            cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
+            hist = cs.get("state_history") or []
+            reg_msg = "P95 latency or bytes billed spiked >15% vs baseline across recurring query families."
+            for h in reversed(hist):
+                if h.get("state") == "REGRESSED" and h.get("note"):
+                    reg_msg = h.get("note")
+                    break
+            cs["regression_message"] = reg_msg
+            regressed_cards.append(cs)
+        elif st == "ROLLED_BACK":
+            cs = dict(r)
+            cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
+            cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
+            cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
+            prog = bq.loads(cs.get("progress_json")) or {}
+            cs["forensics_table"] = prog.get("steps", {}).get("ROLLED_BACK", {}).get("kept_for_forensics")
+            hist = cs.get("state_history") or []
+            rollback_msg = cs.get("rejection_note") or "Rolled back by operator"
+            rollback_actor = "operator"
+            for h in reversed(hist):
+                if h.get("state") == "ROLLED_BACK":
+                    if h.get("note"):
+                        rollback_msg = h.get("note")
+                    if h.get("actor"):
+                        rollback_actor = h.get("actor")
+                    break
+            cs["rollback_message"] = rollback_msg
+            cs["rollback_actor"] = rollback_actor
+            cs["snooze_until_display"] = cs.get("snooze_until")
+            rolled_back_cards.append(cs)
+        elif st == "PR_HANDED_OFF":
+            cs = dict(r)
             cs["evidence"] = bq.loads(cs.get("evidence_json")) or {}
             cs["proposed"] = bq.loads(cs.get("proposed_change_json")) or {}
             cs["factors"] = bq.loads(cs.get("confidence_factors_json")) or {}
             cs["handoff"] = bq.loads(cs.get("progress_json")) or {}
             handoff_cards.append(cs)
-    except Exception:
-        handoff_cards = []
 
-    # Associate director and department mapping from v_director_recommendations if available
+    # Sort strictly by Net Savings Realized ($) DESC
+    cards.sort(key=lambda x: float(x.get("net_monthly_value_usd") or 0.0), reverse=True)
+
+    # Associate director and department mapping from v_director_recommendations
     all_items = cards + blocked_cards + regressed_cards + rolled_back_cards + handoff_cards
-    try:
-        dir_rows = bq.query(c, f"SELECT change_set_id, director_name, department, team_readers_count, team_queries_count, team_billed_gb FROM `{c.ops}.v_director_recommendations`")
-        dir_map = {r["change_set_id"]: r for r in dir_rows}
-        for item in all_items:
-            cid = item.get("change_set_id")
-            if cid in dir_map:
-                item["director_name"] = dir_map[cid].get("director_name")
-                item["department"] = dir_map[cid].get("department")
-                item["team_readers_count"] = dir_map[cid].get("team_readers_count", 0)
-                item["team_queries_count"] = dir_map[cid].get("team_queries_count", 0)
-                item["team_billed_gb"] = dir_map[cid].get("team_billed_gb", 0.0)
-            item.setdefault("director_name", "Central Data Platform")
-            item.setdefault("department", "Platform Infrastructure")
-            item.setdefault("team_readers_count", 0)
-            item.setdefault("team_queries_count", 0)
-            item.setdefault("team_billed_gb", 0.0)
-    except Exception:
-        for item in all_items:
-            item.setdefault("director_name", "Central Data Platform")
-            item.setdefault("department", "Platform Infrastructure")
-            item.setdefault("team_readers_count", 0)
-            item.setdefault("team_queries_count", 0)
-            item.setdefault("team_billed_gb", 0.0)
+    dir_map = {r["change_set_id"]: r for r in dir_rows}
+    for item in all_items:
+        cid = item.get("change_set_id")
+        if cid in dir_map:
+            item["director_name"] = dir_map[cid].get("director_name")
+            item["department"] = dir_map[cid].get("department")
+            item["team_readers_count"] = dir_map[cid].get("team_readers_count", 0)
+            item["team_queries_count"] = dir_map[cid].get("team_queries_count", 0)
+            item["team_billed_gb"] = dir_map[cid].get("team_billed_gb", 0.0)
+        item.setdefault("director_name", "Central Data Platform")
+        item.setdefault("department", "Platform Infrastructure")
+        item.setdefault("team_readers_count", 0)
+        item.setdefault("team_queries_count", 0)
+        item.setdefault("team_billed_gb", 0.0)
 
-    receipts = bq.query(c, f"SELECT * FROM `{c.ops}.v_receipts` ORDER BY applied_at DESC LIMIT 10")
+    # Build top-10 receipts (sorted by applied_at DESC)
+    receipt_candidates.sort(
+        key=lambda x: str(x.get("applied_at") or ""),
+        reverse=True,
+    )
+    receipts = []
+    for r in receipt_candidates[:10]:
+        vres = bq.loads(r.get("verification_result_json")) or {}
+        realized_val = vres.get("realized_monthly_usd")
+        receipts.append({
+            "change_set_id": r.get("change_set_id"),
+            "rule_ids": r.get("rule_ids") or [],
+            "target_dataset": r.get("target_dataset"),
+            "target_table": r.get("target_table"),
+            "predicted_usd": r.get("gross_monthly_savings_usd"),
+            "realized_usd": None if realized_val is None else str(realized_val),
+            "realized_over_predicted": r.get("realized_over_predicted"),
+            "state": r.get("state"),
+            "applied_at": r.get("applied_at"),
+        })
+
     reviewer_email = _default_reviewer()
 
     total_savings = sum(float(x.get("net_monthly_value_usd") or 0.0) for x in cards)
@@ -287,22 +350,24 @@ def _dashboard_data(c) -> dict:
 
     # Latest W-01 sizing (any state) for the Project-Wide Billing Fit panel
     w01 = None
-    try:
-        w_rows = bq.query(c, f"""SELECT evidence_json, proposed_change_json FROM `{c.ops}.change_sets`
-                                 WHERE 'W-01' IN UNNEST(rule_ids) ORDER BY created_at DESC LIMIT 1""")
-        if w_rows:
-            ev = bq.loads(w_rows[0].get("evidence_json")) or {}
-            pr = bq.loads(w_rows[0].get("proposed_change_json")) or {}
-            od = float(ev.get("on_demand_spend_monthly") or 0.0)
-            o1 = float(ev.get("option_1_monthly_cost_usd") or 0.0)
-            o2 = float(ev.get("option_2_monthly_cost_usd") or 0.0)
-            w01 = {"tib": float(ev.get("bytes_scanned_tib_30d") or 0.0), "od": od, "o1": o1, "o2": o2,
-                   "o1_pct": int(round(100 * o1 / od)) if od else 0,
-                   "o2_pct": int(round(100 * o2 / od)) if od else 0,
-                   "baseline": int(pr.get("recommended_baseline_slots") or 0),
-                   "max": int(pr.get("recommended_autoscale_max_slots") or 0)}
-    except Exception:
-        w01 = None
+    if w01_candidates:
+        w01_candidates.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        latest_w = w01_candidates[0]
+        ev = bq.loads(latest_w.get("evidence_json")) or {}
+        pr = bq.loads(latest_w.get("proposed_change_json")) or {}
+        od = float(ev.get("on_demand_spend_monthly") or 0.0)
+        o1 = float(ev.get("option_1_monthly_cost_usd") or 0.0)
+        o2 = float(ev.get("option_2_monthly_cost_usd") or 0.0)
+        w01 = {
+            "tib": float(ev.get("bytes_scanned_tib_30d") or 0.0),
+            "od": od,
+            "o1": o1,
+            "o2": o2,
+            "o1_pct": int(round(100 * o1 / od)) if od else 0,
+            "o2_pct": int(round(100 * o2 / od)) if od else 0,
+            "baseline": int(pr.get("recommended_baseline_slots") or 0),
+            "max": int(pr.get("recommended_autoscale_max_slots") or 0),
+        }
 
     return dict(
         w01=w01,
@@ -321,6 +386,37 @@ def _dashboard_data(c) -> dict:
     )
 
 
+def _refresh_cache_bg(cache_key: str, c) -> None:
+    try:
+        fresh = _fetch_dashboard_data_uncached(c)
+        with _DASHBOARD_LOCK:
+            _DASHBOARD_CACHE[cache_key] = {"ts": time.time(), "data": fresh, "refreshing": False}
+    except Exception:
+        with _DASHBOARD_LOCK:
+            if cache_key in _DASHBOARD_CACHE:
+                _DASHBOARD_CACHE[cache_key]["refreshing"] = False
+
+
+def _dashboard_data(c, force_refresh: bool = False) -> dict:
+    """Everything the review UI shows. Shared by the classic Jinja page and /api/dashboard.
+    Uses stale-while-revalidate caching so page refreshes return in <50ms."""
+    cache_key = f"{c.project_id}:{c.ops}"
+    now = time.time()
+    if not force_refresh:
+        with _DASHBOARD_LOCK:
+            entry = _DASHBOARD_CACHE.get(cache_key)
+            if entry and (now - entry["ts"]) < _CACHE_MAX_STALE_SEC:
+                if (now - entry["ts"]) >= _CACHE_FRESH_SEC and not entry.get("refreshing"):
+                    entry["refreshing"] = True
+                    threading.Thread(target=_refresh_cache_bg, args=(cache_key, c), daemon=True).start()
+                return copy.deepcopy(entry["data"])
+
+    fresh = _fetch_dashboard_data_uncached(c)
+    with _DASHBOARD_LOCK:
+        _DASHBOARD_CACHE[cache_key] = {"ts": time.time(), "data": fresh, "refreshing": False}
+    return copy.deepcopy(fresh)
+
+
 # ---------------------------------------------------------------------------
 # Pages: React SPA at "/", classic Jinja page kept at "/classic"
 # ---------------------------------------------------------------------------
@@ -330,7 +426,8 @@ _DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @app.get("/classic")
 def queue():
-    return render_template("index.html", **_dashboard_data(cfg()))
+    force = request.args.get("refresh") in ("1", "true")
+    return render_template("index.html", **_dashboard_data(cfg(), force_refresh=force))
 
 
 @app.get("/")
@@ -353,7 +450,6 @@ def spa_assets(filename):
 
 def _jsonable(o):
     """BigQuery rows -> JSON: Decimal -> float, datetime/date -> ISO string."""
-    import datetime as _dt
     from decimal import Decimal
     if isinstance(o, dict):
         return {str(k): _jsonable(v) for k, v in o.items()}
@@ -375,7 +471,8 @@ _JSON_BLOBS = ("evidence_json", "proposed_change_json", "confidence_factors_json
 @app.get("/api/dashboard")
 def api_dashboard():
     from flask import jsonify
-    data = _dashboard_data(cfg())
+    force = request.args.get("refresh") in ("1", "true")
+    data = _dashboard_data(cfg(), force_refresh=force)
     for key in ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards", "handoff_cards"):
         for cs in data[key]:
             for blob in _JSON_BLOBS:          # already parsed into evidence/proposed/factors
@@ -399,7 +496,9 @@ def api_decisions():
     who = _who(body.get("principal"))
     try:
         result = _apply_decision(c, body, who)
+        invalidate_dashboard_cache()
     except Exception as e:  # noqa: BLE001 — surfaced to the reviewer, card left retryable
+        invalidate_dashboard_cache()
         return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True, **result})
 
@@ -667,12 +766,34 @@ def decision():
     c = cfg()
     try:
         _apply_decision(c, request.form, _who())
+        invalidate_dashboard_cache()
     except Exception as e:  # noqa: BLE001
+        invalidate_dashboard_cache()
         from markupsafe import escape
         return (f"<h3>Action failed</h3><pre>{escape(str(e))}</pre>"
                 f"<p>If this was a rollback, the change set is left in ROLLING_BACK; fix the cause and retry.</p>"
                 f"<a href='{url_for('queue')}'>Back to review queue</a>"), 500
     return redirect(url_for("queue"))
+
+
+def _warm_cache_on_boot() -> None:
+    """Pre-warm and continuously refresh the BigQuery dashboard cache in a background daemon thread."""
+    if os.environ.get("K_SERVICE") or os.environ.get("WARM_DASHBOARD_CACHE") == "1":
+        def _bg():
+            while True:
+                try:
+                    c = cfg()
+                    fresh = _fetch_dashboard_data_uncached(c)
+                    cache_key = f"{c.project_id}:{c.ops}"
+                    with _DASHBOARD_LOCK:
+                        _DASHBOARD_CACHE[cache_key] = {"ts": time.time(), "data": fresh, "refreshing": False}
+                except Exception:
+                    pass
+                time.sleep(30.0)
+        threading.Thread(target=_bg, daemon=True).start()
+
+
+_warm_cache_on_boot()
 
 
 if __name__ == "__main__":
@@ -683,3 +804,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     is_debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
     app.run(host=args.host, port=args.port, debug=is_debug)
+
