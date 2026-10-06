@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 from typing import Any, Callable
 
-from . import bq
+from . import bq, pricing
 from .config import Config
 
 Finding = dict[str, Any]
@@ -35,10 +35,84 @@ _TIB = 1024 ** 4
 
 PARTITION_CLUSTER_RECOMMENDER = "google.bigquery.table.PartitionClusterRecommender"
 
+# Autoscale bills in 50-slot steps with a 1-minute minimum, so billed slot-hours
+# run above measured slot-hours; this allowance is a planning heuristic.
+_AUTOSCALE_OVERHEAD = 1.25
+# Even a plain full scan needs roughly 0.5-3 slot-hours per TiB; a project that reports
+# less slot time than this for the bytes it billed has slot telemetry that does not cover
+# those bytes (e.g. seeded demo rows), so any Editions estimate built on it is too low.
+_MIN_PLAUSIBLE_SLOT_H_PER_TIB = 0.5
+
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+def _f(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v) if v is not None else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _savings_math(method: str, formula: str, **extra: Any) -> dict:
+    """The evidence block every priced card carries: how its number was computed.
+    Rendered in the review UI under "How this saving is calculated"."""
+    out: dict[str, Any] = {"method": method, "formula": formula, "demo_floor_applied": False}
+    out.update({k: v for k, v in extra.items() if v is not None})
+    return out
+
+
+def _apply_demo_floor(f: Finding, c: Config, floor: float) -> Finding:
+    """demo_mode only: lift gross savings to a synthetic minimum, loudly labelled
+    (risk note + evidence flag + UI badge). A no-op for real deployments."""
+    raw = _f(f.get("gross_monthly_savings_usd"))
+    val, applied = pricing.demo_floor(c, raw, floor)
+    if applied:
+        f["gross_monthly_savings_usd"] = round(val, 2)
+        sm = f.setdefault("evidence", {}).setdefault("savings_math", {})
+        sm["demo_floor_applied"] = True
+        sm["measured_gross_usd"] = round(raw, 2)
+        sm["demo_floor_usd"] = float(floor)
+        f.setdefault("risk_notes", []).append("DEMO_SYNTHETIC_FLOOR_APPLIED")
+    return f
+
+
+def _billing_costs(row: dict, prices: dict, *, od_key: str, resv_key: str,
+                   legacy_usd_key: str | None = None, legacy_bytes_key: str | None = None,
+                   divisor: float = 1.0) -> tuple[float, float, str]:
+    """Monthly (on_demand_usd, reservation_usd, source) for a rule row.
+
+    Rows from the billing-aware views carry both parts. Older row shapes (unit
+    tests, views not yet upgraded) only have bytes / on-demand dollars; those are
+    treated as on-demand and labelled LEGACY_ASSUMED_ON_DEMAND."""
+    if row.get(od_key) is not None or row.get(resv_key) is not None:
+        return _f(row.get(od_key)) / divisor, _f(row.get(resv_key)) / divisor, "BILLING_AWARE"
+    if legacy_usd_key and row.get(legacy_usd_key) is not None:
+        return _f(row.get(legacy_usd_key)) / divisor, 0.0, "LEGACY_ASSUMED_ON_DEMAND"
+    if legacy_bytes_key and row.get(legacy_bytes_key) is not None:
+        od = _f(row.get(legacy_bytes_key)) / _TIB * pricing.rate(prices, "on_demand_usd_per_tib")
+        return od / divisor, 0.0, "LEGACY_ASSUMED_ON_DEMAND"
+    return 0.0, 0.0, "NO_SPEND_DATA"
+
+
+def _scan_math(sv: dict, method: str, src: str, *, pool_key: str | None = None,
+               split_rule: str | None = None, **extra: Any) -> dict:
+    """savings_math for a scan-reduction estimate built by pricing.scan_savings."""
+    extra.setdefault("spend_kind", pricing.COMPUTE)
+    return _savings_math(
+        method, sv["formula"],
+        billing_mix=sv["billing_mix"], cost_source=src,
+        on_demand_monthly_usd=sv["on_demand_monthly_usd"],
+        reservation_monthly_usd=sv["reservation_monthly_usd"],
+        attributed_monthly_usd=sv["attributed_monthly_usd"],
+        reduction=sv["reduction"], reservation_realization=sv["realization"],
+        pool_key=pool_key, pool_spend_usd=sv["attributed_monthly_usd"] if pool_key else None,
+        split_rule=split_rule, **extra)
+
+
+_SPLIT_1N = "job cost split equally across the tables it reads (1/N)"
+_SPLIT_SIZE = "job cost split across the tables it reads, by table size (1/N if any size unknown)"
 
 def _table_from_resource(res_json: str | None) -> tuple[str, str, str] | None:
     """'.../projects/P/datasets/D/tables/T' -> (P, D, T)."""
@@ -79,13 +153,60 @@ def _map_native_pc(row: dict, prices: dict, c: Config) -> Finding | None:
     gb_saved = bq.deep_find(details, ["gbSavedMonthly", "est_gb_saved_monthly", "gbSaved"])
 
     is_partition = bool(part_col) or "PARTITION" in str(row.get("subtype") or "").upper()
-    gross = 0.0
+    rule_id = "C3-01" if is_partition else "C1-01"
+
+    # What Active Assist's own claim is worth at list price.
+    claim_usd = 0.0
     basis = "SLOT_EDITIONS"
     if gb_saved:
-        gross = float(gb_saved) / 1024 * float(prices["on_demand_usd_per_tib"])
+        claim_usd = float(gb_saved) / 1024 * pricing.rate(prices, "on_demand_usd_per_tib")
         basis = "BYTES_ON_DEMAND"
     elif slot_hours:
-        gross = float(slot_hours) * float(prices.get("slot_hour_usd_enterprise", 0.06))
+        claim_usd = float(slot_hours) * pricing.rate(prices, "slot_hour_usd_enterprise")
+
+    # The table's real monthly read cost, split by billing mode (v_table_read_write_90d / 3).
+    tc = (prices.get("_table_costs") or {}).get(tuple(tgt)) if isinstance(prices, dict) else None
+    risk_extra: list[str] = []
+    reduction = None
+    if tc and (tc["od_usd"] + tc["resv_usd"]) > 0:
+        # Express the claim as a fraction of the work this table's readers actually
+        # do, then price that fraction by how those readers are billed.
+        if gb_saved and tc.get("bytes_month"):
+            reduction = min(float(gb_saved) * _GIB / tc["bytes_month"], 1.0)
+        elif slot_hours and tc.get("slot_ms_month"):
+            reduction = min(float(slot_hours) * 3_600_000.0 / tc["slot_ms_month"], 1.0)
+        else:
+            reduction = 0.0
+        sv = pricing.scan_savings(tc["od_usd"], tc["resv_usd"], reduction, c)
+        gross = sv["gross"]
+        if tc["od_usd"] > 0 and tc["resv_usd"] > 0:
+            basis = "MIXED"
+        else:
+            basis = "BYTES_ON_DEMAND" if tc["od_usd"] > 0 else "SLOT_EDITIONS"
+        math = _scan_math(sv, "ACTIVE_ASSIST_CLAIM_AS_SHARE_OF_TABLE_READ_COST", "BILLING_AWARE",
+                          pool_key=f"table:{tgt[0]}.{tgt[1]}.{tgt[2]}", split_rule=_SPLIT_SIZE,
+                          active_assist_claim_usd=round(claim_usd, 2),
+                          billing_projects=tc.get("billing_projects") or None)
+        cur_month = tc["od_usd"] + tc["resv_usd"]
+        q_month = tc.get("scan_jobs_month") or 0.0
+        avg_gib = (tc.get("bytes_month") or 0.0) / q_month / _GIB if q_month else 0.0
+        current_spend = f"${cur_month:,.2f} / month ({sv['billing_mix']})"
+        current_queries = f"{q_month:,.0f} queries / month"
+        current_scan = f"{avg_gib:,.1f} GiB / query" if q_month else "n/a"
+        projected = f"${max(cur_month - gross, 0.0):,.2f} / month"
+    else:
+        gross = claim_usd
+        math = _savings_math("ACTIVE_ASSIST_CLAIM_AT_LIST_PRICE",
+                             f"Active Assist claim priced at list rates = ${claim_usd:,.2f}/mo "
+                             f"(this table's reads were not in the collected jobs, so the billing "
+                             f"model could not be checked)",
+                             billing_mix="UNKNOWN", cost_source="NO_SPEND_DATA",
+                             active_assist_claim_usd=round(claim_usd, 2))
+        risk_extra.append("SAVINGS_BILLING_MODE_UNVERIFIED")
+        current_spend = "not observed in collected jobs"
+        current_queries = "n/a"
+        current_scan = "n/a"
+        projected = "n/a"
 
     action: dict[str, Any] = {"action": "REPARTITION" if is_partition else "SET_CLUSTERING"}
     if part_col:
@@ -99,38 +220,44 @@ def _map_native_pc(row: dict, prices: dict, c: Config) -> Finding | None:
     elif is_partition and part_col:
         action["generated_ddl"] = f"CREATE TABLE {table_fqn}__bqopt_new PARTITION BY DATE({part_col}) AS SELECT * FROM {table_fqn};"
 
+    change_txt = (f"PARTITION BY DATE({part_col})" if is_partition and part_col
+                  else f"CLUSTER BY {', '.join(action.get('cluster_columns', []))}")
+    red_txt = (f"{reduction:.0%} of this table's read work (Active Assist estimate)"
+               if reduction is not None else "per Active Assist (could not be checked against observed reads)")
     return {
-        "rule_id": "C3-01" if is_partition else "C1-01",
+        "rule_id": rule_id,
         "apply_class": 3 if is_partition else 1,
         "source": "NATIVE_RECOMMENDER",
         "savings_basis": basis,
         "target_project": tgt[0], "target_dataset": tgt[1], "target_table": tgt[2],
         "target_region": row.get("region"),
-        "finding_summary": f"Clustering {tgt[1]}.{tgt[2]} by {', '.join(action.get('cluster_columns', []))} will reduce scanned bytes by up to 68% with zero table downtime.",
+        "finding_summary": (f"Active Assist recommends {change_txt} on {tgt[1]}.{tgt[2]}: "
+                            f"~${gross:,.2f}/mo at this table's real billing mix."),
         "evidence": {
             "current_state": {
-                "clustering": "None (Unclustered table)",
-                "avg_query_scan": "1.0 TiB / query",
-                "monthly_read_spend": "$1,500.00 / month",
-                "monthly_query_count": "240 queries / month",
+                ("partitioning" if is_partition else "clustering"):
+                    "None (Unpartitioned table)" if is_partition else "None (Unclustered table)",
+                "avg_query_scan": current_scan,
+                "monthly_read_spend": current_spend,
+                "monthly_query_count": current_queries,
             },
             "proposed_state": {
-                "clustering": f"CLUSTER BY {', '.join(action.get('cluster_columns', []))}",
-                "expected_scan_reduction": "68% scan reduction (~320 GiB / query)",
-                "projected_monthly_spend": "$480.00 / month",
-                "net_monthly_savings": "$1,020.00 / month ($1,500 current - $480 projected)",
+                ("partitioning" if is_partition else "clustering"): change_txt,
+                "expected_reduction": red_txt,
+                "projected_monthly_spend": projected,
+                "net_monthly_savings": f"${gross:,.2f} / month",
             },
             "underlying_sql": action.get("generated_ddl"),
             "recommender": row["recommender"],
-            "raw_active_assist_claim": f"${gross:,.2f} / month",
-            "spend_cap_applied": True,
+            "raw_active_assist_claim": f"${claim_usd:,.2f} / month",
+            "savings_math": math,
         },
         "observation_days": 30,
         "proposed_change": action,
-        "gross_monthly_savings_usd": gross,
+        "gross_monthly_savings_usd": round(gross, 2),
         "one_time_apply_cost_usd": 0.0,
         "risk_notes": (["REBUILD_REQUIRED", "NO_TIME_TRAVEL_ON_NEW_TABLE"] if is_partition
-                       else ["RECLUSTER_OF_EXISTING_DATA_NOT_AUTOMATIC"]),
+                       else ["RECLUSTER_OF_EXISTING_DATA_NOT_AUTOMATIC"]) + risk_extra,
         "native_rec_names": [f"{row['project_path']}/locations/{row['region']}"
                              f"/recommenders/{PARTITION_CLUSTER_RECOMMENDER}"
                              f"/recommendations/{row['recommendation_id']}"],
@@ -145,50 +272,63 @@ def _map_native_pc(row: dict, prices: dict, c: Config) -> Finding | None:
 def _sql_unpartitioned(c: Config) -> str:
     return f"""
       SELECT region, project_id, dataset_id, table_id, total_logical_bytes,
-             time_columns, scan_jobs, bytes_billed_reads, est_on_demand_usd_reads
+             time_columns, scan_jobs, bytes_billed_reads, est_on_demand_usd_reads,
+             est_cost_usd_reads, est_od_usd_reads, est_resv_usd_reads, billing_projects,
+             multi_table_jobs
       FROM `{c.ops}.v_unpartitioned_scan_targets`
       LIMIT 200
     """
 
 
 def _map_unpartitioned(row: dict, prices: dict, c: Config) -> Finding | None:
-    monthly_read_usd = float(row.get("est_on_demand_usd_reads") or 0) / 3.0
+    # 90-day attributed read cost / 3 = monthly; billing-aware and split across joined tables.
+    od, rv, src = _billing_costs(row, prices, od_key="est_od_usd_reads", resv_key="est_resv_usd_reads",
+                                 legacy_usd_key="est_on_demand_usd_reads", divisor=3.0)
+    monthly_read_usd = od + rv
     if monthly_read_usd < 5:
         return None
-    gross = monthly_read_usd * 0.85
+    sv = pricing.scan_savings(od, rv, 0.85, c)
+    gross = sv["gross"]
     pcol = (row.get("time_columns") or [None])[0]
     table_fqn = f"`{row['project_id']}.{row['dataset_id']}.{row['table_id']}`"
     ddl = f"S0–S9 Copy-Swap-Rebind: CREATE TABLE {table_fqn}__bqopt_new PARTITION BY DATE({pcol}) AS SELECT * FROM {table_fqn};"
     table_gib = int(row['total_logical_bytes']) / _GIB
     scanned_after_gib = table_gib * 0.15
+    one_time = float(row["total_logical_bytes"]) / _TIB * pricing.rate(prices, "on_demand_usd_per_tib")
     return {
         "rule_id": "C3-01", "apply_class": 3, "source": "CUSTOM_RULE",
-        "savings_basis": "BYTES_ON_DEMAND",
+        "savings_basis": "BYTES_ON_DEMAND" if rv <= 0 else ("SLOT_EDITIONS" if od <= 0 else "MIXED"),
         "target_project": row["project_id"], "target_dataset": row["dataset_id"],
         "target_table": row["table_id"], "target_region": row["region"],
         "finding_summary": (f"Table {row['table_id']} is unpartitioned "
                             f"({table_gib:.0f} GiB, "
-                            f"{row['scan_jobs']} scans/90d). Rebuilding with PARTITION BY DATE({pcol}) reduces scan waste by 85%."),
+                            f"{row['scan_jobs']} scans/90d). Rebuilding with PARTITION BY DATE({pcol}) "
+                            f"could cut ~85% of its read work (~${gross:,.2f}/mo at its real billing mix)."),
         "evidence": {
             "current_state": {
                 "partitioning": "None (Unpartitioned Table)",
                 "table_size": f"{table_gib:.0f} GiB",
                 "scans_90d": f"{row['scan_jobs']} full-table scans",
-                "monthly_spend": f"${monthly_read_usd:,.2f} / month",
+                "monthly_spend": f"${monthly_read_usd:,.2f} / month ({sv['billing_mix']})",
             },
             "proposed_state": {
                 "partitioning": f"PARTITION BY DATE({pcol})",
                 "expected_pruning": f"85% daily scan pruning (~{scanned_after_gib:.0f} GiB / query)",
-                "projected_monthly_spend": f"${monthly_read_usd*0.15:,.2f} / month",
+                "projected_monthly_spend": f"${max(monthly_read_usd - gross, 0.0):,.2f} / month",
                 "net_realized_savings": f"${gross:,.2f} / month",
             },
             "underlying_sql": ddl,
+            "savings_math": _scan_math(
+                sv, "TABLE_READ_COST_X_HEURISTIC_PRUNING", src,
+                pool_key=f"table:{row['project_id']}.{row['dataset_id']}.{row['table_id']}",
+                split_rule=_SPLIT_SIZE, billing_projects=list(row.get("billing_projects") or []) or None,
+                multi_table_jobs_90d=row.get("multi_table_jobs"),
+                one_time_cost_note="rebuild priced at on-demand $/TiB (upper bound if the ops project runs on slots)"),
         },
         "observation_days": 90,
         "proposed_change": {"action": "REPARTITION", "partition_column": pcol, "generated_ddl": ddl},
         "gross_monthly_savings_usd": gross,
-        "one_time_apply_cost_usd": float(row["total_logical_bytes"]) / _TIB
-                                    * float(prices["on_demand_usd_per_tib"]),
+        "one_time_apply_cost_usd": one_time,
         "risk_notes": ["REBUILD_REQUIRED", "NO_TIME_TRAVEL_ON_NEW_TABLE",
                        "SAVINGS_ESTIMATE_HEURISTIC_CONFIRM_PREDICATES"],
         "confidence_hint": 0.75,
@@ -262,6 +402,11 @@ def _map_rpf(row: dict, prices: dict, c: Config) -> Finding:
                 "risk_mitigation": "100% compliance with zero pipeline downtime",
             },
             "underlying_sql": ddl,
+            "savings_math": _savings_math(
+                "PREVENTIVE_GUARDRAIL_UNPRICED",
+                "require_partition_filter only blocks FUTURE unfiltered scans; the observed queries "
+                "already filter on the partition column, so $0.00/mo is counted",
+                spend_kind=pricing.COMPUTE),
         },
         "observation_days": 90,
         "proposed_change": {"action": "SET_REQUIRE_PARTITION_FILTER", "value": True,
@@ -321,6 +466,13 @@ def _map_staging(row: dict, prices: dict, c: Config) -> Finding:
                 "net_monthly_savings": f"${monthly:.2f} / month",
             },
             "underlying_sql": ddl,
+            "savings_math": _savings_math(
+                "STALE_TABLE_ACTIVE_STORAGE_X_LOGICAL_RATE",
+                f"{float(row['active_bytes'])/_GIB:,.0f} GiB active storage in {row['tables_no_expiry']} tables "
+                f"older than 30d x ${float(prices['p_log_active']):.3f}/GiB-mo = ${monthly:,.2f}/mo "
+                f"(assumes those tables are no longer needed and expire)",
+                spend_kind=pricing.STORAGE,
+                pool_key=f"storage:{row['project_id']}.{row['dataset_id']}"),
         },
         "observation_days": 90,
         "proposed_change": {"action": "SET_DATASET_DEFAULT_EXPIRATION", "days": 30, "generated_ddl": ddl},
@@ -356,6 +508,10 @@ def _map_billing(row: dict, prices: dict, c: Config) -> Finding:
     ds_fqn = f"`{row['project_id']}.{row['dataset_id']}`"
     ddl = f"ALTER SCHEMA {ds_fqn} SET OPTIONS (storage_billing_model = 'PHYSICAL');"
     saving = float(row["monthly_saving_if_physical_usd"])
+    cost_logical = _f(row.get("monthly_cost_logical_usd"))
+    cost_physical = _f(row.get("monthly_cost_physical_usd"))
+    drop_pct = f"{saving / cost_logical:.0%}" if cost_logical > 0 else "n/a"
+    p_log, p_phy = pricing.rate(prices, "p_log_active"), pricing.rate(prices, "p_phy_active")
     return {
         "rule_id": "C1-05", "apply_class": 1, "source": "CUSTOM_RULE", "savings_basis": "STORAGE",
         "target_project": row["project_id"], "target_dataset": row["dataset_id"],
@@ -364,17 +520,23 @@ def _map_billing(row: dict, prices: dict, c: Config) -> Finding:
                             f"Flipping storage billing to PHYSICAL saves ~${saving:.0f}/mo net of time-travel and fail-safe bytes."),
         "evidence": {
             "current_state": {
-                "billing_model": "LOGICAL Storage Billing ($0.02 / GB active)",
+                "billing_model": f"LOGICAL Storage Billing (${p_log:.2f} / GiB active)",
                 "active_logical_storage": f"{float(row.get('active_logical') or 0)/_GIB:.0f} GiB",
-                "monthly_storage_cost": f"${float(row.get('monthly_cost_logical_usd') or 0):.2f} / month",
+                "monthly_storage_cost": f"${cost_logical:.2f} / month",
             },
             "proposed_state": {
-                "billing_model": "PHYSICAL Storage Billing ($0.04 / GB active)",
+                "billing_model": f"PHYSICAL Storage Billing (${p_phy:.2f} / GiB active)",
                 "compressed_physical_storage": f"{float(row.get('active_physical') or 0)/_GIB:.0f} GiB ({float(row.get('compression_ratio') or 0):.1f}:1 compression)",
-                "monthly_storage_cost": f"${float(row.get('monthly_cost_physical_usd') or 0):.2f} / month (includes time-travel & fail-safe)",
-                "net_realized_savings": f"${saving:.2f} / month (70% storage cost drop)",
+                "monthly_storage_cost": f"${cost_physical:.2f} / month (includes time-travel & fail-safe)",
+                "net_realized_savings": f"${saving:.2f} / month ({drop_pct} storage cost drop)",
             },
             "underlying_sql": ddl,
+            "savings_math": _savings_math(
+                "STORAGE_LIST_PRICE_LOGICAL_VS_PHYSICAL",
+                f"logical ${cost_logical:,.2f}/mo - physical ${cost_physical:,.2f}/mo "
+                f"(physical includes time-travel + fail-safe bytes) = ${saving:,.2f}/mo",
+                spend_kind=pricing.STORAGE,
+                pool_key=f"storage:{row['project_id']}.{row['dataset_id']}", pool_spend_usd=round(cost_logical, 2)),
         },
         "observation_days": 30,
         "proposed_change": {"action": "SET_STORAGE_BILLING_MODEL", "model": "PHYSICAL", "generated_ddl": ddl},
@@ -425,6 +587,11 @@ def _map_sharded(row: dict, prices: dict, c: Config) -> Finding:
                 "query_performance": "Instant single-table metadata pruning",
             },
             "underlying_sql": ddl,
+            "savings_math": _savings_math(
+                "UNPRICED_METADATA_AND_SCAN_BENEFITS",
+                "consolidation mainly speeds up planning and pruning; that is not measurable from "
+                "job telemetry, so $0.00/mo is counted",
+                spend_kind=pricing.COMPUTE),
         },
         "observation_days": 30,
         "proposed_change": {"action": "CONSOLIDATE_SHARDS", "family": row["family"], "generated_ddl": ddl},
@@ -482,6 +649,15 @@ def _map_unused(row: dict, prices: dict, c: Config) -> Finding:
                 "safety_net": "snapshot + verified GCS export required before any drop (runbook-gated)",
             },
             "underlying_sql": ddl,
+            "savings_math": _savings_math(
+                "UNREAD_TABLE_STORAGE_X_LOGICAL_RATE",
+                f"active {float(row.get('active_logical_bytes') or 0)/_GIB:,.0f} GiB x "
+                f"${float(prices['p_log_active']):.3f} + long-term "
+                f"{float(row.get('long_term_logical_bytes') or 0)/_GIB:,.0f} GiB x "
+                f"${float(prices['p_log_lt']):.3f} per GiB-mo = ${monthly:,.2f}/mo of BigQuery storage "
+                f"(the GCS archive's own storage cost is not subtracted)",
+                spend_kind=pricing.STORAGE,
+                pool_key=f"storage:{row['project_id']}.{row['dataset_id']}"),
         },
         "observation_days": 90,
         "proposed_change": {"action": "ARCHIVE_TO_GCS_THEN_DROP", "generated_ddl": ddl},
@@ -499,19 +675,45 @@ def _map_unused(row: dict, prices: dict, c: Config) -> Finding:
 def _sql_time_travel(c: Config) -> str:
     return f"""
       SELECT t.project_id, t.dataset_id, t.table_id,
-             t.total_physical_bytes, t.time_travel_physical_bytes, t.total_logical_bytes
+             t.total_physical_bytes, t.time_travel_physical_bytes, t.total_logical_bytes,
+             d.storage_billing_model
       FROM `{c.ops}.table_state_daily` t
+      LEFT JOIN (
+        SELECT project_id, dataset_id, ANY_VALUE(storage_billing_model) AS storage_billing_model
+        FROM `{c.ops}.dataset_state_daily`
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM `{c.ops}.dataset_state_daily`)
+        GROUP BY 1, 2
+      ) d USING (project_id, dataset_id)
       WHERE t.snapshot_date = CURRENT_DATE()
         AND t.time_travel_physical_bytes > 5 * 1024 * 1024 * 1024
     """
 
 
-def _map_time_travel(row: dict, prices: dict, c: Config) -> Finding:
+def _map_time_travel(row: dict, prices: dict, c: Config) -> Finding | None:
     tt_bytes = float(row.get("time_travel_physical_bytes") or 0.0)
     tt_gib = tt_bytes / _GIB
-    savings_usd = round((tt_gib * 0.60) * float(prices.get("active_physical_gib_usd", 0.04)), 2)
+    rate_phy = pricing.rate(prices, "p_phy_active")
+    # 168h -> 48h keeps ~29% of steady-churn time-travel bytes; 60% is the conservative cut used here.
+    if_physical = round((tt_gib * 0.60) * rate_phy, 2)
+    model = str(row.get("storage_billing_model") or "").strip().upper()
+    notes = ["SHRINKS_RECOVERY_WINDOW_FROM_7D_TO_2D"]
+    if model == "PHYSICAL":
+        savings_usd = if_physical
+        why = f"{tt_gib:,.1f} GiB time travel x 60% x ${rate_phy:.2f}/GiB (PHYSICAL billing) = ${if_physical:,.2f}/mo"
+    elif model == "LOGICAL":
+        # LOGICAL billing does not charge for time-travel bytes: nothing to save.
+        if not pricing.demo_mode(c):
+            return None
+        savings_usd = 0.0
+        notes.append("LOGICAL_BILLING_TIME_TRAVEL_NOT_CHARGED")
+        why = "dataset is LOGICAL-billed: time-travel bytes are free, so $0.00/mo"
+    else:
+        savings_usd = 0.0
+        notes.append("STORAGE_BILLING_MODEL_UNKNOWN_SAVINGS_NOT_COUNTED")
+        why = (f"storage billing model unknown: $0.00/mo counted "
+               f"(would be ${if_physical:,.2f}/mo if the dataset is PHYSICAL-billed)")
     ddl = f"ALTER SCHEMA `{row['project_id']}.{row['dataset_id']}` SET OPTIONS (max_time_travel_hours = 48);"
-    return {
+    f = {
         "rule_id": "C1-04",
         "apply_class": 1,
         "source": "CUSTOM_RULE",
@@ -520,19 +722,26 @@ def _map_time_travel(row: dict, prices: dict, c: Config) -> Finding:
         "target_dataset": row["dataset_id"],
         "target_table": row.get("table_id"),
         "target_region": c.get("location", "US"),
-        "finding_summary": f"High-churn physical table accumulates {tt_gib:.1f} GiB in time travel. Reduce window to 48 hours.",
+        "finding_summary": f"High-churn table accumulates {tt_gib:.1f} GiB in time travel. Reduce window to 48 hours.",
         "evidence": {
             "time_travel_physical_bytes": tt_bytes,
             "time_travel_physical_gib": round(tt_gib, 2),
             "current_window": "7 days (168h)",
             "proposed_window": "2 days (48h)",
+            "storage_billing_model": model or "UNKNOWN",
+            "savings_math": _savings_math("TIME_TRAVEL_BYTES_X_PHYSICAL_RATE", why,
+                                          storage_billing_model=model or "UNKNOWN",
+                                          if_physical_monthly_usd=if_physical,
+                                          spend_kind=pricing.STORAGE,
+                                          pool_key=f"storage:{row['project_id']}.{row['dataset_id']}"),
         },
         "observation_days": 30,
         "proposed_change": {"action": "SET_TIME_TRAVEL_WINDOW", "hours": 48, "generated_ddl": ddl},
-        "gross_monthly_savings_usd": max(savings_usd, 5.0),
-        "risk_notes": ["SHRINKS_RECOVERY_WINDOW_FROM_7D_TO_2D"],
+        "gross_monthly_savings_usd": savings_usd,
+        "risk_notes": notes,
         "confidence_hint": 0.85,
     }
+    return _apply_demo_floor(f, c, 5.0)
 
 
 # --------------------------------------------------------------------------
@@ -543,8 +752,10 @@ def _sql_adaptive_opts(c: Config) -> str:
     return f"""
       SELECT j.project_id,
              COUNT(DISTINCT j.job_id) AS complex_queries,
-             SUM(j.total_slot_ms)     AS slot_ms_30d
-      FROM `{c.ops}.jobs_events` j
+             SUM(j.total_slot_ms)     AS slot_ms_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.total_slot_ms, 0)) AS resv_slot_ms_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.est_cost_usd, 0))  AS resv_cost_usd_30d
+      FROM `{c.ops}.v_jobs_costed` j
       WHERE j.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
         AND j.total_slot_ms > 5000000
       GROUP BY 1
@@ -554,10 +765,14 @@ def _sql_adaptive_opts(c: Config) -> str:
 
 def _map_adaptive_opts(row: dict, prices: dict, c: Config) -> Finding:
     slot_hours = float(row.get("slot_ms_30d") or 0.0) / 3_600_000.0
-    slot_rate = float(prices.get("slot_hour_usd_enterprise", 0.06))
-    savings_usd = round(slot_hours * 0.08 * slot_rate, 2)
+    resv_slot_hours = _f(row.get("resv_slot_ms_30d")) / 3_600_000.0
+    # Fewer slot-ms only saves money on reservation jobs; on-demand jobs pay per byte.
+    sv = pricing.scan_savings(0.0, _f(row.get("resv_cost_usd_30d")), 0.08, c)
+    notes = ["PROJECT_LEVEL_DEFAULT_OPTIONS"]
+    if sv["reservation_monthly_usd"] <= 0:
+        notes.append("NO_RESERVATION_SLOT_SPEND_ON_DEMAND_JOBS_PAY_PER_BYTE")
     ddl = f"ALTER PROJECT `{row['project_id']}` SET OPTIONS (default_query_optimizer_options = 'adaptive=on');"
-    return {
+    f = {
         "rule_id": "C1-06",
         "apply_class": 1,
         "source": "CUSTOM_RULE",
@@ -570,14 +785,18 @@ def _map_adaptive_opts(row: dict, prices: dict, c: Config) -> Finding:
         "evidence": {
             "complex_queries_30d": row["complex_queries"],
             "total_slot_hours_30d": round(slot_hours, 1),
+            "reservation_slot_hours_30d": round(resv_slot_hours, 1),
             "expected_slot_reduction_pct": "8%",
+            "savings_math": _scan_math(sv, "RESERVATION_SLOT_COST_X_HEURISTIC_REDUCTION", "BILLING_AWARE",
+                                       note="only reservation slot time is priced; on-demand jobs are billed by bytes"),
         },
         "observation_days": 30,
         "proposed_change": {"action": "ENABLE_ADAPTIVE_OPTIMIZATION", "generated_ddl": ddl},
-        "gross_monthly_savings_usd": max(savings_usd, 15.0),
-        "risk_notes": ["PROJECT_LEVEL_DEFAULT_OPTIONS"],
+        "gross_monthly_savings_usd": sv["gross"],
+        "risk_notes": notes,
         "confidence_hint": 0.80,
     }
+    return _apply_demo_floor(f, c, 15.0)
 
 
 # --------------------------------------------------------------------------
@@ -585,14 +804,22 @@ def _map_adaptive_opts(row: dict, prices: dict, c: Config) -> Finding:
 # --------------------------------------------------------------------------
 
 def _sql_editions_fit(c: Config) -> str:
+    # Only ON-DEMAND work can move to Editions: projects (or the parts of projects)
+    # that already run on a reservation are excluded from the comparison.
+    min_tib = _f((c.get("pricing") or {}).get("w01_min_on_demand_tib_30d"), 100.0)
     return f"""
       SELECT project_id,
-             SUM(total_bytes_billed) AS total_bytes_billed_30d,
-             SUM(total_slot_ms)      AS total_slot_ms_30d
-      FROM `{c.ops}.jobs_events`
+             SUM(IF(billing_mode = 'ON_DEMAND', total_bytes_billed, 0)) AS od_bytes_billed_30d,
+             SUM(IF(billing_mode = 'ON_DEMAND', total_slot_ms, 0))      AS od_slot_ms_30d,
+             SUM(total_bytes_billed)                                    AS total_bytes_billed_30d,
+             SUM(total_slot_ms)                                         AS total_slot_ms_30d,
+             COUNTIF(billing_mode = 'ON_DEMAND')                        AS od_jobs_30d,
+             COUNTIF(billing_mode = 'RESERVATION')                      AS resv_jobs_30d,
+             ARRAY_AGG(DISTINCT reservation_id IGNORE NULLS ORDER BY reservation_id LIMIT 3) AS reservations
+      FROM `{c.ops}.v_jobs_costed`
       WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
       GROUP BY 1
-      HAVING total_bytes_billed_30d > 100 * 1024 * 1024 * 1024 * 1024
+      HAVING od_bytes_billed_30d > {min_tib} * POW(1024, 4)
     """
 
 
@@ -612,6 +839,11 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | N
     Every minute in the window is counted (idle minutes = 0 slots), so:
       * p50_all  = the load that is present at least half of the time -> steady baseline
       * p99_busy = the top of normal busy-minute demand (ignores the rarest 1% spikes) -> ceiling
+    It also prices autoscaling the way it is billed: whole 50-slot steps, for at least a
+    minute, every minute there is work (autoscale_slot_hours; *_above_baseline = the part
+    above a baseline of p50_all rounded down to 50). Small, spiky workloads pay far more
+    than their measured slot-hours this way.
+    Only on-demand jobs are profiled: work already on a reservation is not being migrated.
     Returns None if JOBS_TIMELINE cannot be read (caller falls back to defaults)."""
     try:
         rows = bq.query(c, f"""
@@ -623,6 +855,7 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | N
               AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
               AND job_type = 'QUERY'
               AND (statement_type IS NULL OR statement_type != 'SCRIPT')
+              AND reservation_id IS NULL
             GROUP BY 1
           ),
           all_minutes AS (
@@ -631,6 +864,10 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | N
                    TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY), MINUTE),
                    TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MINUTE), INTERVAL 1 MINUTE)) AS m
             LEFT JOIN busy b ON b.minute = m
+          ),
+          base AS (
+            SELECT FLOOR(APPROX_QUANTILES(slots, 100)[OFFSET(50)] / 50) * 50 AS baseline
+            FROM all_minutes
           )
           SELECT
             (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(50)] FROM all_minutes) AS p50_all,
@@ -639,7 +876,10 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | N
             (SELECT MAX(slots) FROM busy)                                     AS peak,
             (SELECT COUNT(*) FROM busy)                                       AS busy_minutes,
             (SELECT COUNT(*) FROM all_minutes)                                AS total_minutes,
-            (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours
+            (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours,
+            (SELECT SUM(CEIL(slots / 50) * 50) / 60.0 FROM busy)              AS autoscale_slot_hours,
+            (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50) / 60.0
+               FROM busy b CROSS JOIN base)                                   AS autoscale_slot_hours_above_baseline
         """)
     except Exception:
         return None
@@ -647,7 +887,8 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | N
         return None
     r = rows[0]
     return {k: float(r.get(k) or 0.0) for k in
-            ("p50_all", "p95_all", "p99_busy", "peak", "busy_minutes", "total_minutes", "slot_hours")}
+            ("p50_all", "p95_all", "p99_busy", "peak", "busy_minutes", "total_minutes", "slot_hours",
+             "autoscale_slot_hours", "autoscale_slot_hours_above_baseline")}
 
 
 def size_capacity(profile: dict | None) -> tuple[int, int, str]:
@@ -664,11 +905,29 @@ def size_capacity(profile: dict | None) -> tuple[int, int, str]:
     return baseline, ceiling, "JOBS_TIMELINE_30D"
 
 
-def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
-    raw_bytes_tib = float(row.get("total_bytes_billed_30d") or 0.0) / _TIB
-    # Ensure realistic enterprise scan volume if running on synthetic demo seed
-    bytes_tib = max(raw_bytes_tib, 1450.0)
-    on_demand_rate = float(prices.get("on_demand_usd_per_tib", 6.25))
+def _rate_txt(x: float) -> str:
+    """$ rate for display: 0.048 -> '$0.048', 0.06 -> '$0.06', 6.25 -> '$6.25'."""
+    return f"${float(x):.4g}"
+
+
+def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
+    # Only ON-DEMAND work is priced: whatever already runs on a reservation is not migrating.
+    od_bytes = row.get("od_bytes_billed_30d")
+    if od_bytes is None:
+        od_bytes = row.get("total_bytes_billed_30d")      # older row shape: assume all on-demand
+    raw_bytes_tib = _f(od_bytes) / _TIB
+    od_jobs = row.get("od_jobs_30d")
+    if od_jobs is None:
+        od_jobs = 1 if raw_bytes_tib > 0 else 0
+    if int(_f(od_jobs)) == 0:
+        return None                                       # nothing runs on-demand: nothing to migrate
+    resv_jobs = int(_f(row.get("resv_jobs_30d")))
+
+    floors: list[str] = []
+    bytes_tib, applied = pricing.demo_floor(c, raw_bytes_tib, 1450.0)
+    if applied:
+        floors.append("on-demand TiB")
+    on_demand_rate = pricing.rate(prices, "on_demand_usd_per_tib")
     on_demand_cost = round(bytes_tib * on_demand_rate, 2)
 
     proj = row["project_id"]
@@ -679,35 +938,69 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
     rec_baseline, rec_max, sizing_source = size_capacity(profile)
     rec_autoscale_add = rec_max - rec_baseline
 
-    commit_rate = float(prices.get("slot_hour_usd_enterprise_1yr", 0.048))
-    payg_rate = float(prices.get("slot_hour_usd_enterprise", 0.06))
+    commit_rate = pricing.rate(prices, "slot_hour_usd_enterprise_1yr")
+    payg_rate = pricing.rate(prices, "slot_hour_usd_enterprise")
+
+    od_slot_ms = row.get("od_slot_ms_30d")
+    if od_slot_ms is None:
+        od_slot_ms = row.get("total_slot_ms_30d")
+    raw_slot_hours = _f(od_slot_ms) / 3_600_000.0
+
+    # Autoscale bills whole 50-slot steps for at least a minute, so measured slot-hours
+    # understate the bill. Use the per-minute step model from JOBS_TIMELINE when we have it,
+    # and never less than measured x _AUTOSCALE_OVERHEAD: the higher (safer) of the two.
+    step_opt2 = _f((profile or {}).get("autoscale_slot_hours"))
+    step_burst = _f((profile or {}).get("autoscale_slot_hours_above_baseline"))
+
+    def _billed_note(step_used: bool, measured: float) -> str:
+        if step_used:
+            return "autoscale billed in 50-slot steps for every busy minute (JOBS_TIMELINE, 30d)"
+        return f"measured {measured:,.0f} slot-h x {_AUTOSCALE_OVERHEAD} autoscale overhead"
 
     # --- OPTION 1: Baseline (1-Yr Commit rate) + Autoscaling Burst up to rec_max ---
     baseline_slot_hours = rec_baseline * 730.0
-    baseline_monthly_cost = round(baseline_slot_hours * commit_rate, 2)  # $3,504.00/mo
-
-    raw_slot_hours = float(row.get("total_slot_ms_30d") or 0.0) / 3_600_000.0
-    autoscale_burst_hours = max(raw_slot_hours - baseline_slot_hours, 5766.67)
-    autoscale_monthly_cost = round(autoscale_burst_hours * payg_rate, 2)  # $346.00/mo
+    baseline_monthly_cost = round(baseline_slot_hours * commit_rate, 2)
+    measured_burst = max(raw_slot_hours - baseline_slot_hours, 0.0)
+    raw_burst = max(measured_burst * _AUTOSCALE_OVERHEAD, step_burst)
+    burst_note = _billed_note(step_burst > measured_burst * _AUTOSCALE_OVERHEAD, measured_burst)
+    autoscale_burst_hours, applied = pricing.demo_floor(c, raw_burst, 5766.67)
+    if applied:
+        floors.append("option 1 burst slot-hours")
+    autoscale_monthly_cost = round(autoscale_burst_hours * payg_rate, 2)
 
     total_slot_hours = round(baseline_slot_hours + autoscale_burst_hours, 1)
-    opt1_cost = round(baseline_monthly_cost + autoscale_monthly_cost, 2)  # $3,850.00/mo
-    opt1_savings = round(max(on_demand_cost - opt1_cost, 0.0), 2)          # $5,212.50/mo
+    opt1_cost = round(baseline_monthly_cost + autoscale_monthly_cost, 2)
+    opt1_savings = round(max(on_demand_cost - opt1_cost, 0.0), 2)
     opt1_pct = int(round((opt1_savings / max(on_demand_cost, 1.0)) * 100))
 
     # --- OPTION 2: 0-Slot Baseline (Pure Autoscaling on Demand) ---
-    # Billed at PAYG $0.06/slot-hr with BigQuery 1-minute minimum burst floor (~19,500 billed burst slot-hrs)
-    opt2_billed_slot_hours = max(raw_slot_hours * 1.25, 19500.0)
-    opt2_cost = round(opt2_billed_slot_hours * payg_rate, 2)               # $1,170.00/mo
-    opt2_savings = round(max(on_demand_cost - opt2_cost, 0.0), 2)          # $7,892.50/mo
+    raw_opt2 = max(raw_slot_hours * _AUTOSCALE_OVERHEAD, step_opt2)
+    opt2_note = _billed_note(step_opt2 > raw_slot_hours * _AUTOSCALE_OVERHEAD, raw_slot_hours)
+    opt2_billed_slot_hours, applied = pricing.demo_floor(c, raw_opt2, 19500.0)
+    if applied:
+        floors.append("option 2 billed slot-hours")
+    opt2_cost = round(opt2_billed_slot_hours * payg_rate, 2)
+    opt2_savings = round(max(on_demand_cost - opt2_cost, 0.0), 2)
     opt2_pct = int(round((opt2_savings / max(on_demand_cost, 1.0)) * 100))
 
-    is_editions_better = opt1_savings > 0
+    if opt1_savings <= 0 and opt2_savings <= 0 and not pricing.demo_mode(c):
+        return None        # Editions would cost more than on-demand: nothing to recommend
+
+    # Slot time that is far too small for the bytes billed means the slot telemetry does not
+    # cover those bytes (e.g. seeded demo rows), so the Editions cost is understated.
+    slot_h_per_tib = (raw_slot_hours / raw_bytes_tib) if raw_bytes_tib > 0 else None
+    implausible = slot_h_per_tib is not None and slot_h_per_tib < _MIN_PLAUSIBLE_SLOT_H_PER_TIB
+
+    # Claim the cheaper option, and pre-select it so the executor applies what the card claims.
+    recommended = 1 if opt1_savings >= opt2_savings else 2
+    gross = opt1_savings if recommended == 1 else opt2_savings
+    is_editions_better = gross > 0
+    cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
 
     ddl_opt1 = (
         f"-- OPTION 1 (Recommended for Steady 24/7 Enterprise Workloads)\n"
-        f"--   Baseline: {rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ $0.048/slot-hr 1-Yr Commit)\n"
-        f"--   Autoscaling Burst: +{rec_autoscale_add} Slots up to {rec_max} Max (${autoscale_monthly_cost:,.2f}/mo est. burst @ $0.06/slot-hr)\n"
+        f"--   Baseline: {rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ {cr}/slot-hr 1-Yr Commit)\n"
+        f"--   Autoscaling Burst: +{rec_autoscale_add} Slots up to {rec_max} Max (${autoscale_monthly_cost:,.2f}/mo est. burst @ {pr_}/slot-hr)\n"
         f"--   Total Projected Spend: ${opt1_cost:,.2f}/mo (Saves ${opt1_savings:,.2f}/mo vs On-Demand)\n"
         f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-prod-pool`\n"
         f"OPTIONS (\n"
@@ -726,7 +1019,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
     ddl_opt2 = (
         f"-- OPTION 2 (Recommended for Spiky / Daytime-Only Workloads — $0 Idle Cost)\n"
         f"--   Baseline: 0 Slots ($0.00/mo fixed cost when no queries are running)\n"
-        f"--   Pure Autoscaling Burst: Scales 0 -> {rec_max} Slots on demand (~{opt2_billed_slot_hours:,.0f} burst slot-hrs @ $0.06/slot-hr PAYG)\n"
+        f"--   Pure Autoscaling Burst: Scales 0 -> {rec_max} Slots on demand (~{opt2_billed_slot_hours:,.0f} burst slot-hrs @ {pr_}/slot-hr PAYG)\n"
         f"--   Total Projected Spend: ${opt2_cost:,.2f}/mo (Saves ${opt2_savings:,.2f}/mo vs On-Demand · No Annual Lock-In)\n"
         f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-autoscale-only-pool`\n"
         f"OPTIONS (\n"
@@ -742,6 +1035,51 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
         f");"
     )
 
+    risk_notes = ["CROSS_WORKLOAD_FINANCIAL_CHANGE", "REQUIRES_TWO_PERSON_APPROVAL"]
+    if resv_jobs > 0:
+        risk_notes.append("PART_OF_PROJECT_ALREADY_ON_RESERVATION")
+    if implausible:
+        risk_notes.append("SLOT_TELEMETRY_IMPLAUSIBLE_FOR_BYTES_SCANNED")
+    if not profile:
+        risk_notes.append("AUTOSCALE_COST_NOT_CHECKED_AGAINST_JOBS_TIMELINE")
+    opt_cost = opt1_cost if recommended == 1 else opt2_cost
+    formula = (f"on-demand {bytes_tib:,.1f} TiB x {odr}/TiB = ${on_demand_cost:,.2f}/mo today; "
+               f"Option {recommended} = ${opt_cost:,.2f}/mo "
+               + (f"({rec_baseline} baseline slots x 730 h x {cr} + "
+                  f"{autoscale_burst_hours:,.0f} burst slot-h x {pr_}; {burst_note})" if recommended == 1 else
+                  f"({opt2_billed_slot_hours:,.0f} billed slot-h x {pr_}; {opt2_note})")
+               + f"; saving ${gross:,.2f}/mo")
+    if implausible:
+        formula += (f". WARNING: only {raw_slot_hours:,.1f} slot-h were recorded for {raw_bytes_tib:,.1f} TiB "
+                    f"({slot_h_per_tib:.2f} slot-h/TiB; real scans need >= {_MIN_PLAUSIBLE_SLOT_H_PER_TIB}), so "
+                    f"the Editions cost is understated; check it with the BigQuery slot estimator first")
+    math = _savings_math(
+        "ON_DEMAND_SPEND_VS_EDITIONS_CAPACITY", formula,
+        billing_mix="100% on-demand (reservation jobs excluded)", cost_source="BILLING_AWARE",
+        on_demand_monthly_usd=on_demand_cost, recommended_option=recommended,
+        on_demand_slot_hours_30d=round(raw_slot_hours, 1),
+        autoscale_overhead=_AUTOSCALE_OVERHEAD,
+        autoscale_step_slot_hours_30d=round(step_opt2, 1) if profile else None,
+        slot_hours_per_tib_30d=round(slot_h_per_tib, 3) if slot_h_per_tib is not None else None,
+        slot_telemetry_plausible=not implausible,
+        reservation_jobs_excluded_30d=resv_jobs,
+        pool_key=f"billing:{proj}", pool_spend_usd=on_demand_cost)
+    if floors:
+        math["demo_floor_applied"] = True
+        math["demo_floor_inputs"] = floors
+        risk_notes.append("DEMO_SYNTHETIC_FLOOR_APPLIED")
+
+    current_state = {
+        "billing_model": f"On-Demand ({odr} per TiB scanned)",
+        "30d_bytes_scanned": f"{bytes_tib:,.1f} TiB billed on-demand",
+        "current_monthly_bill": f"${on_demand_cost:,.2f} / month (on-demand jobs only)",
+        "cost_driver": "High scan volume (wide tables & unpartitioned scans) billed per Terabyte",
+    }
+    if resv_jobs > 0:
+        current_state["already_on_reservation"] = (
+            f"{resv_jobs} jobs in 30d already ran on a reservation "
+            f"({', '.join(row.get('reservations') or []) or 'reservation'}); they are excluded here")
+
     return {
         "rule_id": "W-01",
         "apply_class": 3,
@@ -752,19 +1090,22 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
         "target_table": "ALL_DATASETS_AND_TABLES",
         "target_region": region,
         "finding_summary": (
-            f"Project-wide workload scanned {bytes_tib:,.0f} TiB in 30d (${on_demand_cost:,.0f}/mo On-Demand). "
-            f"Choose Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → saves ${opt1_savings:,.0f}/mo) "
-            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → saves ${opt2_savings:,.0f}/mo)."
+            f"On-demand workload billed {bytes_tib:,.0f} TiB in 30d (${on_demand_cost:,.0f}/mo). "
+            f"Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → saves ${opt1_savings:,.0f}/mo) "
+            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → saves ${opt2_savings:,.0f}/mo). "
+            f"Recommended: Option {recommended}."
         ),
         "evidence": {
             "bytes_scanned_tib_30d": round(bytes_tib, 1),
             "slot_hours_30d": total_slot_hours,
             "on_demand_spend_monthly": on_demand_cost,
-            "estimated_editions_spend_monthly": opt1_cost,
+            "estimated_editions_spend_monthly": opt_cost,
             "option_1_monthly_cost_usd": opt1_cost,
             "option_1_savings_usd": opt1_savings,
             "option_2_monthly_cost_usd": opt2_cost,
             "option_2_savings_usd": opt2_savings,
+            "recommended_option": recommended,
+            "reservation_jobs_30d": resv_jobs,
             "capacity_sizing": {
                 "source": sizing_source,
                 "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
@@ -776,16 +1117,12 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
                 "busy_minutes_pct": round(100.0 * (profile or {}).get("busy_minutes", 0.0)
                                           / max((profile or {}).get("total_minutes", 1.0), 1.0), 2),
                 "measured_slot_hours_30d": round((profile or {}).get("slot_hours", 0.0), 1),
+                "autoscale_billed_slot_hours_30d": round((profile or {}).get("autoscale_slot_hours", 0.0), 1),
                 "recommended_baseline_slots": rec_baseline,
                 "recommended_max_slots": rec_max,
             },
             "recommended_pricing_model": "BigQuery Enterprise Edition (Option 1: Baseline+Autoscale OR Option 2: 0-Baseline Autoscale)",
-            "current_state": {
-                "billing_model": "On-Demand ($6.25 per TiB scanned)",
-                "30d_bytes_scanned": f"{bytes_tib:,.1f} TiB across all project datasets",
-                "current_monthly_bill": f"${on_demand_cost:,.2f} / month",
-                "cost_driver": "High scan volume (wide tables & unpartitioned scans) billed per Terabyte",
-            },
+            "current_state": current_state,
             "proposed_state": {
                 "option_1_steady_24x7": (f"{rec_baseline} Baseline Slots (${baseline_monthly_cost:,.0f}/mo) + up to "
                                          f"{rec_autoscale_add} Autoscaling Slots (${autoscale_monthly_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"),
@@ -793,6 +1130,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
                 "option_2_spiky_0_baseline": f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month",
                 "option_2_net_savings": f"${opt2_savings:,.2f} / month ({opt2_pct}% reduction · $0 idle cost overnight & no lock-in)",
             },
+            "savings_math": math,
         },
         "observation_days": 30,
         "proposed_change": {
@@ -800,12 +1138,13 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding:
             "recommended_baseline_slots": rec_baseline,
             "recommended_autoscale_max_slots": rec_max,
             "plan_type": "ENTERPRISE_EDITION",
+            "selected_option": recommended,
             "generated_ddl": ddl_opt1,
             "generated_ddl_option2": ddl_opt2,
         },
-        "gross_monthly_savings_usd": opt1_savings,
-        "risk_notes": ["CROSS_WORKLOAD_FINANCIAL_CHANGE", "REQUIRES_TWO_PERSON_APPROVAL"],
-        "confidence_hint": 0.85,
+        "gross_monthly_savings_usd": gross,
+        "risk_notes": risk_notes,
+        "confidence_hint": 0.4 if implausible else 0.85,
     }
 
 
@@ -847,69 +1186,127 @@ def _classify_query_actor(user_email: str | None, sql_text: str | None = "") -> 
 # R11b — W-02 Proactive Cost Guardrails (Human Ad-Hoc vs Service Account ETL Separation)
 # --------------------------------------------------------------------------
 
+_HUMAN_CAP_BYTES = 53687091200      # 50 GiB per-query ceiling for human ad-hoc sessions
+_SA_LIKE = r"(airflow|dbt|dataform|composer|etl|svc|looker)"
+
+
 def _sql_human_runaway_guardrail(c: Config) -> str:
+    # Billing-aware: a byte cap only saves money on ON-DEMAND jobs (reservation jobs pay for
+    # slots), and only the bytes ABOVE the cap are counted — a blocked query is assumed to be
+    # rewritten to scan at most the cap, not to disappear.
     return f"""
+      WITH j AS (
+        SELECT project_id, user_email, billing_mode, total_bytes_billed, est_cost_usd,
+               (ENDS_WITH(LOWER(COALESCE(user_email, '')), '.gserviceaccount.com')
+                OR REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'{_SA_LIKE}')) AS is_sa
+        FROM `{c.ops}.v_jobs_costed`
+        WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+      )
       SELECT
         project_id,
-        COUNTIF(LOWER(COALESCE(user_email, '')) NOT LIKE '%.gserviceaccount.com'
-            AND NOT REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)')) AS human_adhoc_queries_30d,
-        SUM(IF(LOWER(COALESCE(user_email, '')) NOT LIKE '%.gserviceaccount.com'
-            AND NOT REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)'),
-            total_bytes_billed, 0)) AS human_bytes_billed_30d,
-        MAX(IF(LOWER(COALESCE(user_email, '')) NOT LIKE '%.gserviceaccount.com'
-            AND NOT REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)'),
-            user_email, NULL)) AS sample_human_email,
-        COUNTIF(LOWER(COALESCE(user_email, '')) LIKE '%.gserviceaccount.com'
-            OR REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)')) AS service_account_queries_30d,
-        SUM(IF(LOWER(COALESCE(user_email, '')) LIKE '%.gserviceaccount.com'
-            OR REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)'),
-            total_bytes_billed, 0)) AS service_account_bytes_30d,
-        MAX(IF(LOWER(COALESCE(user_email, '')) LIKE '%.gserviceaccount.com'
-            OR REGEXP_CONTAINS(LOWER(COALESCE(user_email, '')), r'(airflow|dbt|dataform|composer|etl|svc|looker)'),
-            user_email, NULL)) AS sample_service_account_email
-      FROM `{c.ops}.jobs_events`
-      WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+        COUNTIF(NOT is_sa)                                 AS human_adhoc_queries_30d,
+        SUM(IF(NOT is_sa, total_bytes_billed, 0))          AS human_bytes_billed_30d,
+        SUM(IF(NOT is_sa, est_cost_usd, 0))                AS human_cost_usd_30d,
+        COUNTIF(NOT is_sa AND billing_mode = 'ON_DEMAND'
+                AND total_bytes_billed > {_HUMAN_CAP_BYTES}) AS human_queries_over_cap_30d,
+        SUM(IF(NOT is_sa AND billing_mode = 'ON_DEMAND' AND total_bytes_billed > {_HUMAN_CAP_BYTES},
+               total_bytes_billed - {_HUMAN_CAP_BYTES}, 0)) AS human_od_bytes_over_cap_30d,
+        MAX(IF(NOT is_sa, user_email, NULL))               AS sample_human_email,
+        COUNTIF(is_sa)                                     AS service_account_queries_30d,
+        SUM(IF(is_sa, total_bytes_billed, 0))              AS service_account_bytes_30d,
+        MAX(IF(is_sa, user_email, NULL))                   AS sample_service_account_email,
+        SUM(IF(billing_mode = 'ON_DEMAND', est_cost_usd, 0)) AS od_cost_usd_30d
+      FROM j
       GROUP BY 1
     """
 
 
-def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
+def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding | None:
     proj = row["project_id"]
     region = c.get("location", "US")
-    on_demand_rate = float(prices.get("on_demand_usd_per_tib", 6.25))
+    on_demand_rate = pricing.rate(prices, "on_demand_usd_per_tib")
+    odr = _rate_txt(on_demand_rate)
+    demo = pricing.demo_mode(c)
+    floors: list[str] = []
 
-    human_queries = max(int(row.get("human_adhoc_queries_30d") or 0), 142)
-    raw_human_tib = float(row.get("human_bytes_billed_30d") or 0.0) / _TIB
-    human_tib = max(raw_human_tib, 285.0)
-    human_monthly_spend = round(human_tib * on_demand_rate, 2)
+    def _floor(name: str, raw: float, floor: float) -> float:
+        val, applied = pricing.demo_floor(c, raw, floor)
+        if applied:
+            floors.append(name)
+        return val
 
-    sa_queries = max(int(row.get("service_account_queries_30d") or 0), 1840)
-    raw_sa_tib = float(row.get("service_account_bytes_30d") or 0.0) / _TIB
-    sa_tib = max(raw_sa_tib, 1165.0)
+    raw_human_queries = int(_f(row.get("human_adhoc_queries_30d")))
+    if raw_human_queries == 0 and not demo:
+        return None                      # no human ad-hoc workload: nothing to guard
+    human_queries = int(_floor("human queries", raw_human_queries, 142))
+    raw_human_tib = _f(row.get("human_bytes_billed_30d")) / _TIB
+    human_tib = _floor("human TiB", raw_human_tib, 285.0)
+    if row.get("human_cost_usd_30d") is not None and human_tib == raw_human_tib:
+        human_monthly_spend = round(_f(row.get("human_cost_usd_30d")), 2)
+    else:
+        human_monthly_spend = round(human_tib * on_demand_rate, 2)
 
-    sample_human = row.get("sample_human_email") or "sarah.analyst@company.com"
+    sa_queries = int(_floor("service-account queries", int(_f(row.get("service_account_queries_30d"))), 1840))
+    sa_tib = _floor("service-account TiB", _f(row.get("service_account_bytes_30d")) / _TIB, 1165.0)
+
+    # Sample principals: real ones only, except in demo mode.
+    sample_human = row.get("sample_human_email") or ""
     if sample_human.endswith(".gserviceaccount.com"):
-        sample_human = "sarah.analyst@company.com"
-    sample_sa = row.get("sample_service_account_email") or f"bq-prod-etl@{proj}.iam.gserviceaccount.com"
-    if not sample_sa.endswith(".gserviceaccount.com"):
-        sample_sa = f"bq-prod-etl@{proj}.iam.gserviceaccount.com"
+        sample_human = ""
+    sample_sa = row.get("sample_service_account_email") or ""
+    if sample_sa and not sample_sa.endswith(".gserviceaccount.com") and demo:
+        sample_sa = ""
+    if demo:
+        sample_human = sample_human or "sarah.analyst@company.com"
+        sample_sa = sample_sa or f"bq-prod-etl@{proj}.iam.gserviceaccount.com"
+    sample_human = sample_human or "no human principal observed"
+    sample_sa = sample_sa or "no service account observed"
 
-    prevented_savings_usd = round(max(human_monthly_spend * 0.68, 1210.0), 2)
+    over_cap_queries = int(_f(row.get("human_queries_over_cap_30d")))
+    notes = ["APPLIES_TO_HUMAN_USERS_ONLY", "SERVICE_ACCOUNTS_AND_ETL_100PCT_EXEMPT"]
+    if row.get("human_od_bytes_over_cap_30d") is not None:
+        over_cap_tib = _f(row.get("human_od_bytes_over_cap_30d")) / _TIB
+        raw_savings = over_cap_tib * on_demand_rate
+        formula = (f"{over_cap_tib:,.2f} TiB billed above the 50 GiB cap by {over_cap_queries} human "
+                   f"on-demand queries in 30d x {odr}/TiB = ${raw_savings:,.2f}/mo "
+                   f"(assumes each blocked query is rewritten to scan at most 50 GiB)")
+        src = "BILLING_AWARE"
+        if over_cap_queries == 0:
+            notes.append("NO_HUMAN_QUERIES_OVER_CAP_OBSERVED")
+    else:
+        over_cap_tib, raw_savings, src = 0.0, 0.0, "NO_PER_QUERY_DATA"
+        formula = "per-query byte detail unavailable (views not upgraded): $0.00/mo counted"
+        notes.append("SAVINGS_NOT_COUNTED_NO_PER_QUERY_DATA")
+    prevented_savings_usd = round(_floor("prevented waste $", raw_savings, 1210.0), 2)
+    od_pool = _f(row.get("od_cost_usd_30d")) or None
 
+    math = _savings_math(
+        "HUMAN_ON_DEMAND_BYTES_ABOVE_CAP_X_RATE", formula,
+        billing_mix="on-demand only (byte caps do not change reservation slot cost)", cost_source=src,
+        human_queries_over_cap_30d=over_cap_queries, human_tib_over_cap_30d=round(over_cap_tib, 3),
+        cap_gib=50, pool_key=f"billing:{proj}" if od_pool else None,
+        pool_spend_usd=round(od_pool, 2) if od_pool else None)
+    if floors:
+        math["demo_floor_applied"] = True
+        math["demo_floor_inputs"] = floors
+        math["measured_gross_usd"] = round(raw_savings, 2)
+        notes.append("DEMO_SYNTHETIC_FLOOR_APPLIED")
+
+    cap_usd = 50.0 / 1024.0 * on_demand_rate
     ddl_opt1 = (
         f"-- OPTION 1 (Recommended — Isolated 50-Slot Human Sandbox + 50 GB Per-Query Cap)\n"
         f"-- ✅ APPLIES TO: Human Ad-Hoc Users ONLY (user_email NOT LIKE '%.gserviceaccount.com', e.g. {sample_human})\n"
         f"-- 🛡️ 100% EXEMPT: Service Accounts & Production ETL ({sample_sa}, Airflow, dbt, Dataform)\n\n"
-        f"-- 1. Create Isolated 0-Baseline Autoscaling Sandbox for Human Analysts (Capped at 50 Slots = max $3/hr)\n"
+        f"-- 1. Create Isolated 0-Baseline Autoscaling Sandbox for Human Analysts (Capped at 50 Slots)\n"
         f"CREATE RESERVATION `{proj}.region-{region.lower()}.human-adhoc-sandbox-pool`\n"
         f"OPTIONS (\n"
         f"  edition = 'ENTERPRISE',\n"
         f"  slot_capacity = 0,\n"
         f"  autoscale_max_slots = 50\n"
         f");\n\n"
-        f"-- 2. Enforce 50 GB Per-Query Cost Guardrail ($0.31 max/query) on Human Ad-Hoc Sessions\n"
+        f"-- 2. Enforce 50 GB Per-Query Cost Guardrail (${cap_usd:.2f} max/query) on Human Ad-Hoc Sessions\n"
         f"--    (Blocks accidental SELECT * on multi-TB tables in 0ms BEFORE billing; never touches Service Accounts)\n"
-        f"SET @@maximum_bytes_billed = 53687091200; -- 50 GiB Human Ad-Hoc Safety Ceiling"
+        f"SET @@maximum_bytes_billed = {_HUMAN_CAP_BYTES}; -- 50 GiB Human Ad-Hoc Safety Ceiling"
     )
 
     ddl_opt2 = (
@@ -922,7 +1319,8 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
         f"  ROUND(SUM(total_bytes_billed) / POW(1024, 4), 2) AS total_tib_billed\n"
         f"FROM `region-{region.lower()}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT\n"
         f"WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)\n"
-        f"  AND total_bytes_billed > 53687091200 -- > 50 GiB per query\n"
+        f"  AND total_bytes_billed > {_HUMAN_CAP_BYTES} -- > 50 GiB per query\n"
+        f"  AND reservation_id IS NULL -- on-demand only: byte caps save money only here\n"
         f"  AND NOT ENDS_WITH(LOWER(user_email), '.gserviceaccount.com')\n"
         f"GROUP BY 1, 2\n"
         f"ORDER BY total_tib_billed DESC;"
@@ -938,7 +1336,8 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
         "target_table": "HUMAN_USERS_ONLY_EXEMPT_ETL",
         "target_region": region,
         "finding_summary": (
-            f"Proactive Cost Guardrail: Human ad-hoc analysts ({human_queries} queries, {human_tib:,.0f} TiB) run without a byte ceiling. "
+            f"Proactive Cost Guardrail: Human ad-hoc analysts ({human_queries} queries, {human_tib:,.0f} TiB; "
+            f"{over_cap_queries} on-demand queries over 50 GiB) run without a byte ceiling. "
             f"Enforce a 50 GiB cap & 50-slot sandbox on Human Ad-Hoc users ONLY while keeping {sa_queries} Service Account / ETL jobs (*.gserviceaccount.com) 100% EXEMPT."
         ),
         "evidence": {
@@ -946,6 +1345,7 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
             "actor_badge": "👤 Human Ad-Hoc Guardrail (🤖 ETL Service Accounts Exempt)",
             "human_adhoc_queries_30d": human_queries,
             "human_adhoc_tib_30d": round(human_tib, 1),
+            "human_queries_over_cap_30d": over_cap_queries,
             "sample_human_user": sample_human,
             "exempt_service_account_queries_30d": sa_queries,
             "exempt_service_account_tib_30d": round(sa_tib, 1),
@@ -954,16 +1354,17 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
             "current_state": {
                 "human_adhoc_cohort": f"👤 {human_queries} Human Console/Jupyter queries ({human_tib:,.1f} TiB · ${human_monthly_spend:,.2f}/mo) — UNGUARDED",
                 "service_account_etl_cohort": f"🤖 {sa_queries} Service Account & ETL queries ({sa_tib:,.1f} TiB · {sample_sa}) — PRODUCTION",
-                "runaway_risk": "A single accidental human SELECT * without WHERE can scan 500+ TiB ($3,125+) in seconds",
+                "runaway_risk": f"A single accidental human SELECT * without WHERE can scan 500+ TiB (${500 * on_demand_rate:,.0f}+ on-demand) in seconds",
                 "pipeline_safety_requirement": "Production ETL (*.gserviceaccount.com, Airflow, dbt) MUST NEVER fail due to byte caps",
             },
             "proposed_state": {
-                "human_adhoc_protection": "Enforce 50 GiB max_bytes_billed ($0.31 cap) + isolated 50-slot autoscaling sandbox on Human Users ONLY",
+                "human_adhoc_protection": f"Enforce 50 GiB max_bytes_billed (${cap_usd:.2f} cap) + isolated 50-slot autoscaling sandbox on Human Users ONLY",
                 "service_account_exemption": "✅ 100% EXEMPT: All *.iam.gserviceaccount.com, Airflow, dbt & Dataform pipelines run uncapped on Enterprise Prod Pool",
                 "zero_pipeline_breakage": "0% risk to production nightly jobs — filter strictly excludes service accounts",
                 "projected_prevented_waste": f"${prevented_savings_usd:,.2f} / month in blocked runaway ad-hoc scans",
             },
             "underlying_sql": ddl_opt1,
+            "savings_math": math,
         },
         "observation_days": 30,
         "proposed_change": {
@@ -976,10 +1377,7 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
             "generated_ddl_option2": ddl_opt2,
         },
         "gross_monthly_savings_usd": prevented_savings_usd,
-        "risk_notes": [
-            "APPLIES_TO_HUMAN_USERS_ONLY",
-            "SERVICE_ACCOUNTS_AND_ETL_100PCT_EXEMPT",
-        ],
+        "risk_notes": notes,
         "confidence_hint": 0.92,
     }
 
@@ -988,17 +1386,32 @@ def _map_human_runaway_guardrail(row: dict, prices: dict, c: Config) -> Finding:
 # R11c — C2-01 Smart-Tuned Materialized Views with max_staleness
 # --------------------------------------------------------------------------
 
+def _basis(od: float, rv: float) -> str:
+    """savings_basis from the billing mix of the spend a card claims against."""
+    if rv <= 0:
+        return "BYTES_ON_DEMAND"
+    if od <= 0:
+        return "SLOT_EDITIONS"
+    return "MIXED"
+
+
+# Per-table cost share of a multi-table job inside a rule query (1/N split; see _SPLIT_1N).
+_SHARE_1N = "SAFE_DIVIDE(1, ARRAY_LENGTH(j.referenced_tables))"
+
+
 def _sql_mv_rollup(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id,
              COUNT(DISTINCT j.job_id) AS agg_queries_30d,
-             SUM(j.total_bytes_billed) AS bytes_billed_30d
-      FROM `{c.ops}.jobs_events` j, UNNEST(j.referenced_tables) rt
+             SUM(j.total_bytes_billed) AS bytes_billed_30d,
+             SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0) * {_SHARE_1N}) AS od_cost_usd_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.est_cost_usd, 0) * {_SHARE_1N}) AS resv_cost_usd_30d
+      FROM `{c.ops}.v_jobs_costed` j, UNNEST(j.referenced_tables) rt
       WHERE j.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
         AND STRPOS(LOWER(j.query_preview), 'group by') > 0
       GROUP BY 1, 2, 3
       HAVING agg_queries_30d >= 12
-      ORDER BY bytes_billed_30d DESC
+      ORDER BY od_cost_usd_30d + resv_cost_usd_30d DESC
       LIMIT 3
     """
 
@@ -1007,9 +1420,11 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
     proj = row["project_id"]
     ds = row["dataset_id"]
     tbl = row["table_id"]
-    billed_tib = max(float(row.get("bytes_billed_30d") or 0.0) / _TIB, 48.0)
-    on_demand_rate = float(prices.get("on_demand_usd_per_tib", 6.25))
-    gross_savings = round(billed_tib * 0.75 * on_demand_rate, 2)
+    billed_tib = _f(row.get("bytes_billed_30d")) / _TIB
+    od, rv, src = _billing_costs(row, prices, od_key="od_cost_usd_30d", resv_key="resv_cost_usd_30d",
+                                 legacy_bytes_key="bytes_billed_30d")
+    sv = pricing.scan_savings(od, rv, 0.75, c)
+    gross_savings = sv["gross"]
     mv_name = f"`{proj}.{ds}.mv_{tbl}_daily_rollup`"
     ddl = (
         f"CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name}\n"
@@ -1026,17 +1441,18 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
         f"FROM `{proj}.{ds}.{tbl}`\n"
         f"GROUP BY 1, 2;"
     )
-    return {
+    f = {
         "rule_id": "C2-01",
         "apply_class": 2,
         "source": "CUSTOM_RULE",
-        "savings_basis": "BYTES_ON_DEMAND",
+        "savings_basis": _basis(od, rv),
         "target_project": proj,
         "target_dataset": ds,
         "target_table": tbl,
         "target_region": c.get("location", "US"),
         "finding_summary": (
-            f"Table `{ds}.{tbl}` executes {row['agg_queries_30d']} repeated GROUP BY rollups ({billed_tib:.1f} TiB). "
+            f"Table `{ds}.{tbl}` executes {row['agg_queries_30d']} repeated GROUP BY rollups "
+            f"(~${od + rv:,.2f}/mo attributed to this table, {sv['billing_mix']}). "
             f"Create a Smart-Tuned Materialized View with `max_staleness = INTERVAL '4' HOUR` to eliminate peak-hour base table scans."
         ),
         "evidence": {
@@ -1045,15 +1461,18 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
             "bytes_billed_tib_30d": round(billed_tib, 1),
             "current_state": {
                 "repeated_aggregations": f"{row['agg_queries_30d']} recurring GROUP BY queries scanning `{ds}.{tbl}`",
-                "30d_scan_volume": f"{billed_tib:.1f} TiB billed on base table",
+                "30d_scan_volume": f"{billed_tib:.1f} TiB billed by these queries (all tables they read)",
+                "monthly_spend": f"${od + rv:,.2f} / month attributed to this table ({sv['billing_mix']})",
                 "refresh_tax_risk": "Standard Materialized Views without max_staleness recompute deltas during peak writes",
             },
             "proposed_state": {
                 "derived_object": f"Materialized View {mv_name} with Smart-Tuning enabled",
                 "max_staleness_guard": "max_staleness = INTERVAL '4' HOUR + refresh_interval_minutes = 60 (Zero peak-hour background slot tax)",
-                "net_monthly_savings": f"${gross_savings:.2f} / month (75% scan reduction)",
+                "net_monthly_savings": f"${gross_savings:,.2f} / month (75% scan reduction, heuristic)",
             },
             "underlying_sql": ddl,
+            "savings_math": _scan_math(sv, "ROLLUP_QUERY_COST_X_HEURISTIC_REDUCTION", src,
+                                       pool_key=f"table:{proj}.{ds}.{tbl}", split_rule=_SPLIT_1N),
         },
         "observation_days": 30,
         "proposed_change": {
@@ -1061,11 +1480,13 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
             "target": mv_name,
             "generated_ddl": ddl,
         },
-        "gross_monthly_savings_usd": max(gross_savings, 95.0),
+        "gross_monthly_savings_usd": gross_savings,
         "recurring_monthly_cost_usd": 6.50,
-        "risk_notes": ["DERIVED_OBJECT_WATCHDOG_MONITORED", "MAX_STALENESS_4H_TUNED"],
+        "risk_notes": ["DERIVED_OBJECT_WATCHDOG_MONITORED", "MAX_STALENESS_4H_TUNED",
+                       "SAVINGS_ESTIMATE_HEURISTIC_75PCT"],
         "confidence_hint": 0.86,
     }
+    return _apply_demo_floor(f, c, 95.0)
 
 
 # --------------------------------------------------------------------------
@@ -1074,18 +1495,20 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
 
 def _sql_zombie_dts(c: Config) -> str:
     return f"""
-      SELECT j.project_id, j.destination_table.dataset_id, j.destination_table.table_id,
+      SELECT COALESCE(j.destination_table.project_id, j.project_id) AS project_id,
+             j.destination_table.dataset_id, j.destination_table.table_id,
              COUNT(*) as write_jobs,
              SUM(j.total_bytes_billed) as bytes_billed,
+             SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0)) AS od_cost_usd_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.est_cost_usd, 0)) AS resv_cost_usd_30d,
              MAX(j.user_email) as owner_email
-      FROM `{c.ops}.jobs_events` j
-      WHERE j.job_type = 'QUERY'
-        AND j.statement_type IN ('INSERT', 'MERGE', 'CREATE_TABLE_AS_SELECT')
+      FROM `{c.ops}.v_jobs_costed` j
+      WHERE j.statement_type IN ('INSERT', 'MERGE', 'CREATE_TABLE_AS_SELECT')
         AND j.destination_table.table_id IS NOT NULL
         AND j.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
         AND NOT EXISTS (
           SELECT 1 FROM `{c.ops}.jobs_events` r, UNNEST(r.referenced_tables) rt
-          WHERE rt.project_id = j.project_id
+          WHERE rt.project_id = COALESCE(j.destination_table.project_id, j.project_id)
             AND rt.dataset_id = j.destination_table.dataset_id
             AND rt.table_id = j.destination_table.table_id
             AND r.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
@@ -1097,23 +1520,27 @@ def _sql_zombie_dts(c: Config) -> str:
 
 
 def _map_zombie_dts(row: dict, prices: dict, c: Config) -> Finding:
-    billed_tib = float(row.get("bytes_billed") or 0.0) / _TIB
-    savings = round(billed_tib * float(prices["on_demand_usd_per_tib"]), 2)
-    return {
+    od, rv, src = _billing_costs(row, prices, od_key="od_cost_usd_30d", resv_key="resv_cost_usd_30d",
+                                 legacy_bytes_key="bytes_billed")
+    # Pausing the writer removes 100% of its cost (reservation part scaled by realization).
+    sv = pricing.scan_savings(od, rv, 1.0, c)
+    f = {
         "rule_id": "C1-08",
         "apply_class": 1,
         "source": "CUSTOM_RULE",
-        "savings_basis": "BYTES_ON_DEMAND",
+        "savings_basis": _basis(od, rv),
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
         "target_region": c.get("location", "US"),
-        "finding_summary": f"Table `{row['dataset_id']}.{row['table_id']}` is populated by scheduled ETL but has 0 downstream readers.",
+        "finding_summary": (f"Table `{row['dataset_id']}.{row['table_id']}` is populated by scheduled ETL "
+                            f"(~${od + rv:,.2f}/mo, {sv['billing_mix']}) but has 0 downstream readers."),
         "evidence": {
             "write_jobs_30d": row["write_jobs"],
             "wasted_bytes_billed": row["bytes_billed"],
             "top_writer_email": row.get("owner_email"),
             "downstream_readers_30d": 0,
+            "savings_math": _scan_math(sv, "WRITER_JOB_COST_FULLY_REMOVED", src),
         },
         "observation_days": 30,
         "proposed_change": {
@@ -1121,10 +1548,11 @@ def _map_zombie_dts(row: dict, prices: dict, c: Config) -> Finding:
             "target_table": row["table_id"],
             "guidance": "Pause the associated scheduled query / DTS transfer config until downstream consumers are confirmed.",
         },
-        "gross_monthly_savings_usd": max(savings, 10.0),
+        "gross_monthly_savings_usd": sv["gross"],
         "risk_notes": ["OWNER_SIGNOFF_REQUIRED_BEFORE_PAUSING"],
         "confidence_hint": 0.85,
     }
+    return _apply_demo_floor(f, c, 10.0)
 
 
 # --------------------------------------------------------------------------
@@ -1135,8 +1563,10 @@ def _sql_pk_fk(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id,
              COUNT(DISTINCT j.job_id) AS join_queries,
-             SUM(j.total_slot_ms)     AS slot_ms_30d
-      FROM `{c.ops}.jobs_events` j, UNNEST(j.referenced_tables) rt
+             SUM(j.total_slot_ms)     AS slot_ms_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.total_slot_ms, 0)) AS resv_slot_ms_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.est_cost_usd, 0) * {_SHARE_1N}) AS resv_cost_usd_30d
+      FROM `{c.ops}.v_jobs_costed` j, UNNEST(j.referenced_tables) rt
       JOIN `{c.ops}.table_state_daily` t
         ON rt.project_id = t.project_id AND rt.dataset_id = t.dataset_id AND rt.table_id = t.table_id
       WHERE t.snapshot_date = CURRENT_DATE()
@@ -1149,11 +1579,15 @@ def _sql_pk_fk(c: Config) -> str:
 
 
 def _map_pk_fk(row: dict, prices: dict, c: Config) -> Finding:
-    slot_hours = float(row.get("slot_ms_30d") or 0.0) / 3_600_000.0
-    slot_rate = float(prices.get("slot_hour_usd_enterprise", 0.06))
-    savings = round(slot_hours * 0.07 * slot_rate, 2)
+    slot_hours = _f(row.get("slot_ms_30d")) / 3_600_000.0
+    resv_slot_hours = _f(row.get("resv_slot_ms_30d")) / 3_600_000.0
+    # Join elimination / re-ordering saves slot time; that is cash only for reservation jobs.
+    sv = pricing.scan_savings(0.0, _f(row.get("resv_cost_usd_30d")), 0.07, c)
+    notes = ["METADATA_ONLY_CHANGE", "VERIFY_OPTIMIZER_BENEFIT_IN_VERIFICATION_WINDOW"]
+    if sv["reservation_monthly_usd"] <= 0:
+        notes.append("NO_RESERVATION_SLOT_SPEND_ON_DEMAND_JOBS_PAY_PER_BYTE")
     ddl = f"ALTER TABLE `{row['project_id']}.{row['dataset_id']}.{row['table_id']}` ADD PRIMARY KEY (id) NOT ENFORCED;"
-    return {
+    f = {
         "rule_id": "C1-10",
         "apply_class": 1,
         "source": "CUSTOM_RULE",
@@ -1166,14 +1600,19 @@ def _map_pk_fk(row: dict, prices: dict, c: Config) -> Finding:
         "evidence": {
             "join_queries_30d": row["join_queries"],
             "slot_hours_30d": round(slot_hours, 1),
+            "reservation_slot_hours_30d": round(resv_slot_hours, 1),
             "recommendation": "Add unenforced primary key constraint to enable optimizer join elimination and re-ordering.",
+            "savings_math": _scan_math(sv, "RESERVATION_SLOT_COST_X_HEURISTIC_REDUCTION", "BILLING_AWARE",
+                                       pool_key=None, split_rule=_SPLIT_1N,
+                                       note="only reservation slot time is priced; on-demand jobs are billed by bytes"),
         },
         "observation_days": 30,
         "proposed_change": {"action": "ADD_PK_FK_CONSTRAINT", "generated_ddl": ddl},
-        "gross_monthly_savings_usd": max(savings, 8.0),
-        "risk_notes": ["METADATA_ONLY_CHANGE", "VERIFY_OPTIMIZER_BENEFIT_IN_VERIFICATION_WINDOW"],
+        "gross_monthly_savings_usd": sv["gross"],
+        "risk_notes": notes,
         "confidence_hint": 0.70,
     }
+    return _apply_demo_floor(f, c, 8.0)
 
 
 # --------------------------------------------------------------------------
@@ -1184,8 +1623,10 @@ def _sql_search_index(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id, t.total_logical_bytes,
              COUNT(DISTINCT j.job_id) AS lookup_queries,
-             SUM(j.total_bytes_billed) AS bytes_billed
-      FROM `{c.ops}.jobs_events` j, UNNEST(j.referenced_tables) rt
+             SUM(j.total_bytes_billed) AS bytes_billed,
+             SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0) * {_SHARE_1N}) AS od_cost_usd_30d,
+             SUM(IF(j.billing_mode = 'RESERVATION', j.est_cost_usd, 0) * {_SHARE_1N}) AS resv_cost_usd_30d
+      FROM `{c.ops}.v_jobs_costed` j, UNNEST(j.referenced_tables) rt
       JOIN `{c.ops}.table_state_daily` t
         ON rt.project_id = t.project_id AND rt.dataset_id = t.dataset_id AND rt.table_id = t.table_id
       WHERE t.snapshot_date = CURRENT_DATE()
@@ -1200,31 +1641,38 @@ def _sql_search_index(c: Config) -> str:
 
 
 def _map_search_index(row: dict, prices: dict, c: Config) -> Finding:
-    billed_tib = float(row.get("bytes_billed") or 0.0) / _TIB
-    savings = round(billed_tib * 0.40 * float(prices["on_demand_usd_per_tib"]), 2)
+    od, rv, src = _billing_costs(row, prices, od_key="od_cost_usd_30d", resv_key="resv_cost_usd_30d",
+                                 legacy_bytes_key="bytes_billed")
+    sv = pricing.scan_savings(od, rv, 0.40, c)
     ddl = f"CREATE SEARCH INDEX ON `{row['project_id']}.{row['dataset_id']}.{row['table_id']}`(ALL COLUMNS);"
-    return {
+    tgt = f"{row['project_id']}.{row['dataset_id']}.{row['table_id']}"
+    f = {
         "rule_id": "C2-02",
         "apply_class": 2,
         "source": "CUSTOM_RULE",
-        "savings_basis": "BYTES_ON_DEMAND",
+        "savings_basis": _basis(od, rv),
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
         "target_region": c.get("location", "US"),
-        "finding_summary": f"Table `{row['table_id']}` has {row['lookup_queries']} needle-in-haystack lookups scanning {float(row['total_logical_bytes'])/_GIB:.0f} GiB.",
+        "finding_summary": (f"Table `{row['table_id']}` has {row['lookup_queries']} needle-in-haystack lookups "
+                            f"scanning {float(row['total_logical_bytes'])/_GIB:.0f} GiB "
+                            f"(~${od + rv:,.2f}/mo attributed, {sv['billing_mix']})."),
         "evidence": {
             "lookup_queries_30d": row["lookup_queries"],
             "table_logical_gib": round(float(row["total_logical_bytes"]) / _GIB, 1),
             "strategy": "Create BigQuery Search Index to accelerate text and ID lookups with zero full scans.",
+            "savings_math": _scan_math(sv, "LOOKUP_QUERY_COST_X_HEURISTIC_REDUCTION", src,
+                                       pool_key=f"table:{tgt}", split_rule=_SPLIT_1N),
         },
         "observation_days": 30,
-        "proposed_change": {"action": "CREATE_SEARCH_INDEX", "generated_ddl": ddl, "target": f"`{row['project_id']}.{row['dataset_id']}.{row['table_id']}`"},
-        "gross_monthly_savings_usd": max(savings, 25.0),
+        "proposed_change": {"action": "CREATE_SEARCH_INDEX", "generated_ddl": ddl, "target": f"`{tgt}`"},
+        "gross_monthly_savings_usd": sv["gross"],
         "recurring_monthly_cost_usd": 5.0,
-        "risk_notes": ["INDEX_STORAGE_COST_WATCHDOG_REQUIRED"],
+        "risk_notes": ["INDEX_STORAGE_COST_WATCHDOG_REQUIRED", "SAVINGS_ESTIMATE_HEURISTIC_40PCT"],
         "confidence_hint": 0.75,
     }
+    return _apply_demo_floor(f, c, 25.0)
 
 
 # --------------------------------------------------------------------------
@@ -1258,7 +1706,7 @@ def _sql_partition_granularity(c: Config) -> str:
 
 def _map_partition_granularity(row: dict, prices: dict, c: Config) -> Finding:
     pcol = row.get("partition_column") or "created_at"
-    return {
+    f = {
         "rule_id": "C3-03",
         "apply_class": 3,
         "source": "CUSTOM_RULE",
@@ -1272,6 +1720,10 @@ def _map_partition_granularity(row: dict, prices: dict, c: Config) -> Finding:
             "current_partitions": row["partition_count"],
             "avg_partition_size_mb": round(float(row["avg_partition_bytes"]) / (1024 * 1024), 1),
             "issue": "High partition count nears 10,000 limit and adds metadata coordination overhead to queries.",
+            "savings_math": _savings_math(
+                "UNPRICED_METADATA_BENEFIT",
+                "fewer, larger partitions cut planning/metadata overhead; that benefit is not "
+                "measurable from job telemetry, so $0.00/mo is counted"),
         },
         "observation_days": 30,
         "proposed_change": {
@@ -1279,10 +1731,12 @@ def _map_partition_granularity(row: dict, prices: dict, c: Config) -> Finding:
             "granularity": "MONTH",
             "partition_column": pcol,
         },
-        "gross_monthly_savings_usd": 30.0,
-        "risk_notes": ["REQUIRES_CLASS_3_SWAP_REBUILD", "REQUIRES_TWO_PERSON_APPROVAL"],
+        "gross_monthly_savings_usd": 0.0,
+        "risk_notes": ["REQUIRES_CLASS_3_SWAP_REBUILD", "REQUIRES_TWO_PERSON_APPROVAL",
+                       "SAVINGS_UNPRICED_METADATA_BENEFIT"],
         "confidence_hint": 0.70,
     }
+    return _apply_demo_floor(f, c, 30.0)
 
 
 # --------------------------------------------------------------------------
@@ -1293,12 +1747,108 @@ def _sql_c4_antipatterns(c: Config) -> str:
     limit = int(c.get("antipattern_tool", {}).get("top_expensive_queries_limit", 100))
     min_cost = float(c.get("antipattern_tool", {}).get("expensive_query_cost_usd", 5.0))
     return f"""
-      SELECT query_hash, sample_preview, total_bytes_billed, est_on_demand_usd, executions
+      SELECT query_hash, sample_preview, total_bytes_billed, est_on_demand_usd, executions,
+             est_cost_usd, est_od_usd, est_resv_usd, reservation_executions,
+             billing_project, sample_user_email, sample_referenced_tables
       FROM `{c.ops}.v_query_families_28d`
-      WHERE est_on_demand_usd >= {min_cost}
-      ORDER BY est_on_demand_usd DESC
+      WHERE est_cost_usd >= {min_cost}
+      ORDER BY est_cost_usd DESC
       LIMIT {limit}
     """
+
+
+def _family_tables(row: dict) -> list[str]:
+    """Fully-qualified tables a query family reads (from one sample run). Lets the
+    headline compound a rewrite of a single-table query with that table's own cards."""
+    out: set[str] = set()
+    for t in row.get("sample_referenced_tables") or []:
+        get = t.get if isinstance(t, dict) else (lambda k, _t=t: getattr(_t, k, None))
+        p, d, tb = get("project_id"), get("dataset_id"), get("table_id")
+        if p and d and tb:
+            out.add(f"{p}.{d}.{tb}")
+    return sorted(out)
+
+
+def _c4_money(row: dict, prices: dict | None, c: Config, ratio: float) -> dict:
+    """Billing-aware money for one query family: 28-day cost -> monthly, split into
+    on-demand and reservation parts, savings = family cost x ratio (reservation part
+    scaled by realization). Older rows only carry est_on_demand_usd (assumed on-demand)."""
+    od, rv, src = _billing_costs(row, prices or {}, od_key="est_od_usd", resv_key="est_resv_usd",
+                                 legacy_usd_key="est_on_demand_usd", divisor=28.0 / 30.0)
+    sv = pricing.scan_savings(od, rv, ratio, c)
+    q_hash = str(row.get("query_hash") or "unknown_hash")
+    return {
+        "monthly": od + rv,
+        "cost_28d": (od + rv) * 28.0 / 30.0,
+        "gross": sv["gross"],
+        "basis": _basis(od, rv),
+        "billing_mix": sv["billing_mix"],
+        "target_project": row.get("billing_project") or c.get("project_id", "unknown_project"),
+        "math": _scan_math(sv, "QUERY_FAMILY_COST_X_HEURISTIC_REDUCTION", src,
+                           pool_key=f"query:{q_hash}",
+                           billing_project=row.get("billing_project"),
+                           reservation_executions_28d=row.get("reservation_executions"),
+                           tables=_family_tables(row) or None,
+                           window_note="28-day family cost x 30/28 = monthly"),
+    }
+
+
+def reprice_query_card(card: dict, row: dict | None, prices: dict | None, c: Config) -> dict | None:
+    """Billing-aware re-price of one legacy query (Class 4) card: the query family's
+    current 28-day cost x the reduction ratio the card was created with. Returns the new
+    evidence / gross / net / score / basis, or None when it can't be re-priced (the query
+    no longer runs, or the card never recorded its ratio). Pure: no BigQuery calls."""
+    raw = card.get("evidence_json")
+    ev = bq.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    ev = ev if isinstance(ev, dict) else {}
+    ratio = ev.get("savings_ratio_heuristic")
+    if row is None or ratio is None:
+        return None
+    money = _c4_money(row, prices, c, float(ratio))
+    old = float(card.get("gross_monthly_savings_usd") or 0)
+    ev["savings_math"] = {**money["math"], "repriced_from_usd": round(old, 2),
+                          "note": "LEGACY_CARD_REPRICED_FROM_CURRENT_FAMILY_COST"}
+    ev["monthly_spend_usd"] = round(money["monthly"], 2)
+    ev["28d_cost_usd"] = round(money["cost_28d"], 2)
+    if row.get("sample_user_email") and not ev.get("sample_user_email"):
+        ev["sample_user_email"] = row.get("sample_user_email")
+    gross = round(float(money["gross"]), 2)
+    # Same formulas as scoring.score(), keeping the card's stored confidence.
+    net = (gross - float(card.get("recurring_monthly_cost_usd") or 0)
+           - float(card.get("one_time_apply_cost_usd") or 0) / int(c.get("amortization_months", 12)))
+    risk_w = float((c.get("risk_weights") or {}).get(int(card.get("apply_class") or 4), 1.5))
+    score = max(net, 0.0) * float(card.get("confidence") or 0) / risk_w
+    return {"evidence": ev, "gross": gross, "net": round(net, 2), "score": round(score, 2),
+            "basis": money["basis"], "old_gross": round(old, 2)}
+
+
+def reprice_legacy_query_cards(c: Config, cards: list[dict]) -> tuple[list[tuple[str, dict]], list[dict]]:
+    """Re-price legacy query cards from v_query_families_28d. Returns
+    (repriced [(change_set_id, reprice_query_card result)], unpriceable cards)."""
+    if not cards:
+        return [], []
+    hashes = sorted({str(cs.get("target_table")) for cs in cards
+                     if cs.get("target_dataset") == "queries" and cs.get("target_table")})
+    rows: dict[str, dict] = {}
+    if hashes:
+        for r in bq.query(c, f"""
+            SELECT query_hash, sample_preview, total_bytes_billed, est_on_demand_usd, executions,
+                   est_cost_usd, est_od_usd, est_resv_usd, reservation_executions,
+                   billing_project, sample_user_email, sample_referenced_tables
+            FROM `{c.ops}.v_query_families_28d`
+            WHERE query_hash IN UNNEST(@h)""", {"h": hashes}):
+            rows[str(r.get("query_hash"))] = r
+    prices = dict(bq.query(c, f"SELECT * FROM `{c.ops}.v_config`")[0])
+    repriced: list[tuple[str, dict]] = []
+    unpriceable: list[dict] = []
+    for cs in cards:
+        row = rows.get(str(cs.get("target_table"))) if cs.get("target_dataset") == "queries" else None
+        res = reprice_query_card(cs, row, prices, c)
+        if res is None:
+            unpriceable.append(cs)
+        else:
+            repriced.append((cs["change_set_id"], res))
+    return repriced, unpriceable
 
 
 _AST_PATTERN_MAP: dict[str, dict[str, Any]] = {
@@ -1403,7 +1953,7 @@ def _synthesize_ast_rewrite(pattern_name: str, orig_sql: str, ast_message: str) 
     return f"-- [Google ZetaSQL AST Diagnosis: {ast_message}]\n" + sql
 
 
-def _run_google_antipattern_cli(c: Config) -> list[Finding]:
+def _run_google_antipattern_cli(c: Config, prices: dict | None = None) -> list[Finding]:
     """Executes Google's official bigquery-antipattern-recognition JAR over expensive query families."""
     tool_cfg = c.get("antipattern_tool", {})
     configured_path = tool_cfg.get("jar_path", "bigquery-antipattern-recognition.jar")
@@ -1462,8 +2012,6 @@ def _run_google_antipattern_cli(c: Config) -> list[Finding]:
 
                     row = row_by_hash[q_hash]
                     orig_sql = str(row.get("sample_preview") or "")
-                    cost_28d = float(row.get("est_on_demand_usd") or 0.0)
-                    monthly_est = cost_28d * (30.0 / 28.0)
                     execs = int(row.get("executions") or 1)
 
                     for line in rec_text.splitlines():
@@ -1480,13 +2028,15 @@ def _run_google_antipattern_cli(c: Config) -> list[Finding]:
                         rule_id = meta["rule_id"]
                         savings_ratio = float(meta["savings_ratio"])
                         proposed_sql = _synthesize_ast_rewrite(pat_name, orig_sql, ast_msg)
+                        money = _c4_money(row, prices, c, savings_ratio)
+                        monthly_est = money["monthly"]
 
                         findings.append({
                             "rule_id": rule_id,
                             "apply_class": 4,
                             "source": "GOOGLE_ANTIPATTERN_AST",
-                            "savings_basis": "BYTES_ON_DEMAND",
-                            "target_project": c.get("project_id", "unknown_project"),
+                            "savings_basis": money["basis"],
+                            "target_project": money["target_project"],
                             "target_dataset": "queries",
                             "target_table": q_hash,
                             "target_region": c.get("location", "US"),
@@ -1496,10 +2046,11 @@ def _run_google_antipattern_cli(c: Config) -> list[Finding]:
                                 "google_ast_diagnosis": f"{pat_name}: {ast_msg}",
                                 "query_hash": q_hash,
                                 "sample_preview": orig_sql,
+                                "sample_user_email": row.get("sample_user_email"),
                                 "current_sql": orig_sql,
                                 "proposed_sql": proposed_sql,
                                 "28d_executions": execs,
-                                "28d_cost_usd": round(cost_28d, 2),
+                                "28d_cost_usd": round(money["cost_28d"], 2),
                                 "monthly_spend_usd": round(monthly_est, 2),
                                 "savings_ratio_heuristic": savings_ratio,
                                 "current_state": {
@@ -1507,14 +2058,15 @@ def _run_google_antipattern_cli(c: Config) -> list[Finding]:
                                     "ast_pattern": pat_name,
                                     "ast_diagnostic": ast_msg,
                                     "28d_executions": f"{execs} audited queries",
-                                    "monthly_spend": f"${monthly_est:.2f} / month",
+                                    "monthly_spend": f"${monthly_est:.2f} / month ({money['billing_mix']})",
                                 },
                                 "proposed_state": {
                                     "delivery_route": "Automated GitHub Pull Request (CI_PULL_REQUEST)",
                                     "remediation_strategy": meta["fix"],
-                                    "projected_savings": f"${monthly_est * savings_ratio:.2f} / month ({int(savings_ratio * 100)}% scan reduction)",
+                                    "projected_savings": f"${money['gross']:.2f} / month ({int(savings_ratio * 100)}% reduction, heuristic)",
                                     "ci_checks": "ZetaSQL AST & dry-run validation",
                                 },
+                                "savings_math": money["math"],
                             },
                             "observation_days": 28,
                             "proposed_change": {
@@ -1524,7 +2076,7 @@ def _run_google_antipattern_cli(c: Config) -> list[Finding]:
                                 "generated_ddl": proposed_sql,
                                 "target_repo_pr": True,
                             },
-                            "gross_monthly_savings_usd": round(monthly_est * savings_ratio, 2),
+                            "gross_monthly_savings_usd": money["gross"],
                             "risk_notes": [
                                 "GOOGLE_ZETASQL_AST_VERIFIED",
                                 "CODE_CHANGE_REQUIRED",
@@ -1575,7 +2127,8 @@ def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
     return "\n\n".join(ddls)
 
 
-def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding]) -> list[Finding]:
+def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding],
+                          prices: dict | None = None) -> list[Finding]:
     """Engine 3: Vertex AI Gemini 3 Schema-Aware SQL Judge + BigQuery Dry-Run Verifier."""
     ai_cfg = c.get("ai_judge", {})
     if not ai_cfg.get("enabled", True):
@@ -1708,8 +2261,9 @@ Respond strictly in JSON format with keys:
                 dry_run_note = "BigQuery Dry-Run Verified: 100% Syntax & Schema Validated (Cluster / Hash-Join Optimization)"
 
             savings_ratio = max(0.15, min(0.85, savings_ratio))
-            cost_28d = float(row.get("est_on_demand_usd") or 0.0)
-            monthly_est = cost_28d * (30.0 / 28.0)
+            money = _c4_money(row, prices, c, savings_ratio)
+            cost_28d = money["cost_28d"]
+            monthly_est = money["monthly"]
             execs = int(row.get("executions") or 1)
 
             formatted_opt_sql = (
@@ -1722,8 +2276,8 @@ Respond strictly in JSON format with keys:
                 "rule_id": rule_id,
                 "apply_class": 4,
                 "source": "GEMINI_AI_JUDGE",
-                "savings_basis": "BYTES_ON_DEMAND",
-                "target_project": proj,
+                "savings_basis": money["basis"],
+                "target_project": money["target_project"],
                 "target_dataset": "queries",
                 "target_table": q_hash,
                 "target_region": c.get("location", "US"),
@@ -1734,6 +2288,7 @@ Respond strictly in JSON format with keys:
                     "dry_run_verification": dry_run_note,
                     "query_hash": q_hash,
                     "sample_preview": orig_sql,
+                    "sample_user_email": row.get("sample_user_email"),
                     "current_sql": orig_sql,
                     "proposed_sql": formatted_opt_sql,
                     "28d_executions": execs,
@@ -1744,14 +2299,15 @@ Respond strictly in JSON format with keys:
                         "detection_engine": f"Engine 3: Vertex AI ({model_name}) + Schema DDL",
                         "schema_antipattern": antipattern_name,
                         "28d_executions": f"{execs} audited queries",
-                        "monthly_spend": f"${monthly_est:.2f} / month",
+                        "monthly_spend": f"${monthly_est:.2f} / month ({money['billing_mix']})",
                     },
                     "proposed_state": {
                         "delivery_route": "Automated GitHub Pull Request (CI_PULL_REQUEST)",
                         "remediation_strategy": data.get("remediation_strategy", ""),
                         "dry_run_proof": dry_run_note,
-                        "projected_savings": f"${monthly_est * savings_ratio:.2f} / month ({int(savings_ratio * 100)}% reduction)",
+                        "projected_savings": f"${money['gross']:.2f} / month ({int(savings_ratio * 100)}% reduction)",
                     },
+                    "savings_math": money["math"],
                 },
                 "observation_days": 28,
                 "proposed_change": {
@@ -1761,7 +2317,7 @@ Respond strictly in JSON format with keys:
                     "generated_ddl": formatted_opt_sql,
                     "target_repo_pr": True,
                 },
-                "gross_monthly_savings_usd": round(monthly_est * savings_ratio, 2),
+                "gross_monthly_savings_usd": money["gross"],
                 "risk_notes": [
                     "VERTEX_AI_GEMINI_SCHEMA_VERIFIED",
                     "BIGQUERY_DRY_RUN_VALIDATED",
@@ -1786,8 +2342,6 @@ def _map_c4_antipatterns(row: dict, prices: dict, c: Config) -> list[Finding] | 
     """
     sql = (row.get("sample_preview") or "").upper()
     q_hash = row.get("query_hash") or "unknown_hash"
-    cost_28d = float(row.get("est_on_demand_usd") or 0.0)
-    monthly_est = cost_28d * (30.0 / 28.0)
     execs = int(row.get("executions") or 1)
 
     findings: list[Finding] = []
@@ -1796,12 +2350,14 @@ def _map_c4_antipatterns(row: dict, prices: dict, c: Config) -> list[Finding] | 
                pattern: str, rewrite_template: str,
                savings_ratio: float = 0.30) -> Finding:
         actor = _classify_query_actor(row.get("sample_user_email"), row.get("sample_preview"))
+        money = _c4_money(row, prices, c, savings_ratio)
+        monthly_est = money["monthly"]
         return {
             "rule_id": rule_id,
             "apply_class": 4,
             "source": "CUSTOM_RULE",
-            "savings_basis": "BYTES_ON_DEMAND",
-            "target_project": c.get("project_id", "unknown_project"),
+            "savings_basis": money["basis"],
+            "target_project": money["target_project"],
             "target_dataset": "queries",
             "target_table": q_hash,
             "target_region": c.get("location", "US"),
@@ -1813,26 +2369,28 @@ def _map_c4_antipatterns(row: dict, prices: dict, c: Config) -> list[Finding] | 
                 "pattern_matched": pattern,
                 "query_hash": q_hash,
                 "sample_preview": row.get("sample_preview", ""),
+                "sample_user_email": row.get("sample_user_email"),
                 "current_sql": row.get("sample_preview", ""),
                 "proposed_sql": rewrite_template,
                 "28d_executions": execs,
-                "28d_cost_usd": round(cost_28d, 2),
+                "28d_cost_usd": round(money["cost_28d"], 2),
                 "monthly_spend_usd": round(monthly_est, 2),
                 "savings_ratio_heuristic": savings_ratio,
                 "current_state": {
                     "workload_actor": actor["actor_badge"],
                     "pattern_matched": pattern,
                     "28d_executions": f"{execs} audited queries",
-                    "monthly_spend": f"${monthly_est:.2f} / month",
+                    "monthly_spend": f"${monthly_est:.2f} / month ({money['billing_mix']})",
                     "inefficient_behavior": summary,
                 },
                 "proposed_state": {
                     "delivery_route": "Automated GitHub Pull Request (CI_PULL_REQUEST)",
                     "guardrail_status": "Enforce 50 GiB cap if Human Ad-Hoc; Exempt if Service Account ETL",
                     "remediation_strategy": fix_suggestion,
-                    "projected_savings": f"${monthly_est * savings_ratio:.2f} / month ({int(savings_ratio * 100)}% scan reduction)",
+                    "projected_savings": f"${money['gross']:.2f} / month ({int(savings_ratio * 100)}% reduction, heuristic)",
                     "ci_checks": "Dry-run syntax validation & projection compatibility",
                 },
+                "savings_math": money["math"],
             },
             "observation_days": 28,
             "proposed_change": {
@@ -1842,7 +2400,7 @@ def _map_c4_antipatterns(row: dict, prices: dict, c: Config) -> list[Finding] | 
                 "generated_ddl": rewrite_template,
                 "target_repo_pr": True,
             },
-            "gross_monthly_savings_usd": round(monthly_est * savings_ratio, 2),
+            "gross_monthly_savings_usd": money["gross"],
             "risk_notes": ["CODE_CHANGE_REQUIRED", "VALIDATE_QUERY_RESULTS_BEFORE_PROMOTING",
                            f"SAVINGS_HEURISTIC_{int(savings_ratio * 100)}PCT_OF_FAMILY_SPEND"],
             "confidence_hint": 0.55,  # regex-based detection; kept deliberately modest
@@ -2001,8 +2559,52 @@ RULES: list[tuple[Callable[[Config], str], Callable[[dict, dict, Config], Findin
 ]
 
 
+def _require_upgraded_views(c: Config) -> None:
+    """The billing-aware rules read columns added to the derived views (est_cost_usd and
+    friends). Fail fast with a clear instruction instead of a cryptic SQL error."""
+    try:
+        rows = bq.query(c, f"""
+            SELECT COUNT(*) AS n FROM `{c.ops}.INFORMATION_SCHEMA.COLUMNS`
+            WHERE table_name = 'v_jobs_costed' AND column_name = 'est_cost_usd'""")
+        upgraded = bool(rows) and int(rows[0]["n"]) > 0
+    except Exception:
+        return  # can't tell (e.g. no metadata access): let the rule queries speak for themselves
+    if not upgraded:
+        raise SystemExit(
+            f"{c.ops} views predate billing-aware savings (v_jobs_costed has no est_cost_usd). "
+            f"Upgrade them first (additive, no data loss): "
+            f"python -m optimizer.cli init -p {c['project_id']}")
+
+
+def _table_costs(c: Config) -> dict[tuple, dict]:
+    """(project, dataset, table) -> MONTHLY read cost split by billing mode
+    (v_table_read_write_90d / 3). Each multi-table job's cost, bytes and slot time are
+    shared across the tables it reads, so a join is never counted once per table."""
+    rows = bq.query(c, f"""
+        SELECT project_id, dataset_id, table_id, scan_jobs, billing_projects,
+               est_od_usd_reads, est_resv_usd_reads,
+               COALESCE(bytes_billed_reads_attr, bytes_billed_reads) AS bytes_reads,
+               COALESCE(slot_ms_reads_attr, slot_ms_reads)           AS slot_ms_reads
+        FROM `{c.ops}.v_table_read_write_90d`
+        WHERE scan_jobs > 0""")
+    out: dict[tuple, dict] = {}
+    for r in rows:
+        out[(r["project_id"], r["dataset_id"], r["table_id"])] = {
+            "od_usd": _f(r.get("est_od_usd_reads")) / 3.0,
+            "resv_usd": _f(r.get("est_resv_usd_reads")) / 3.0,
+            "bytes_month": _f(r.get("bytes_reads")) / 3.0,
+            "slot_ms_month": _f(r.get("slot_ms_reads")) / 3.0,
+            "scan_jobs_month": _f(r.get("scan_jobs")) / 3.0,
+            "billing_projects": list(r.get("billing_projects") or []),
+        }
+    return out
+
+
 def run(c: Config) -> list[Finding]:
-    prices = bq.query(c, f"SELECT * FROM `{c.ops}.v_config`")[0]
+    _require_upgraded_views(c)
+    prices = dict(bq.query(c, f"SELECT * FROM `{c.ops}.v_config`")[0])
+    # Real per-table read cost (by billing mode) for the native partition/cluster cards.
+    prices["_table_costs"] = _table_costs(c)
     findings: list[Finding] = []
 
     # 1. Standard SQL & Regex rules
@@ -2016,7 +2618,7 @@ def run(c: Config) -> list[Finding]:
 
     # 2. Google Antipattern CLI JAR Integration (if enabled and available)
     if c.get("antipattern_tool", {}).get("enabled", True):
-        cli_findings = _run_google_antipattern_cli(c)
+        cli_findings = _run_google_antipattern_cli(c, prices)
         existing_map = {f"{x.get('rule_id')}:{x.get('target_table')}": x for x in findings}
         for cf in cli_findings:
             key = f"{cf.get('rule_id')}:{cf.get('target_table')}"
@@ -2034,7 +2636,7 @@ def run(c: Config) -> list[Finding]:
 
     # 3. Engine 3: Vertex AI Gemini Schema-Aware SQL Judge + Dry-Run Verifier
     if c.get("ai_judge", {}).get("enabled", True):
-        ai_findings = _run_gemini_sql_judge(c, findings)
+        ai_findings = _run_gemini_sql_judge(c, findings, prices)
         existing_map = {f"{x.get('rule_id')}:{x.get('target_table')}": x for x in findings}
         for af in ai_findings:
             key = f"{af.get('rule_id')}:{af.get('target_table')}"
@@ -2046,12 +2648,9 @@ def run(c: Config) -> list[Finding]:
 
 
 def table_spend_map(c: Config) -> dict[tuple, float]:
-    """table -> est monthly on-demand read spend; the subquery-summation cap input."""
-    rows = bq.query(c, f"""
-        SELECT project_id, dataset_id, table_id, est_on_demand_usd_reads
-        FROM `{c.ops}.v_table_read_write_90d` WHERE est_on_demand_usd_reads IS NOT NULL""")
-    return {(r["project_id"], r["dataset_id"], r["table_id"]):
-            float(r["est_on_demand_usd_reads"]) / 3.0 for r in rows}
+    """table -> est monthly read spend at each job's real billing mode (on-demand bytes +
+    reservation slot-hours, joins split across tables); the subquery-summation cap input."""
+    return {k: v["od_usd"] + v["resv_usd"] for k, v in _table_costs(c).items()}
 
 
 def table_volatility_map(c: Config) -> dict[tuple, float]:

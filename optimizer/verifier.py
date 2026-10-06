@@ -11,24 +11,39 @@ from __future__ import annotations
 
 import datetime as dt
 
-from . import bq, store
+from . import bq, pricing, store
 from .config import Config
 from .executor import recommender_sync
 
 _TIB = 1024 ** 4
 _GIB = 1024 ** 3
 
+# Per-family metrics stored in the frozen plan. The *_execs / od_* / resv_* keys
+# (added with billing-aware savings) let check() price each billing mode at its own
+# rate; plans frozen before that only have the first four and use _price().
+_FAMILY_KEYS = ("execs", "bytes_per_exec", "slot_ms_per_exec", "p95_ms",
+                "od_execs", "od_bytes_per_exec", "resv_execs", "resv_slot_ms_per_exec",
+                "resv_slot_rate_usd")
+
 
 def _family_metrics(c: Config, cs: dict, start_days_ago: int, end_days_ago: int) -> list[dict]:
+    # EXISTS (not a join on UNNEST): a job that reads several tables of the target
+    # dataset is still one execution, so dataset-level targets aren't double counted.
     return bq.query(c, f"""
         SELECT j.query_hash,
                COUNT(*)                    AS execs,
                AVG(j.total_bytes_billed)   AS bytes_per_exec,
                AVG(j.total_slot_ms)        AS slot_ms_per_exec,
-               APPROX_QUANTILES(j.duration_ms, 100)[OFFSET(95)] AS p95_ms
-        FROM `{c.ops}.v_jobs_costed` j, UNNEST(j.referenced_tables) rt
-        WHERE rt.project_id = @p AND rt.dataset_id = @d
-          AND (@t IS NULL OR rt.table_id = @t)
+               APPROX_QUANTILES(j.duration_ms, 100)[OFFSET(95)] AS p95_ms,
+               COUNTIF(j.billing_mode = 'ON_DEMAND')                              AS od_execs,
+               AVG(IF(j.billing_mode = 'ON_DEMAND', j.total_bytes_billed, NULL))  AS od_bytes_per_exec,
+               COUNTIF(j.billing_mode = 'RESERVATION')                            AS resv_execs,
+               AVG(IF(j.billing_mode = 'RESERVATION', j.total_slot_ms, NULL))     AS resv_slot_ms_per_exec,
+               AVG(j.slot_rate_usd)                                               AS resv_slot_rate_usd
+        FROM `{c.ops}.v_jobs_costed` j
+        WHERE EXISTS (SELECT 1 FROM UNNEST(j.referenced_tables) rt
+                      WHERE rt.project_id = @p AND rt.dataset_id = @d
+                        AND (@t IS NULL OR rt.table_id = @t))
           AND j.query_hash IS NOT NULL
           AND j.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @s DAY)
           AND j.creation_time <  TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @e DAY)
@@ -61,8 +76,7 @@ def freeze_baseline(c: Config, cs: dict, actor: str = "verifier") -> None:
     plan = {"window_days": win,
             "frozen_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "storage_baseline": storage_base,
-            "families": {f["query_hash"]: {k: float(f[k] or 0) for k in
-                         ("execs", "bytes_per_exec", "slot_ms_per_exec", "p95_ms")}
+            "families": {f["query_hash"]: {k: float(f.get(k) or 0) for k in _FAMILY_KEYS}
                          for f in fams}}
     bq.execute(c, f"UPDATE `{c.ops}.change_sets` SET verification_plan_json=@p "
                   f"WHERE change_set_id=@id",
@@ -76,9 +90,62 @@ def _price(c: Config, basis: str, bytes_delta_month: float, slot_ms_delta_month:
     if basis == "SLOT_EDITIONS":
         return slot_ms_delta_month / 3_600_000 * float(prices.get("slot_hour_usd_enterprise", 0.06))
     if basis == "STORAGE":
-        rate = float(prices.get("active_logical_gib_usd", 0.02))
+        rate = pricing.rate(prices, "p_log_active")
         return round(storage_gb_delta * rate, 2)
     return 0.0
+
+
+def _f(v) -> float:
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def compare_families(base: dict, post: dict, *, win: int, min_execs: int, thresh: float,
+                     prices: dict, c=None) -> dict:
+    """Pure: compare frozen baseline families with the post-window families.
+
+    Billing-aware plans (frozen with per-mode metrics) price on-demand executions by
+    bytes x $/TiB and reservation executions by slot-hours x their edition rate x
+    realization — like-for-like with how the prediction was made. Regressions are
+    checked per mode too (bytes for on-demand, slot time for reservation). Older plans
+    fall back to the totals (bytes_delta / slot_delta) priced by savings_basis."""
+    month_scale = 30.0 / max(win, 1)
+    od_rate = pricing.rate(prices, "on_demand_usd_per_tib")
+    default_slot_rate = pricing.rate(prices, "slot_hour_usd_enterprise")
+    real = pricing.realization(c)
+    out = {"compared": 0, "regressed": 0, "bytes_delta": 0.0, "slot_delta": 0.0,
+           "od_usd": 0.0, "resv_usd": 0.0,
+           "billing_aware": bool(base) and all("od_execs" in b for b in base.values())}
+    for h, b in base.items():
+        p = post.get(h)
+        if not p or int(_f(p.get("execs"))) < min_execs or _f(b.get("execs")) < min_execs:
+            continue
+        out["compared"] += 1
+        p_execs = _f(p.get("execs"))
+        out["bytes_delta"] += (_f(b.get("bytes_per_exec")) - _f(p.get("bytes_per_exec"))) * p_execs * month_scale
+        out["slot_delta"] += (_f(b.get("slot_ms_per_exec")) - _f(p.get("slot_ms_per_exec"))) * p_execs * month_scale
+        if out["billing_aware"]:
+            worse_cost = False
+            if _f(b.get("od_execs")) > 0 and _f(p.get("od_execs")) > 0:
+                d_bytes = ((_f(b.get("od_bytes_per_exec")) - _f(p.get("od_bytes_per_exec")))
+                           * _f(p.get("od_execs")) * month_scale)
+                out["od_usd"] += d_bytes / _TIB * od_rate
+                worse_cost |= _f(p.get("od_bytes_per_exec")) > _f(b.get("od_bytes_per_exec")) * thresh
+            if _f(b.get("resv_execs")) > 0 and _f(p.get("resv_execs")) > 0:
+                rate = _f(p.get("resv_slot_rate_usd")) or _f(b.get("resv_slot_rate_usd")) or default_slot_rate
+                d_slot = ((_f(b.get("resv_slot_ms_per_exec")) - _f(p.get("resv_slot_ms_per_exec")))
+                          * _f(p.get("resv_execs")) * month_scale)
+                out["resv_usd"] += d_slot / 3_600_000 * rate * real
+                worse_cost |= (_f(p.get("resv_slot_ms_per_exec"))
+                               > _f(b.get("resv_slot_ms_per_exec")) * thresh)
+        else:
+            worse_cost = _f(p.get("bytes_per_exec")) > _f(b.get("bytes_per_exec")) * thresh
+        worse_lat = _f(p.get("p95_ms")) > _f(b.get("p95_ms")) * thresh
+        if worse_cost or worse_lat:
+            out["regressed"] += 1
+    return out
 
 
 def check(c: Config, cs: dict) -> str:
@@ -97,23 +164,11 @@ def check(c: Config, cs: dict) -> str:
     post = {f["query_hash"]: f for f in _family_metrics(c, cs, start_days_ago=max(win, 1), end_days_ago=0)}
     prices = bq.query(c, f"SELECT * FROM `{c.ops}.v_config`")[0]
 
-    regressed, bytes_delta, slot_delta, compared = 0, 0.0, 0.0, 0
     min_execs = int(c.get("min_family_execs", 1))
     thresh = 1 + float(c.get("regression_pct", 15.0)) / 100.0
-    for h, b in base.items():
-        p = post.get(h)
-        if not p or int(p["execs"] or 0) < min_execs or b["execs"] < min_execs:
-            continue
-        compared += 1
-        month_scale = 30.0 / max(win, 1)
-        bytes_delta += (b["bytes_per_exec"] - float(p["bytes_per_exec"] or 0)) \
-                       * float(p["execs"]) * month_scale
-        slot_delta += (b["slot_ms_per_exec"] - float(p["slot_ms_per_exec"] or 0)) \
-                      * float(p["execs"]) * month_scale
-        worse_cost = float(p["bytes_per_exec"] or 0) > b["bytes_per_exec"] * thresh
-        worse_lat = float(p["p95_ms"] or 0) > b["p95_ms"] * thresh
-        if worse_cost or worse_lat:
-            regressed += 1
+    cmp = compare_families(base, post, win=win, min_execs=min_execs, thresh=thresh, prices=prices, c=c)
+    regressed, compared = cmp["regressed"], cmp["compared"]
+    bytes_delta, slot_delta = cmp["bytes_delta"], cmp["slot_delta"]
 
     predicted = float(cs.get("gross_monthly_savings_usd") or 0)
     basis = cs.get("savings_basis") or ""
@@ -141,9 +196,14 @@ def check(c: Config, cs: dict) -> str:
             ratio = 1.0
             note = "Storage verified (table dropped/expired as planned)"
     elif compared > 0:
-        realized = round(_price(c, basis, bytes_delta, slot_delta, prices), 2)
+        if cmp["billing_aware"]:
+            realized = round(cmp["od_usd"] + cmp["resv_usd"], 2)
+            note = (f"billing-aware: on-demand ${cmp['od_usd']:,.2f} (bytes x $/TiB) + reservation "
+                    f"${cmp['resv_usd']:,.2f} (slot-hours x edition rate x realization)")
+        else:
+            realized = round(_price(c, basis, bytes_delta, slot_delta, prices), 2)
+            note = None
         ratio = round(realized / predicted, 3) if predicted > 0 else None
-        note = None
     else:
         realized, ratio = None, None
         note = "no comparable post-window families yet — realized savings pending"
@@ -217,7 +277,7 @@ def watchdogs(c: Config) -> list[str]:
     alerts = []
     rows = bq.query(c, f"""
         SELECT w.change_set_id, w.target, w.monthly_limit_usd,
-               SUM(j.est_on_demand_usd) * 30 / {max(int(c.get('verify_window_days', 14)), 1)} AS est_monthly
+               SUM(j.est_cost_usd) * 30 / {max(int(c.get('verify_window_days', 14)), 1)} AS est_monthly
         FROM `{c.ops}.cost_watchdogs` w
         JOIN `{c.ops}.v_jobs_costed` j
           ON STRPOS(COALESCE(j.query_preview, ''), w.target) > 0

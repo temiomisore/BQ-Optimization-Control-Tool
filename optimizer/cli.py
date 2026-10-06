@@ -14,7 +14,8 @@ import argparse
 import datetime as dt
 import sys
 
-from . import bq, collector_driver, compiler, rules, scoring, store, verifier
+from . import (attribution, bq, collector_driver, compiler, governance, rules, scoring, store,
+               verifier)
 from .config import cfg
 from .executor import class1, class2, class3, pr_handoff, recommender_sync, router
 
@@ -32,6 +33,16 @@ def cmd_init(c) -> None:
     for f in ("sql/01_ops_schema.sql", "sql/04_change_sets.sql", "sql/03_derived_views.sql"):
         bq.run_file(c, f)
         print("  + Ran DDL:", f)
+    # Point the attribution source views at the customer's own employee-hierarchy and
+    # service-account owner tables (config: employee_hierarchy_table/_columns,
+    # service_account_owner_table/_columns). Nothing configured = local optimizer_ops tables.
+    try:
+        stmts = attribution.source_view_sql(c)
+    except attribution.AttributionConfigError as e:
+        sys.exit(f"[!] attribution config error: {e}")
+    for stmt in stmts:
+        bq.execute(c, stmt)
+        print("  + Attribution source view:", stmt.splitlines()[0].replace("CREATE OR REPLACE VIEW ", ""))
     print("✅ Control plane schema initialized successfully!")
 
 
@@ -79,41 +90,90 @@ def cmd_collect(c) -> None:
     print("✅ Telemetry collection completed successfully!")
 
 
+# Findings that are not tied to one dataset stay in scope for dataset-scoped runs.
+_CROSS_DATASET_TARGETS = (None, "queries", "PROJECT_WIDE_BILLING", "HUMAN_ADHOC_GOVERNANCE")
+
+
+def _in_scope(item: dict, target_ds: str | None) -> bool:
+    return (not target_ds or item.get("target_dataset") == target_ds
+            or item.get("target_dataset") in _CROSS_DATASET_TARGETS)
+
+
+def _annotate_query_runner(f: dict, sa_owners: dict) -> None:
+    """Class 4 (SQL rewrite) cards: record who answers for the query's spend. A service
+    account (PowerBI, ETL ...) resolves to its human owner through the SA owner table."""
+    ev = f.setdefault("evidence", {})
+    runner = ev.get("sample_user_email")
+    acct = router.accountable_owner(runner, sa_owners)
+    if acct:
+        ev["accountable_owner"] = acct
+    elif runner and attribution.is_service_account(runner):
+        notes = f.setdefault("risk_notes", [])
+        if "QUERY_RUN_BY_UNMAPPED_SERVICE_ACCOUNT" not in notes:
+            notes.append("QUERY_RUN_BY_UNMAPPED_SERVICE_ACCOUNT")
+
+
 def cmd_rules(c) -> None:
     expired = store.expire_stale(c)
     findings = rules.run(c)
     target_ds = c.get("target_dataset")
     if target_ds:
-        findings = [
-            f for f in findings
-            if f.get("target_dataset") == target_ds
-            or f.get("target_dataset") in (None, "queries", "PROJECT_WIDE_BILLING", "HUMAN_ADHOC_GOVERNANCE")
-        ]
+        findings = [f for f in findings if _in_scope(f, target_ds)]
         print(f"[*] Filtered rules to target dataset: {target_ds}")
     spend = rules.table_spend_map(c)
     cv = rules.table_volatility_map(c)
     hist = store.rule_history(c)
+    sa_owners = attribution.load_sa_owner_map(c)
+    if sa_owners:
+        print(f"[*] Service-account owner map: {len(sa_owners)} service account(s) mapped to owners")
     for f in findings:
         scoring.score(f, c, table_spend=spend, table_cv=cv, rule_history=hist)
         f["execution_route"], _ = router.route(c, f.get("target_dataset"), f)
-        f["owner_principal"], f["owner_source"] = router.resolve_owner(c, f)
+        f["owner_principal"], f["owner_source"] = router.resolve_owner(c, f, sa_owners)
+        if int(f.get("apply_class") or 0) == 4:
+            _annotate_query_runner(f, sa_owners)
     open_sets = store.open_sets(c)
-    # Refresh (not duplicate) W-01 capacity cards still awaiting their first approval
+
+    # Re-price (not duplicate) every card that is still awaiting its first approval and
+    # was detected again, so reviewers always see this run's billing-aware number.
     refreshed = 0
-    for f in findings:
-        if f.get("rule_id") != "W-01":
-            continue
-        for cs in open_sets:
-            if ("W-01" in (cs.get("rule_ids") or []) and cs.get("state") == "PENDING_REVIEW"
-                    and not cs.get("n_approvals")
-                    and cs.get("target_project") == f.get("target_project")):
-                store.refresh_pending(c, cs["change_set_id"], f)
-                refreshed += 1
+    for cs_id, f in compiler.pending_refreshes(findings, open_sets, c):
+        store.refresh_pending(c, cs_id, f)
+        refreshed += 1
     if refreshed:
-        print(f"[*] Refreshed {refreshed} pending W-01 card(s) with latest slot sizing")
-    sets, notes = compiler.compile(findings, open_sets)
+        print(f"[*] Re-priced {refreshed} pending card(s) still awaiting their first approval")
+
+    # Unapproved cards priced by the old (not billing-aware) math and not detected again:
+    # retire them so a stale number never stays on the board. Query cards from the
+    # non-deterministic engines are re-priced from the query's current cost instead.
+    legacy = [cs for cs in store.unapproved_legacy_pending(c) if _in_scope(cs, target_ds)]
+    retired = 0
+    for cs in compiler.stale_legacy_cards(findings, legacy):
+        store.transition(c, cs["change_set_id"], "SUPERSEDED", "rules-engine",
+                         "Retired: priced by the pre-billing-aware engine and not detected again; "
+                         "re-created with billing-aware savings if the finding still applies")
+        retired += 1
+    repriced, unpriceable = rules.reprice_legacy_query_cards(
+        c, compiler.legacy_to_reprice(findings, legacy))
+    for cs_id, r in repriced:
+        store.reprice_pending(c, cs_id, evidence=r["evidence"], gross=r["gross"], net=r["net"],
+                              score=r["score"], basis=r["basis"],
+                              note=(f"Re-priced with billing-aware math: "
+                                    f"${r['old_gross']:,.2f} -> ${r['gross']:,.2f}/mo"))
+    for cs in unpriceable:
+        store.transition(c, cs["change_set_id"], "SUPERSEDED", "rules-engine",
+                         "Retired: legacy estimate could not be re-priced (query no longer runs "
+                         "in the 28-day window, or the card has no recorded reduction ratio)")
+        retired += 1
+    if retired or repriced:
+        print(f"[*] Legacy estimates: re-priced {len(repriced)}, retired {retired}")
+
+    sets, notes = compiler.compile(findings, open_sets, c)
     n = store.insert(c, sets)
-    print(f"expired={expired} findings={len(findings)} inserted={n} suppressed={len(notes)}")
+    floors = sum(1 for f in findings if "DEMO_SYNTHETIC_FLOOR_APPLIED" in (f.get("risk_notes") or []))
+    print(f"expired={expired} findings={len(findings)} inserted={n} suppressed={len(notes)} "
+          f"refreshed={refreshed} retired={retired}"
+          + (f" demo_floors={floors} (demo_mode is on: synthetic minimums applied)" if floors else ""))
     for note in notes:
         print("  ", note)
 
@@ -135,6 +195,14 @@ def cmd_execute(c) -> None:
         if target_ds and cs.get("target_dataset") != target_ds:
             continue
         target = f"{cs['target_dataset']}.{cs.get('target_table') or '*'}"
+        # Defense in depth (the review UI already refuses with 403): a billing, commitment,
+        # reservation or project-level card runs only if FinOps approvers approved it.
+        # Otherwise it goes back to the queue for a FinOps approver - recoverable, not FAILED.
+        block = governance.executor_block_reason(cs, c)
+        if block:
+            store.send_back_for_reapproval(c, cs["change_set_id"], "executor", block)
+            print(f"sent back {cs['change_set_id']} ({target}) for FinOps re-approval: {block}")
+            continue
         if cs.get("execution_route") == "CI_PULL_REQUEST":
             # Code changes (Class 4 SQL rewrites) are never applied directly: hand them off
             # to an engineer as a ready-to-open pull request instead of skipping forever.

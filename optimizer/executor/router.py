@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from .. import store
+from .. import attribution, store
 from ..config import Config
 
 
@@ -28,9 +28,30 @@ def route(c: Config, target_dataset: str | None, finding: dict | None = None) ->
     return "DIRECT_GUARDED", "UNMANAGED"
 
 
-def resolve_owner(c: Config, finding: dict) -> tuple[str, str]:
+def accountable_owner(principal: str | None, sa_owners: dict | None) -> dict | None:
+    """Who answers for a principal's spend: a service account (PowerBI, ETL ...) listed in
+    the SA owner table maps to its human owner; a human is accountable for themself.
+    Returns None for a service account nobody has claimed yet."""
+    if not principal:
+        return None
+    owner = attribution.resolve_sa_owner(principal, sa_owners)
+    if owner:
+        return {"principal": str(principal), "owner_email": owner["owner_email"],
+                "director_name": owner.get("director_name"),
+                "director_email": owner.get("director_email"),
+                "application": owner.get("application"),
+                "source": "SERVICE_ACCOUNT_OWNER"}
+    if attribution.is_service_account(principal):
+        return None
+    return {"principal": str(principal), "owner_email": str(principal), "source": "PRINCIPAL"}
+
+
+def resolve_owner(c: Config, finding: dict, sa_owners: dict | None = None) -> tuple[str, str]:
     """Resolves table owner following design doc §8:
     1. Table owner label -> 2. IaC CODEOWNERS -> 3. Top writer principal -> 4. Dataset admin.
+    A top writer that is a service account resolves to its accountable human owner through
+    the service-account owner table (sa_owners, see optimizer/attribution.py); an unmapped
+    service account is never treated as an owner.
     Returns (owner_principal, owner_source)."""
     # 1. Table label
     labels = finding.get("evidence", {}).get("labels") or finding.get("proposed_change", {}).get("labels") or {}
@@ -46,9 +67,17 @@ def resolve_owner(c: Config, finding: dict) -> tuple[str, str]:
         return codeowner, "IAC_CODEOWNERS"
 
     # 3. Top writer principal from telemetry if available
-    top_writer = finding.get("evidence", {}).get("top_writer_email")
+    top_writer = (finding.get("evidence") or {}).get("top_writer_email")
     if top_writer:
-        return str(top_writer), "TOP_WRITER"
+        acct = accountable_owner(top_writer, sa_owners)
+        if acct and acct["source"] == "SERVICE_ACCOUNT_OWNER":
+            finding.setdefault("evidence", {})["service_account_owner"] = acct
+            return acct["owner_email"], "SERVICE_ACCOUNT_OWNER"
+        if acct:
+            return str(top_writer), "TOP_WRITER"
+        notes = finding.setdefault("risk_notes", [])
+        if "TOP_WRITER_IS_UNMAPPED_SERVICE_ACCOUNT" not in notes:
+            notes.append("TOP_WRITER_IS_UNMAPPED_SERVICE_ACCOUNT")
 
     # 4. Fallback: Dataset admin / project default
     default_owner = c.get("default_owner") or f"data-platform-admin@{c['project_id']}.iam.gserviceaccount.com"

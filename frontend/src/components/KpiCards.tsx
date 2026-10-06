@@ -4,7 +4,7 @@ import type { Dashboard } from "@/lib/api";
 import { AnimatedNumber, Skeleton } from "./ui";
 import { cn, usd } from "@/lib/utils";
 
-export type TabKey = "queue" | "handoffs" | "blocked" | "regressed" | "rolled_back" | "receipts";
+export type TabKey = "queue" | "finops" | "handoffs" | "blocked" | "regressed" | "rolled_back" | "receipts";
 
 export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey) => void }) {
   if (!data) {
@@ -20,23 +20,38 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
     );
   }
   const k = data.kpis;
+  const overlap = Number(k.overlap_removed_usd || 0);
+  const demoCards = Number(k.demo_floor_cards || 0);
+  const legacyCards = Number(k.legacy_estimate_cards || 0);
+  const spend = k.compute_spend_30d_usd;
+  const savingsFoot = [
+    `${usd(k.annual_savings)} / year`,
+    overlap > 0 ? `${usd(overlap)} overlap removed (sum of cards ${usd(k.monthly_savings_gross_sum)})` : null,
+    k.headline_capped_at_spend
+      ? spend != null ? `capped at actual 30-day compute spend (${usd(spend)})` : "capped at actual 30-day compute spend"
+      : null,
+    legacyCards > 0 ? `${legacyCards} legacy estimate${legacyCards > 1 ? "s" : ""}` : null,
+  ].filter(Boolean).join(" · ");
   const items = [
     {
       title: "Net monthly savings",
       icon: Wallet,
       value: k.monthly_savings,
       fmt: (n: number) => usd(n),
-      foot: `${usd(k.annual_savings)} / year annualized`,
-      pill: "identified",
-      tone: "emerald",
+      foot: savingsFoot,
+      pill: demoCards > 0 ? `${demoCards} demo floor${demoCards > 1 ? "s" : ""}` : "billing-aware",
+      tone: demoCards > 0 ? "amber" : "emerald",
       onClick: undefined as undefined | (() => void),
+      tip: "Each card is priced the way its jobs are billed: on-demand jobs by bytes x $/TiB, reservation jobs by slot-hours x the edition rate. Cards that claim the same spend (same table, query or billing project) are compounded instead of added; Editions and byte-cap cards only count against what the table and query fixes leave; and the total can never exceed the last 30 days' actual compute spend.",
     },
     {
       title: "Review queue",
       icon: ListChecks,
-      value: k.pending_count,
+      value: k.engineering_pending_count ?? k.pending_count,
       fmt: (n: number) => Math.round(n).toString(),
-      foot: `${Object.values(k.class_counts || {}).filter(Boolean).length} optimization classes`,
+      foot: k.finops_pending_count
+        ? `+ ${k.finops_pending_count} in FinOps & billing (${usd(k.finops_monthly_savings)}/mo)`
+        : `${Object.values(k.class_counts || {}).filter(Boolean).length} optimization classes`,
       pill: "open",
       tone: "sky",
       onClick: () => onTab("queue"),
@@ -65,7 +80,8 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
       tone: k.regressed_count ? "rose" : k.rolled_back_count ? "amber" : "emerald",
       onClick: () => onTab(k.regressed_count ? "regressed" : "rolled_back"),
     },
-  ];
+  ] as { title: string; icon: typeof Wallet; value: number; fmt: (n: number) => string; foot: string;
+         pill: string; tone: string; onClick: undefined | (() => void); tip?: string }[];
   const tones: Record<string, string> = {
     emerald: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
     sky: "bg-sky-500/10 text-sky-300 ring-sky-500/20",
@@ -81,6 +97,7 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
           type="button"
           onClick={it.onClick}
           disabled={!it.onClick}
+          title={it.tip}
           initial={{ opacity: 0, y: 12 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: i * 0.06 }}

@@ -18,7 +18,7 @@ This guide walks you step-by-step through running the **BigQuery Optimization Co
 11. [Step 7: Safe Execution with Guardrails (`execute`)](#step-7-safe-execution-with-guardrails-execute)
 12. [Step 8: Verify Realized Savings & CFO Receipt (`verify`)](#step-8-verify-realized-savings--cfo-receipt-verify)
 13. [Step 9: Safety Net & 1-Click Rollback (`rollback`)](#step-9-safety-net--1-click-rollback-rollback)
-14. [💡 Troubleshooting & FAQs](#14--troubleshooting--faqs)
+14. [💡 Troubleshooting & FAQs](#10--troubleshooting--faqs)
 
 ---
 
@@ -51,7 +51,7 @@ Running this on your production dataset is safe:
 1. **🔒 Zero Payload Data Access**: The tool **never queries your table data rows**. It reads exclusively from BigQuery `INFORMATION_SCHEMA` (query metadata, table byte sizes, and column definitions).
 2. **✋ Human-in-the-Loop Gate**: The tool **never applies changes automatically**. Every recommendation appears in a review queue with its full proposed BigQuery DDL. A human engineer must explicitly approve it.
 3. **⚡ Zero Downtime (Class 1 DDL)**: Table clustering changes are applied in-place using BigQuery's native `ALTER TABLE ... SET OPTIONS (clustering_fields = [...])`. Tables remain 100% available for reads and writes throughout.
-4. **💰 Honest Scoring**: We apply the **Subquery-Summation Cap**. A recommendation cannot claim more monthly savings than the total dollar amount actually spent on that table.
+4. **💰 Honest Scoring**: Every card is priced the way its jobs are billed — on-demand jobs at bytes × $/TiB, reservation (Editions) jobs at slot-hours × the edition rate — and shows its formula. A recommendation cannot claim more than the money actually spent on that table, and the dashboard headline cannot exceed your last 30 days' actual compute spend (overlapping cards are compounded, never added).
 5. **⏪ 1-Click Rollback**: Any applied optimization can be rolled back instantly with a single command.
 
 ---
@@ -149,7 +149,36 @@ jobs_view: "JOBS_BY_ORGANIZATION"   # or "JOBS_BY_PROJECT"
 
 # Employee Hierarchy Table:
 employee_hierarchy_table: "optimizer_ops.employee_hierarchy"
+
+# Reservation admin project: reservation jobs are priced at their reservation's
+# edition slot rate, read from here (Enterprise list price if left null).
+reservation_admin_project: "your-reservation-admin-project"
+
+# Service account -> accountable human owner (PowerBI, ETL ...). Map YOUR column names:
+service_account_owner_table: "gov-project.iam.sa_owner_map"
+service_account_owner_columns:
+  service_account: sa_email        # required
+  owner: owner_email               # required
+  owner_team: team                 # optional
+  director_email: director_email   # optional (else taken from the owner's hierarchy row)
+  director_name: director_name     # optional
+  application: app_name            # optional
+
+# Savings math
+demo_mode: false                   # never true for a real customer
+pricing:
+  reservation_savings_realization: 1.0   # lower (e.g. 0.3) if most slots are committed baseline
+
+# FinOps / governance: who may see and approve billing, commitment,
+# reservation and project-level cards (everyone else gets HTTP 403)
+governance:
+  finops_approvers: ["finops-lead@yourco.com", "data-platform-director@yourco.com"]
+  trust_client_identity: false     # keep false outside demos
+  iap_audience: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
 ```
+
+> [!IMPORTANT]
+> `finops_approvers` empty means **nobody** can approve FinOps cards (fail closed). You can add approvers without editing the file via the env var `BQOPT_FINOPS_APPROVERS` (comma-separated). The review app only trusts the email inside a **verified IAP JWT**; put the app behind IAP and set `iap_audience`.
 
 > [!NOTE]
 > **Understanding BigQuery's Telemetry Scopes**:
@@ -171,13 +200,17 @@ Run this once per project:
   * `jobs_events`: Stores normalized query execution history (project or org-wide).
   * `table_state_daily`: Snapshots table sizes, partition counts, and formats.
   * `employee_hierarchy`: Enterprise mapping of users to Directors and Departments.
+  * `service_account_owners`: Service account → accountable human owner (used when `service_account_owner_table` is not set).
   * `change_sets`: The audit state machine tracking all recommendations.
+  * `v_jobs_costed`: Every job priced the way it was billed (`billing_mode`, `est_cost_usd`).
   * `v_pending_review`: View feeding the Review Web UI.
-  * `v_spend_by_director`: Executive spend rollup by Director and Project.
+  * `v_spend_by_director`: Executive spend rollup by Director and Project (service-account spend rolls up to its owner's Director).
+  * `v_unmapped_service_accounts`: Service accounts with spend but no owner — the to-do list for the mapping table.
   * `v_director_recommendations`: Recommendations mapped to Directors and impacted teams.
   * `v_receipts`: View showing verified savings receipts.
+* Points the attribution views at your own hierarchy / service-account tables when they are configured (column names mapped from `config.yaml`). `init` stops with a clear error if a required column mapping is missing.
 
-> **Note:** If `optimizer_ops` already exists, running `init` is completely idempotent and safe.
+> **Note:** If `optimizer_ops` already exists, running `init` is completely idempotent and safe. Re-run it after upgrading the tool or changing the attribution tables — `rules` refuses to run on views that predate billing-aware pricing.
 
 ---
 
@@ -214,18 +247,19 @@ Analyze your dataset against 10+ cost-optimization patterns:
 ### Output Example:
 ```
 [*] Filtered rules to target dataset: YOUR_DATASET_NAME
-expired=0 findings=3 inserted=3 suppressed=0
+expired=0 findings=3 inserted=3 suppressed=0 refreshed=2 retired=1
 ```
 
 ### What happens under the hood:
 * **Evaluates Rules**:
   * `C1-01`: Detects unclustered tables that are frequently filtered in `WHERE` clauses.
-  * `C1-02`: Compares Physical vs. Logical storage pricing to see if switching saves money.
-  * `C1-03`: Checks for missing partition expiration policies on time-series tables.
+  * `C1-02`: Enforces `require_partition_filter` where every observed query already filters.
+  * `C1-03`: Sets default expirations on staging/scratch datasets.
   * `C4-01`: Flags queries scanning unnecessary columns (`SELECT *`).
   * `C4-03`: Flags non-sargable functions preventing partition pruning.
-* **Calculates Honest Savings**: Capped by the actual 30-day dollar spend on each table.
-* **Inserts Change Sets**: Recommendations are created in state `PENDING_REVIEW`.
+* **Calculates Honest, Billing-Aware Savings**: on-demand spend at bytes × $/TiB, reservation spend at slot-hours × edition rate (scaled by `pricing.reservation_savings_realization`), split across the tables a job reads, and capped by the actual spend. Each card records its formula under `evidence.savings_math`.
+* **Keeps the queue current**: unapproved cards that are detected again are re-priced in place (`refreshed`); unapproved cards priced the old way that no longer hold up are retired as `SUPERSEDED` (`retired`).
+* **Inserts Change Sets**: New recommendations are created in state `PENDING_REVIEW`.
 
 ---
 
@@ -263,6 +297,17 @@ If an optimization is halted by pre-execution safety checks (e.g. streaming buff
 
 Click **"Approve 👍"** on pending cards you want to queue for safe execution, or **"Reject 👎"** to dismiss them.
 
+#### 💳 FinOps & Billing Tab (privileged viewers only)
+Billing, commitment, reservation and project-level cards (`W-01` Editions sizing, `W-02` human cost guardrail, `C1-05` storage billing model, reservation tuning) live in a separate **FinOps & billing** tab:
+* Only identities in `governance.finops_approvers` (or `BQOPT_FINOPS_APPROVERS`) receive these cards, the W-01 billing panel and the org-wide spend figure. Everyone else sees the engineering queue only, with KPIs computed on what they can see.
+* The check runs on the server: approving, rejecting or resetting a FinOps card as anyone else returns **HTTP 403** with `"code": "FINOPS_PERMISSION_REQUIRED"`.
+* `execute` re-checks the approvals and sends a card back to `PENDING_REVIEW` if a non-FinOps approval slipped in.
+
+#### 💰 Reading the Savings Headline
+* **Net monthly savings** never double counts: cards on the same table, query or dataset compound (50% + 50% = 75%), a single-table query rewrite joins its table's cards, Editions/byte-cap cards only count against what the table and query fixes leave, and the total is capped at the last 30 days' actual compute spend. The plain sum of the cards is shown next to it.
+* Open any card's **"How this saving is calculated"** panel to see its inputs, billing mix (on-demand vs reservation) and formula.
+* A **legacy estimate** badge marks a card priced before billing-aware math; the next `rules` run re-prices or retires it.
+
 ### Option B: Review & Approve via BigQuery SQL
 You can also inspect the pending queue directly in BigQuery Studio:
 ```sql
@@ -290,37 +335,51 @@ WHERE change_set_id = 'YOUR_CHANGE_SET_ID';
 
 ## Step 6: Executive & Director Spend Attribution (`v_spend_by_director`)
 
-The control plane joins query execution telemetry with your organizational hierarchy (`optimizer_ops.employee_hierarchy`), allowing FinOps and Engineering leadership to inspect spend and recommendations by business domain.
+The control plane joins query execution telemetry with your organizational hierarchy (`optimizer_ops.employee_hierarchy` or your own table) and your service-account → owner table, so FinOps and Engineering leadership can inspect spend and recommendations by business domain. Service-account spend (PowerBI, ETL ...) rolls up **service account → owner → owner's Director**.
 
 ### 1. View BigQuery Spend Rolled Up by Director & Project:
 ```sql
-SELECT 
+SELECT
   director_name,
   department,
   project_id,
-  query_count,
-  distinct_users,
-  total_tb_scanned,
-  total_query_spend_usd,
-  total_slot_hours
+  total_queries,
+  active_users,
+  total_billed_tb,
+  estimated_spend_usd,        -- billing-aware (on-demand bytes + reservation slot-hours)
+  on_demand_spend_usd,
+  reservation_spend_usd,
+  total_slot_hours,
+  attribution_sources         -- e.g. EMPLOYEE_HIERARCHY+SERVICE_ACCOUNT_OWNER
 FROM `your-project.optimizer_ops.v_spend_by_director`
-ORDER BY total_query_spend_usd DESC;
+ORDER BY estimated_spend_usd DESC;
 ```
 
 ### 2. View Active Recommendations Mapped to Directors & Teams:
 ```sql
-SELECT 
+SELECT
   director_name,
   department,
   target_table,
   rule_ids,
-  net_monthly_value_usd,
-  confidence,
-  impacted_users,
-  queries_impacted
+  gross_monthly_savings_usd,
+  team_readers_count,
+  team_queries_count,
+  attribution_source
 FROM `your-project.optimizer_ops.v_director_recommendations`
-ORDER BY net_monthly_value_usd DESC;
+ORDER BY gross_monthly_savings_usd DESC;
 ```
+
+### 3. Find Service Accounts That Still Need an Owner:
+```sql
+SELECT service_account_email, mapping_status, queries_90d, est_spend_usd_90d, projects, last_seen_at
+FROM `your-project.optimizer_ops.v_unmapped_service_accounts`
+ORDER BY est_spend_usd_90d DESC;
+```
+Add the top rows to your mapping table (or `optimizer_ops.service_account_owners`); the next dashboard load picks them up. Cards for queries run by an unmapped service account carry the risk note `QUERY_RUN_BY_UNMAPPED_SERVICE_ACCOUNT`.
+
+> [!NOTE]
+> When `service_account_owner_table` / `employee_hierarchy_table` point at tables in another project, grant the review app's and collector's service accounts **BigQuery Data Viewer** on them, then re-run `init`.
 
 ---
 
@@ -424,3 +483,24 @@ This pulls query logs from `region-{location}.INFORMATION_SCHEMA.JOBS_BY_ORGANIZ
 - **👤 Human Ad-Hoc Users**: Assigned a **50 GiB per-query safety cap (`SET @@maximum_bytes_billed = 53687091200`, max ~$0.31/query)** and an isolated **50-slot autoscaling sandbox (`human-adhoc-sandbox-pool`)** so an accidental `SELECT *` without a `WHERE` clause fails fast in 0ms before billing.
 - **🤖 Service Accounts & Production ETL (`*.gserviceaccount.com`)**: Explicitly marked **100% EXEMPT** from query byte caps so nightly multi-terabyte ETL jobs never fail.
 
+
+### Q: Why is the savings headline lower than the sum of the cards?
+**A:** Because several cards often chase the same dollars. The headline:
+1. compounds cards on the same table, query or dataset (two 50% cuts on one table save 75%, not 100%);
+2. lets a rewrite of a single-table query join that table's cards;
+3. counts Editions sizing (`W-01`) and the human byte cap (`W-02`) only against the spend the table and query fixes leave behind;
+4. caps compute savings at the last 30 days' actual compute spend (`v_jobs_costed`).
+
+When step 4 kicks in, the KPI tile says **"capped at actual 30-day compute spend ($X)"**. The plain sum of the cards stays visible for comparison.
+
+### Q: Why did a card's price change, or why did it become `SUPERSEDED`, after `rules`?
+**A:** Each `rules` run re-prices every card that is still waiting for its first approval, using that day's telemetry and billing-aware math (`refreshed=` in the output). Unapproved cards priced by the older, non-billing-aware math are re-priced from the query's current cost, or retired as `SUPERSEDED` when the finding no longer shows up or can't be re-priced (`retired=`). Retired findings come back with billing-aware numbers if they still apply. Cards that already have an approval are never re-priced; the card history records why each one changed.
+
+### Q: Why do I get HTTP 403 `FINOPS_PERMISSION_REQUIRED`?
+**A:** The card is a billing, commitment, reservation or project-level card, and your identity is not in `governance.finops_approvers` (or `BQOPT_FINOPS_APPROVERS`). Ask a FinOps approver to act on it, or have one added to the list. Only verified identities count: put the review app behind IAP and set `governance.iap_audience`. If the list is empty, nobody can approve FinOps cards (fail closed). `trust_client_identity: true` is for the sandbox persona picker only.
+
+### Q: What does `SLOT_TELEMETRY_IMPLAUSIBLE_FOR_BYTES_SCANNED` mean on the `W-01` card?
+**A:** The project's job history shows far more bytes scanned than its recorded slot usage could process (under 0.5 slot-hours per TiB). This usually means synthetic or imported jobs, or gaps in `JOBS_TIMELINE`. The card stays in the queue with low confidence (0.4) and a warning in its formula. Check the slot telemetry before acting on it.
+
+### Q: Why did the `W-01` (Editions) card disappear?
+**A:** `W-01` prices Editions autoscaling the way BigQuery bills it: 50-slot steps with a 1-minute minimum. Spiky workloads can be billed many times their measured slot-hours. When neither Editions option beats your current bill, the rule creates no card instead of claiming a saving.

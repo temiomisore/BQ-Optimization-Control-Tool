@@ -87,13 +87,21 @@ def recent_structural_change(c: Config, target: tuple, days: int) -> bool:
 
 def refresh_pending(c: Config, change_set_id: str, f: Finding, actor: str = "rules-engine") -> None:
     """Refresh evidence/sizing/savings of a PENDING_REVIEW card that nobody has approved yet,
-    so reviewers always see the latest telemetry instead of a stale duplicate-suppressed card."""
+    so reviewers always see the latest telemetry instead of a stale duplicate-suppressed card.
+    Score, confidence, risk notes and owner are refreshed too (owner may now resolve through
+    the service-account owner table)."""
     bq.execute(c, f"""
         UPDATE {_t(c)} SET
           finding_summary = @summary, evidence_json = @evidence, proposed_change_json = @proposed,
           gross_monthly_savings_usd = CAST(@gross AS NUMERIC),
+          recurring_monthly_cost_usd = CAST(@recur AS NUMERIC),
+          one_time_apply_cost_usd = CAST(@once AS NUMERIC),
           net_monthly_value_usd = CAST(@net AS NUMERIC),
           savings_basis = @basis,
+          confidence = CAST(@conf AS NUMERIC), confidence_factors_json = @factors,
+          score = CAST(@score AS NUMERIC), risk_notes = @risks,
+          owner_principal = COALESCE(@owner, owner_principal),
+          owner_source = COALESCE(@owner_src, owner_source),
           state_history = ARRAY_CONCAT(state_history,
               [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @actor AS actor,
                       'Evidence refreshed from latest telemetry' AS note)])
@@ -103,8 +111,68 @@ def refresh_pending(c: Config, change_set_id: str, f: Finding, actor: str = "rul
          "evidence": bq.dumps(f.get("evidence") or {}),
          "proposed": bq.dumps(f.get("proposed_change") or {}),
          "gross": float(f.get("gross_monthly_savings_usd") or 0),
+         "recur": float(f.get("recurring_monthly_cost_usd") or 0),
+         "once": float(f.get("one_time_apply_cost_usd") or 0),
          "net": float(f.get("net_monthly_value_usd") or 0),
-         "basis": f.get("savings_basis"), "actor": actor})
+         "basis": f.get("savings_basis"),
+         "conf": float(f.get("confidence") or 0),
+         "factors": bq.dumps(f.get("confidence_factors") or {}),
+         "score": float(f.get("score") or 0),
+         "risks": [str(x) for x in (f.get("risk_notes") or [])],
+         "owner": f.get("owner_principal"), "owner_src": f.get("owner_source"),
+         "actor": actor})
+
+
+def unapproved_legacy_pending(c: Config) -> list[dict]:
+    """PENDING_REVIEW cards nobody has approved that were priced before billing-aware
+    savings (their evidence has no savings_math block)."""
+    return bq.query(c, f"""
+        SELECT change_set_id, rule_ids, source, apply_class,
+               target_project, target_dataset, target_table,
+               gross_monthly_savings_usd, recurring_monthly_cost_usd, one_time_apply_cost_usd,
+               confidence, evidence_json
+        FROM {_t(c)}
+        WHERE state = 'PENDING_REVIEW'
+          AND ARRAY_LENGTH(IFNULL(approvals, [])) = 0
+          AND JSON_QUERY(evidence_json, '$.savings_math') IS NULL""")
+
+
+def reprice_pending(c: Config, change_set_id: str, *, evidence: dict, gross: float, net: float,
+                    score: float, basis: str | None, note: str,
+                    actor: str = "rules-engine") -> None:
+    """Re-price an unapproved PENDING_REVIEW card in place (evidence and money only).
+    Used for legacy query cards from engines whose output varies run to run, so their
+    number is corrected even when this run did not happen to re-detect them."""
+    bq.execute(c, f"""
+        UPDATE {_t(c)} SET
+          evidence_json = @evidence,
+          gross_monthly_savings_usd = CAST(@gross AS NUMERIC),
+          net_monthly_value_usd = CAST(@net AS NUMERIC),
+          score = CAST(@score AS NUMERIC),
+          savings_basis = COALESCE(@basis, savings_basis),
+          state_history = ARRAY_CONCAT(state_history,
+              [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @actor AS actor,
+                      @note AS note)])
+        WHERE change_set_id = @id AND state = 'PENDING_REVIEW'
+          AND ARRAY_LENGTH(IFNULL(approvals, [])) = 0""",
+        {"id": change_set_id, "evidence": bq.dumps(evidence or {}), "gross": float(gross),
+         "net": float(net), "score": float(score), "basis": basis, "note": note,
+         "actor": actor})
+
+
+def send_back_for_reapproval(c: Config, change_set_id: str, actor: str, note: str) -> None:
+    """Return an APPROVED card to the review queue with its approvals cleared, keeping the
+    full history. Used when the executor refuses a FinOps card that wasn't approved by a
+    FinOps approver: recoverable (a FinOps approver re-approves), unlike FAILED."""
+    bq.execute(c, f"""
+        UPDATE {_t(c)} SET
+          state = 'PENDING_REVIEW',
+          approvals = [],
+          state_history = ARRAY_CONCAT(state_history,
+              [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @actor AS actor,
+                      @note AS note)])
+        WHERE change_set_id = @id AND state IN ('APPROVED', 'SCHEDULED')""",
+        {"id": change_set_id, "actor": actor, "note": note})
 
 
 def insert(c: Config, sets: Iterable[Finding], actor: str = "rules-engine") -> int:

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Moon, Sparkles, Sun, UserRound, BarChart3, ExternalLink } from "lucide-react";
+import { Moon, Sparkles, Sun, UserRound, BarChart3, ExternalLink, Landmark } from "lucide-react";
 import type { Dashboard } from "@/lib/api";
 import { useReviewer } from "@/lib/store";
 import { Button } from "./ui";
@@ -20,6 +20,22 @@ export function Header({
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
   const [custom, setCustom] = useState(false);
   const personas = data?.personas || [];
+  const viewer = data?.viewer;
+  // "" = the server's own identity; show who the server actually resolved.
+  const current = email || viewer?.email || data?.reviewer_email || "";
+  // Outside the sandbox demo the identity comes from IAP / server config and can't be switched.
+  const canSwitch = viewer ? viewer.can_switch_persona : true;
+  const sourceLabel: Record<string, string> = {
+    IAP: "verified by Identity-Aware Proxy",
+    CLIENT_SELECTED: "demo persona (trust_client_identity is on)",
+    SERVER_CONFIG: "server REVIEWER_EMAIL",
+    LOCAL_GCLOUD: "local gcloud account",
+    PLACEHOLDER: "placeholder: no verified identity",
+  };
+  const identityTitle = viewer
+    ? `Identity: ${sourceLabel[viewer.identity_source] || viewer.identity_source}` +
+      (viewer.is_finops ? " · FinOps approver" : " · not a FinOps approver")
+    : "Reviewer identity recorded on approvals";
 
   const toggleTheme = () => {
     const next = !dark;
@@ -49,7 +65,9 @@ export function Header({
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-2 py-1 dark:border-ink-800 dark:bg-ink-900">
             <UserRound className="h-4 w-4 text-zinc-400" />
-            {custom ? (
+            {!canSwitch ? (
+              <span className="max-w-[260px] truncate text-xs" title={identityTitle}>{current}</span>
+            ) : custom ? (
               <input
                 autoFocus
                 className="w-56 bg-transparent text-xs outline-none"
@@ -64,22 +82,30 @@ export function Header({
             ) : (
               <select
                 className="max-w-[260px] cursor-pointer bg-transparent text-xs outline-none"
-                value={personas.some((p) => p.email === email) ? email : "__current__"}
+                value={personas.some((p) => p.email === current) ? current : "__current__"}
                 onChange={(e) => {
                   if (e.target.value === "__custom__") return setCustom(true);
                   const p = personas.find((x) => x.email === e.target.value);
                   if (p) setReviewer(p.email, p.role);
                 }}
-                title="Reviewer identity recorded on approvals"
+                title={identityTitle}
               >
-                {!personas.some((p) => p.email === email) && <option value="__current__">{email}</option>}
+                {!personas.some((p) => p.email === current) && <option value="__current__">{current}</option>}
                 {personas.map((p) => (
                   <option key={p.email} value={p.email}>
-                    {p.email} — {p.label}
+                    {p.email} — {p.label}{p.is_finops ? " · FinOps" : ""}
                   </option>
                 ))}
                 <option value="__custom__">Custom reviewer…</option>
               </select>
+            )}
+            {viewer?.is_finops && (
+              <span
+                className="inline-flex items-center gap-1 rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-500/30"
+                title="Can see and approve billing, commitment, reservation and project-level changes"
+              >
+                <Landmark className="h-3 w-3" />FinOps
+              </span>
             )}
           </div>
 

@@ -27,6 +27,9 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 | `sql/04_change_sets.sql` | Recommendation store, rule accuracy, watchdogs, queue views |
 | `optimizer/rules.py` | 14 infra & billing rules (including `W-01` Option 1 vs Option 2 Reservation Sizing, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, and **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** |
 | `optimizer/scoring.py` | Net value × confidence ÷ risk; **subquery-summation cap** |
+| `optimizer/pricing.py` | **Billing-aware money**: on-demand jobs at bytes × $/TiB, reservation jobs at slot-hours × edition rate; compounding of overlapping cards; headline capped at actual spend |
+| `optimizer/governance.py` | **FinOps split**: which cards are billing / commitment / reservation / project-level, who may see and approve them (server-side 403 + executor re-check), verified IAP identity |
+| `optimizer/attribution.py` | Points the attribution views at your employee-hierarchy and **service-account → owner** tables (column names configurable) |
 | `optimizer/compiler.py` | Dedupe, partition+cluster merge, rebuild-supersedes conflicts |
 | `optimizer/store.py` | DML-based state machine with append-only history |
 | `optimizer/executor/` | Router + guardrails, Class 1/2/3 applies (including `W-01` & `W-02` governance execution), **Class 3 copy-swap-rebind machine**, Recommender write-back |
@@ -43,7 +46,7 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 | `notebooks/BigQuery_Optimization_Notebook_2.ipynb` | Interactive Jupyter Notebook for Customer Demo 2 in BigQuery Studio |
 | `scripts/demo_git_pr.py` | Renders the Class-4 CI pull-request (simulated PR output for demos) |
 | `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, bundled OpenJDK + ZetaSQL `.jar`, multi-worker Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
-| `tests/` | Pure-logic unit tests (23 unit tests, no GCP needed) |
+| `tests/` | Pure-logic unit tests (no GCP needed): `python -m unittest discover -s tests` |
 
 ## Quickstart
 
@@ -57,6 +60,42 @@ FLASK_APP=review_app.main flask run  # review + approve locally
 python -m optimizer.cli execute      # applies APPROVED (class 1 only by default)
 python -m optimizer.cli verify       # after the window: receipts + regressions
 ```
+
+> After upgrading, run `init` once before `rules`: the rules need the billing-aware
+> views (`rules` stops with a clear message if they are missing).
+
+## Savings math, FinOps view and ownership (Sept 29, 2026 review)
+
+**1. Savings match how you are billed.**
+- On-demand jobs are priced at bytes × $/TiB; reservation (Editions) jobs at slot-hours ×
+  their reservation's edition rate (read from `reservation_admin_project`; Enterprise list
+  price if unknown). Slot-time savings are scaled by `pricing.reservation_savings_realization`
+  (1.0 = autoscale slots you stop paying for; lower it when most capacity is committed).
+- A job that reads N tables is split across them, never counted N times.
+- The headline does not double count: cards on the same table / query / dataset compound
+  (50% + 50% = 75%), a single-table query rewrite joins its table's cards, Editions and
+  byte-cap cards only count against what the table and query fixes leave, and the total is
+  **capped at the last 30 days' actual compute spend**.
+- W-01 prices autoscaling the way it is billed (50-slot steps, every busy minute, from
+  `JOBS_TIMELINE`) and flags slot telemetry that can't cover the bytes scanned.
+- Every card shows its formula ("How this saving is calculated"). Synthetic demo minimums
+  exist only with `demo_mode: true` (sandbox only) and are labelled on the card.
+- Unapproved cards priced the old way are re-priced from current telemetry or retired
+  (`SUPERSEDED`) by the next `rules` run.
+
+**2. Billing controls live in a separate FinOps view.** W-01/W-02, storage billing model,
+reservations/commitments and project-level cards are shown and approvable only for
+`governance.finops_approvers` (plus env `BQOPT_FINOPS_APPROVERS`). Others get HTTP 403
+(`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the W-01 panel, or the spend
+figure. `execute` re-checks the approvers and sends a card back to review if needed.
+Identity comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker is
+honored only with `trust_client_identity: true` (demo only).
+
+**3. Service-account spend rolls up to a human owner.** Set `service_account_owner_table`
+and `service_account_owner_columns` (your column names), then run `init`. PowerBI / ETL
+service-account spend then rolls up SA → owner → Director in `v_spend_by_director` and on
+the cards; `v_unmapped_service_accounts` lists what still needs an owner. The review app's
+service account needs read access to that table.
 
 ## Honest status matrix
 
@@ -94,9 +133,11 @@ python -m optimizer.cli verify       # after the window: receipts + regressions
 
 Split identities: `bqopt-collector` (read-only) vs `bqopt-executor` (jobUser +
 **per-dataset** dataOwner where needed for IAM rebind). The review app has no
-auth of its own — put IAP in front; it reads the IAP identity header for the
-approvals audit trail. Schedules in `terraform/main.tf` place `execute` inside
-the change window on purpose.
+auth of its own — put IAP in front and set `governance.iap_audience` (or env
+`IAP_AUDIENCE`): it verifies the signed IAP JWT and uses that email for the FinOps
+permission check and the approvals audit trail (a bare identity header is never
+trusted). Schedules in `terraform/main.tf` place `execute` inside the change window
+on purpose.
 
 ## Review UI (React) 
 
@@ -113,7 +154,9 @@ the change window on purpose.
 ## Verify-before-trust checklist (first week)
 
 - Run `rules` and eyeball `v_pending_review` — do the dollar figures pass the
-  sniff test against last month's invoice?
+  sniff test against last month's invoice? The headline should never exceed the
+  bill; open a card's "How this saving is calculated" to check its inputs.
+- Check `v_unmapped_service_accounts` and add owners for the big spenders.
 - Approve one **C1-01 clustering** card on a mid-size table; watch it through the
   full APPLYING → APPLIED → VERIFYING → VERIFIED path.
 - Confirm the Active Assist console shows the recommendation as claimed and,

@@ -246,6 +246,7 @@ USING (
   SELECT 'slot_hour_usd_standard',              NUMERIC '0.04' UNION ALL   -- verify: edition + region
   SELECT 'slot_hour_usd_enterprise',            NUMERIC '0.06' UNION ALL   -- verify
   SELECT 'slot_hour_usd_enterprise_plus',       NUMERIC '0.10' UNION ALL   -- verify
+  SELECT 'slot_hour_usd_enterprise_1yr',        NUMERIC '0.048' UNION ALL  -- verify: 1-yr commitment rate (W-01)
   SELECT 'partition_candidate_min_bytes',       NUMERIC '107374182400' UNION ALL  -- 100 GiB
   SELECT 'cluster_candidate_min_bytes',         NUMERIC '10737418240'             -- 10 GiB
 ) S
@@ -289,4 +290,23 @@ WHEN MATCHED THEN UPDATE SET
   updated_at = S.updated_at
 WHEN NOT MATCHED THEN INSERT (user_email, user_name, department, manager_email, director_email, director_name, cost_center, updated_at)
 VALUES (S.user_email, S.user_name, S.department, S.manager_email, S.director_email, S.director_name, S.cost_center, S.updated_at);
+
+-- -----------------------------------------------------------------------------
+-- Service account -> accountable human owner
+-- -----------------------------------------------------------------------------
+-- Service accounts (PowerBI dashboards, ETL) can't approve anything and have no
+-- Director, so their spend is rolled up through the human who owns them.
+-- If you already keep this mapping elsewhere, leave this table empty and set
+-- service_account_owner_table + service_account_owner_columns in config.yaml;
+-- `optimizer.cli init` then reads your table instead (see optimizer/attribution.py).
+CREATE TABLE IF NOT EXISTS optimizer_ops.service_account_owners (
+  service_account_email STRING NOT NULL,
+  owner_email           STRING,      -- accountable human (must exist in the employee hierarchy to reach a Director)
+  owner_team            STRING,
+  director_email        STRING,      -- optional override when the owner isn't in the hierarchy
+  director_name         STRING,
+  application           STRING,      -- e.g. 'PowerBI - Finance dashboards', 'Nightly ETL'
+  notes                 STRING,
+  updated_at            TIMESTAMP
+);
 

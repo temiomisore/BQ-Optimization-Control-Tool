@@ -18,7 +18,32 @@ _DEFAULTS: dict[str, Any] = {
     "jobs_view": "JOBS",
     "reservation_admin_project": None,
     "employee_hierarchy_table": None,
+    # Map the customer's column names when they differ from ours (see optimizer/attribution.py).
+    "employee_hierarchy_columns": {},
+    # Service account -> accountable human owner (PowerBI, ETL ...): rolls SA spend up to a Director.
+    "service_account_owner_table": None,
+    "service_account_owner_columns": {},
     "billing_export_table": None,
+    # SANDBOX ONLY. True lets rules apply labelled synthetic minimum values so a tiny
+    # demo dataset still shows every card type. Never enable for a real customer.
+    "demo_mode": False,
+    "pricing": {
+        # Share of a reservation slot-time reduction that turns into cash (0..1). 1.0 = autoscale
+        # slots you stop paying for; lower it when most capacity is committed baseline.
+        "reservation_savings_realization": 1.0,
+    },
+    "governance": {
+        # Who may see and approve billing / commitment / reservation / project-level cards.
+        # Empty = nobody (fail closed). Env BQOPT_FINOPS_APPROVERS adds comma-separated emails.
+        "finops_approvers": [],
+        "finops_rule_ids": ["W-01", "C1-07", "C1-05", "W-02", "C1-06"],
+        # DEMO ONLY: trust the identity picked in the UI persona picker. Production: false + IAP.
+        "trust_client_identity": False,
+        # IAP signed-header audience; when set, the review app trusts only IAP-verified emails.
+        # Cloud Run + IAP: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
+        # Load balancer:   "/projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID"
+        "iap_audience": None,
+    },
     "executor": {
         "enable_class1": True,
         "enable_class2": False,
@@ -85,6 +110,8 @@ def cfg(path: str | None = None, **overrides: Any) -> Config:
         merged["location"] = os.environ["BQOPT_LOCATION"]
     if os.environ.get("BQOPT_EMPLOYEE_HIERARCHY_TABLE"):
         merged["employee_hierarchy_table"] = os.environ["BQOPT_EMPLOYEE_HIERARCHY_TABLE"]
+    if os.environ.get("BQOPT_SERVICE_ACCOUNT_OWNER_TABLE"):
+        merged["service_account_owner_table"] = os.environ["BQOPT_SERVICE_ACCOUNT_OWNER_TABLE"]
     if os.environ.get("BQOPT_BILLING_EXPORT_TABLE"):
         merged["billing_export_table"] = os.environ["BQOPT_BILLING_EXPORT_TABLE"]
 
@@ -92,7 +119,8 @@ def cfg(path: str | None = None, **overrides: Any) -> Config:
     for k, v in overrides.items():
         if v is not None:
             merged[k] = v
-        elif k in ("target_dataset", "reservation_admin_project", "employee_hierarchy_table", "billing_export_table"):
+        elif k in ("target_dataset", "reservation_admin_project", "employee_hierarchy_table",
+                   "service_account_owner_table", "billing_export_table"):
             merged[k] = None
     env_proj = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
     if env_proj:

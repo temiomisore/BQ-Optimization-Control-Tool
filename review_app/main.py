@@ -25,7 +25,7 @@ except ModuleNotFoundError:
             os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
     raise
 
-from optimizer import bq, store, verifier  # noqa: E402
+from optimizer import bq, governance, pricing, store, verifier  # noqa: E402
 from optimizer.config import cfg  # noqa: E402
 from optimizer.executor import recommender_sync  # noqa: E402
 
@@ -68,6 +68,9 @@ def healthz():
     return {"status": "ok", "service": "bqopt-review-ui"}, 200
 
 
+_PLACEHOLDER_REVIEWER = "finops-lead@company.com"
+
+
 def _default_reviewer() -> str:
     global _CACHED_REVIEWER
     if os.environ.get("REVIEWER_EMAIL"):
@@ -75,7 +78,7 @@ def _default_reviewer() -> str:
     if _CACHED_REVIEWER:
         return _CACHED_REVIEWER
     if os.environ.get("K_SERVICE"):
-        _CACHED_REVIEWER = "finops-lead@company.com"
+        _CACHED_REVIEWER = _PLACEHOLDER_REVIEWER
         return _CACHED_REVIEWER
     try:
         import subprocess
@@ -86,27 +89,76 @@ def _default_reviewer() -> str:
             return email
     except Exception:
         pass
-    _CACHED_REVIEWER = "finops-lead@company.com"
+    _CACHED_REVIEWER = _PLACEHOLDER_REVIEWER
     return _CACHED_REVIEWER
 
 
+def _default_reviewer_source() -> str:
+    """How the server-side default identity was obtained (see optimizer/governance.py)."""
+    if os.environ.get("REVIEWER_EMAIL"):
+        return governance.SOURCE_SERVER
+    if os.environ.get("K_SERVICE"):
+        return governance.SOURCE_PLACEHOLDER
+    return governance.SOURCE_PLACEHOLDER if _default_reviewer() == _PLACEHOLDER_REVIEWER else governance.SOURCE_LOCAL
+
+
+_IAP_CERTS_URL = "https://www.gstatic.com/iap/verify/public_key"
+_IAP_CACHE: dict[str, tuple[str, float]] = {}    # verified JWT -> (email, expiry epoch)
+
+
+def _iap_email(c) -> str | None:
+    """Reviewer email from Identity-Aware Proxy. Trusted only when IAP's signed JWT
+    (X-Goog-IAP-JWT-Assertion) verifies against the configured audience
+    (governance.iap_audience in config.yaml, or env IAP_AUDIENCE). The plain
+    X-Goog-Authenticated-User-Email header is never trusted on its own: anyone who
+    reaches the app without going through IAP could forge it."""
+    token = request.headers.get("X-Goog-IAP-JWT-Assertion", "")
+    aud = os.environ.get("IAP_AUDIENCE") or str((c.get("governance") or {}).get("iap_audience") or "")
+    if not token or not aud:
+        return None
+    now = time.time()
+    hit = _IAP_CACHE.get(token)
+    if hit and hit[1] > now:
+        return hit[0]
+    try:
+        from google.auth.transport import requests as g_requests
+        from google.oauth2 import id_token
+        claims = id_token.verify_token(token, g_requests.Request(), audience=aud,
+                                       certs_url=_IAP_CERTS_URL)
+    except Exception as e:  # noqa: BLE001 — invalid/expired/forged token: not an identity
+        app.logger.warning("IAP JWT rejected: %s", e)
+        return None
+    if claims.get("iss") != "https://cloud.google.com/iap":
+        app.logger.warning("IAP JWT rejected: unexpected issuer %r", claims.get("iss"))
+        return None
+    email = str(claims.get("email") or "").strip()
+    if not email:
+        return None
+    if len(_IAP_CACHE) > 1000:
+        _IAP_CACHE.clear()
+    _IAP_CACHE[token] = (email, float(claims.get("exp") or now + 60))
+    return email
+
+
+def _identity(c, principal: str | None = None) -> dict:
+    """Who is acting, and how we know (strongest first):
+    1. IAP-verified email.
+    2. The principal the browser picked (persona picker / form field / ?principal=):
+       honoured ONLY when governance.trust_client_identity is on (sandbox demo).
+    3. Server default: REVIEWER_EMAIL env, local gcloud account, or a placeholder.
+    FinOps permissions are decided from this, never from what the client claims alone."""
+    iap = _iap_email(c)
+    if iap:
+        return {"email": iap, "source": governance.SOURCE_IAP}
+    claimed = (principal or request.form.get("principal", "") or request.args.get("principal", "")).strip()
+    if claimed and governance.trust_client_identity(c):
+        return {"email": claimed, "source": governance.SOURCE_CLIENT}
+    return {"email": _default_reviewer(), "source": _default_reviewer_source()}
+
+
 def _who(principal: str | None = None) -> str:
-    # 1. IAP sets X-Goog-Authenticated-User-Email: accounts.google.com:user@x
-    hdr = request.headers.get("X-Goog-Authenticated-User-Email", "")
-    if hdr:
-        u = hdr.split(":")[-1].strip()
-        if u:
-            return u
-    # 2. Explicit principal (JSON API) or form submission from UI
-    form_user = (principal or request.form.get("principal", "")).strip()
-    if form_user:
-        return form_user
-    # 3. Explicit query parameter
-    query_user = request.args.get("principal", "").strip()
-    if query_user:
-        return query_user
-    # 4. Environment variable override or default operator email
-    return _default_reviewer()
+    """Email recorded in the audit trail for the current request."""
+    return _identity(cfg(), principal)["email"]
 
 
 def _enrich_repartition(cs: dict) -> None:
@@ -149,26 +201,35 @@ def _fetch_dashboard_data_uncached(c) -> dict:
     """
     dir_sql = f"""
         SELECT change_set_id, director_name, department,
-               team_readers_count, team_queries_count, team_billed_gb
+               team_readers_count, team_queries_count, team_billed_gb, attribution_source
         FROM `{c.ops}.v_director_recommendations`
     """
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f_cs = pool.submit(bq.query, c, all_cs_sql)
-            f_dir = pool.submit(bq.query, c, dir_sql)
-            raw_rows = f_cs.result()
+    # Same query against a warehouse that has not been re-initialised yet (no attribution_source).
+    dir_sql_legacy = dir_sql.replace(", attribution_source", "")
+
+    def _dir_rows() -> list[dict]:
+        try:
+            return bq.query(c, dir_sql)
+        except Exception:
             try:
-                dir_rows = f_dir.result()
+                return bq.query(c, dir_sql_legacy)
             except Exception:
-                dir_rows = []
+                return []
+
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f_cs = pool.submit(bq.query, c, all_cs_sql)
+            f_dir = pool.submit(_dir_rows)
+            f_spend = pool.submit(_compute_spend_30d, c)
+            raw_rows = f_cs.result()
+            dir_rows = f_dir.result()
+            compute_spend = f_spend.result()
     except Exception:
         from optimizer import cli
         cli.cmd_init(c)
         raw_rows = bq.query(c, all_cs_sql)
-        try:
-            dir_rows = bq.query(c, dir_sql)
-        except Exception:
-            dir_rows = []
+        dir_rows = _dir_rows()
+        compute_spend = _compute_spend_30d(c)
 
     now_utc = _dt.datetime.now(_dt.timezone.utc)
 
@@ -280,11 +341,13 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             item["team_readers_count"] = dir_map[cid].get("team_readers_count", 0)
             item["team_queries_count"] = dir_map[cid].get("team_queries_count", 0)
             item["team_billed_gb"] = dir_map[cid].get("team_billed_gb", 0.0)
+            item["attribution_source"] = dir_map[cid].get("attribution_source")
         item.setdefault("director_name", "Central Data Platform")
         item.setdefault("department", "Platform Infrastructure")
         item.setdefault("team_readers_count", 0)
         item.setdefault("team_queries_count", 0)
         item.setdefault("team_billed_gb", 0.0)
+        item.setdefault("attribution_source", None)
 
     # Build top-10 receipts (sorted by applied_at DESC)
     receipt_candidates.sort(
@@ -307,52 +370,13 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "applied_at": r.get("applied_at"),
         })
 
-    reviewer_email = _default_reviewer()
-
-    total_savings = sum(float(x.get("net_monthly_value_usd") or 0.0) for x in cards)
-    total_annual = total_savings * 12
-    pending_count = len(cards)
-    blocked_count = len(blocked_cards)
-    regressed_count = len(regressed_cards)
-    rolled_back_count = len(rolled_back_cards)
-    directors_set = {x.get("director_name") for x in all_items if x.get("director_name")}
-    departments_set = {x.get("department") for x in all_items if x.get("department")}
-    projects_set = {x.get("target_project") for x in all_items if x.get("target_project")}
-    datasets_set = {x.get("target_dataset") for x in all_items if x.get("target_dataset")}
-    directors_list = sorted(list(directors_set))
-    projects_list = sorted(list(projects_set))
-    datasets_list = sorted(list(datasets_set))
-    class_savings = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-    class_counts = {1: 0, 2: 0, 3: 0, 4: 0}
-    for x in cards:
-        cls_idx = int(x.get("apply_class") or 1)
-        if cls_idx in class_savings:
-            class_savings[cls_idx] += float(x.get("net_monthly_value_usd") or 0.0)
-            class_counts[cls_idx] += 1
-    denom = max(total_savings, 1.0)
-    kpis = {
-        "monthly_savings": total_savings,
-        "annual_savings": total_annual,
-        "pending_count": pending_count,
-        "blocked_count": blocked_count,
-        "regressed_count": regressed_count,
-        "rolled_back_count": rolled_back_count,
-        "handoff_count": len(handoff_cards),
-        "directors_count": len(directors_set),
-        "departments_count": len(departments_set),
-        "applied_count": len(receipts),
-        "project_id": c.project_id,
-        "location": getattr(c, "location", "US"),
-        "class_savings": {k: round(v, 2) for k, v in class_savings.items()},
-        "class_pcts": {k: int(round((v / denom) * 100)) for k, v in class_savings.items()},
-        "class_counts": class_counts,
-    }
-
-    # Latest W-01 sizing (any state) for the Project-Wide Billing Fit panel
+    # Latest W-01 sizing for the Project-Wide Billing Fit panel (any state except retired:
+    # a SUPERSEDED card carries a number the current math no longer stands behind).
     w01 = None
-    if w01_candidates:
-        w01_candidates.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
-        latest_w = w01_candidates[0]
+    w01_live = [r for r in w01_candidates if r.get("state") not in ("SUPERSEDED", "EXPIRED")]
+    if w01_live:
+        w01_live.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        latest_w = w01_live[0]
         ev = bq.loads(latest_w.get("evidence_json")) or {}
         pr = bq.loads(latest_w.get("proposed_change_json")) or {}
         od = float(ev.get("on_demand_spend_monthly") or 0.0)
@@ -367,9 +391,11 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "o2_pct": int(round(100 * o2 / od)) if od else 0,
             "baseline": int(pr.get("recommended_baseline_slots") or 0),
             "max": int(pr.get("recommended_autoscale_max_slots") or 0),
+            "recommended_option": ev.get("recommended_option") or pr.get("selected_option"),
+            "billing_aware": isinstance(ev.get("savings_math"), dict),
         }
 
-    return dict(
+    data = dict(
         w01=w01,
         cards=cards,
         blocked_cards=blocked_cards,
@@ -378,12 +404,161 @@ def _fetch_dashboard_data_uncached(c) -> dict:
         handoff_cards=handoff_cards,
         receipts=receipts,
         reasons=REASONS,
-        reviewer_email=reviewer_email,
-        kpis=kpis,
-        directors=directors_list,
-        projects=projects_list,
-        datasets=datasets_list,
+        reviewer_email=_default_reviewer(),
+        # Actual spend the savings come out of; the headline is capped at it.
+        spend_ceilings={pricing.COMPUTE: compute_spend},
     )
+    data.update(_summaries(c, data))
+    return data
+
+
+def _compute_spend_30d(c) -> float | None:
+    """What the warehouse actually spent on queries in the last 30 days (billing-aware:
+    on-demand bytes x $/TiB, reservation slot-hours x edition rate). No set of cards can
+    save more compute than this. None when the views are not upgraded / not readable."""
+    try:
+        rows = bq.query(c, f"""
+            SELECT ROUND(SUM(est_cost_usd), 2) AS compute_usd_30d
+            FROM `{c.ops}.v_jobs_costed`
+            WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)""")
+        v = rows[0].get("compute_usd_30d") if rows else None
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _spend_ceilings(c) -> dict:
+    """Spend ceilings for the headline, from the warm dashboard cache when possible."""
+    with _DASHBOARD_LOCK:
+        entry = _DASHBOARD_CACHE.get(f"{c.project_id}:{c.ops}")
+        if entry and isinstance(entry["data"].get("spend_ceilings"), dict):
+            return dict(entry["data"]["spend_ceilings"])
+    return {pricing.COMPUTE: _compute_spend_30d(c)}
+
+
+_ITEM_LISTS = ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards", "handoff_cards")
+
+
+def _savings_math(item: dict) -> dict | None:
+    sm = (item.get("evidence") or {}).get("savings_math")
+    return sm if isinstance(sm, dict) else None
+
+
+def _summaries(c, data: dict) -> dict:
+    """KPIs and filter facets for whatever cards are in `data` (recomputed per viewer).
+
+    The headline monthly_savings does not double count: cards claiming the same spend
+    (same table, same query family, same billing project) are compounded against that
+    spend instead of being added up, billing-model cards only count against what the
+    table/query fixes leave, and the total is capped at the last 30 days' actual compute
+    spend (optimizer.pricing.deoverlap_total). The plain sum is reported next to it as
+    monthly_savings_gross_sum."""
+    cards = data.get("cards") or []
+    all_items = [x for k in _ITEM_LISTS for x in (data.get(k) or [])]
+    ceilings = data.get("spend_ceilings") or {}
+    headline = pricing.deoverlap_total(cards, ceilings=ceilings)
+    finops = [x for x in cards if governance.is_finops_card(x, c)]
+    engineering = [x for x in cards if not governance.is_finops_card(x, c)]
+    class_savings = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+    class_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    for x in cards:
+        cls_idx = int(x.get("apply_class") or 1)
+        if cls_idx in class_savings:
+            class_savings[cls_idx] += float(x.get("net_monthly_value_usd") or 0.0)
+            class_counts[cls_idx] += 1
+    denom = max(sum(class_savings.values()), 1.0)
+    directors_set = {x.get("director_name") for x in all_items if x.get("director_name")}
+    departments_set = {x.get("department") for x in all_items if x.get("department")}
+    kpis = {
+        "monthly_savings": headline["total"],
+        "annual_savings": headline["total"] * 12,
+        "monthly_savings_gross_sum": headline["naive_total"],
+        "overlap_removed_usd": headline["overlap_removed"],
+        "overlapping_cards": headline["overlapping_cards"],
+        "headline_capped_at_spend": bool(headline["ceiling_applied"]),
+        "compute_spend_30d_usd": headline["compute_ceiling_usd"],
+        "billing_cards_claimed_usd": headline["billing_cards_claimed_usd"],
+        "billing_cards_counted_usd": headline["billing_cards_counted_usd"],
+        "demo_floor_cards": sum(1 for x in cards if (_savings_math(x) or {}).get("demo_floor_applied")),
+        "legacy_estimate_cards": sum(1 for x in cards if _savings_math(x) is None),
+        "finops_pending_count": len(finops),
+        "finops_monthly_savings": pricing.deoverlap_total(finops, ceilings=ceilings)["total"],
+        "engineering_pending_count": len(engineering),
+        "engineering_monthly_savings": pricing.deoverlap_total(engineering, ceilings=ceilings)["total"],
+        "pending_count": len(cards),
+        "blocked_count": len(data.get("blocked_cards") or []),
+        "regressed_count": len(data.get("regressed_cards") or []),
+        "rolled_back_count": len(data.get("rolled_back_cards") or []),
+        "handoff_count": len(data.get("handoff_cards") or []),
+        "directors_count": len(directors_set),
+        "departments_count": len(departments_set),
+        "applied_count": len(data.get("receipts") or []),
+        "project_id": c.project_id,
+        "location": getattr(c, "location", "US"),
+        "class_savings": {k: round(v, 2) for k, v in class_savings.items()},
+        "class_pcts": {k: int(round((v / denom) * 100)) for k, v in class_savings.items()},
+        "class_counts": class_counts,
+    }
+    return dict(
+        kpis=kpis,
+        directors=sorted(directors_set),
+        projects=sorted({x.get("target_project") for x in all_items if x.get("target_project")}),
+        datasets=sorted({x.get("target_dataset") for x in all_items if x.get("target_dataset")}),
+    )
+
+
+def _scope_for_viewer(c, data: dict, ident: dict) -> dict:
+    """Server-side FinOps split. Billing, commitment, reservation and project-level cards
+    (and the W-01 billing panel) are only sent to FinOps / governance viewers; everyone
+    else gets the engineering queue, with KPIs computed on what they can see."""
+    is_finops = governance.is_finops_viewer(ident, c)
+    hidden = 0
+    for key in _ITEM_LISTS + ("receipts",):
+        data[key], n = governance.split_items(data.get(key) or [], is_finops, c)
+        hidden += n
+    if not is_finops:
+        data["w01"] = None
+    data.update(_summaries(c, data))
+    # The org-wide compute bill is billing data: the cap still applies, but only FinOps
+    # viewers see the figure. The raw ceilings never leave the server.
+    data.pop("spend_ceilings", None)
+    if not is_finops:
+        data["kpis"]["compute_spend_30d_usd"] = None
+        data["kpis"]["billing_cards_claimed_usd"] = None
+        data["kpis"]["billing_cards_counted_usd"] = None
+    data["reviewer_email"] = ident["email"]
+    data["viewer"] = {
+        "email": ident["email"],
+        "identity_source": ident["source"],
+        "is_finops": is_finops,
+        "hidden_finops_items": hidden,
+        "can_switch_persona": governance.trust_client_identity(c),
+        "finops_approvers_configured": bool(governance.finops_approvers(c)),
+    }
+    return data
+
+
+def _personas(c, ident: dict) -> list[dict]:
+    """Identities the UI may offer. Outside demo mode (trust_client_identity off) that is
+    only the verified identity: the persona picker is read-only."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(email: str | None, label: str, role: str) -> None:
+        if not email or email.lower() in seen:
+            return
+        seen.add(email.lower())
+        as_viewer = {"email": email, "source": ident["source"] if email == ident["email"] else governance.SOURCE_CLIENT}
+        out.append({"email": email, "label": label, "role": role,
+                    "is_finops": governance.is_finops_viewer(as_viewer, c)})
+
+    add(ident["email"], "Active Identity", "platform_approver")
+    if governance.trust_client_identity(c):
+        add("gcp-admin@company.com", "GCP Project Admin", "platform_approver")
+        add("alice-owner@company.com", "Data Owner / Dataset Lead", "owner_approver")
+        for email in sorted(governance.finops_approvers(c)):
+            add(email, "FinOps / Governance", "platform_approver")
+    return out
 
 
 def _refresh_cache_bg(cache_key: str, c) -> None:
@@ -426,8 +601,10 @@ _DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @app.get("/classic")
 def queue():
+    c = cfg()
     force = request.args.get("refresh") in ("1", "true")
-    return render_template("index.html", **_dashboard_data(cfg(), force_refresh=force))
+    data = _scope_for_viewer(c, _dashboard_data(c, force_refresh=force), _identity(c))
+    return render_template("index.html", **data)
 
 
 @app.get("/")
@@ -471,19 +648,22 @@ _JSON_BLOBS = ("evidence_json", "proposed_change_json", "confidence_factors_json
 @app.get("/api/dashboard")
 def api_dashboard():
     from flask import jsonify
+    c = cfg()
     force = request.args.get("refresh") in ("1", "true")
-    data = _dashboard_data(cfg(), force_refresh=force)
-    for key in ("cards", "blocked_cards", "regressed_cards", "rolled_back_cards", "handoff_cards"):
+    ident = _identity(c, request.args.get("principal"))
+    data = _scope_for_viewer(c, _dashboard_data(c, force_refresh=force), ident)
+    for key in _ITEM_LISTS:
         for cs in data[key]:
             for blob in _JSON_BLOBS:          # already parsed into evidence/proposed/factors
                 cs.pop(blob, None)
-    data["personas"] = [
-        {"email": data["reviewer_email"], "label": "Active Identity / Platform Lead", "role": "platform_approver"},
-        {"email": "alice-owner@company.com", "label": "Data Owner / Dataset Lead", "role": "owner_approver"},
-        {"email": "gcp-admin@company.com", "label": "GCP Project Admin", "role": "platform_approver"},
-    ]
+    data["personas"] = _personas(c, ident)
     data["reason_snooze_days"] = dict(store.REJECTION_SNOOZE_DAYS)
     return jsonify(_jsonable(data))
+
+
+def _permission_denied(e: Exception):
+    from flask import jsonify
+    return jsonify({"ok": False, "error": str(e), "code": "FINOPS_PERMISSION_REQUIRED"}), 403
 
 
 @app.post("/api/decisions")
@@ -493,10 +673,12 @@ def api_decisions():
     if not body.get("change_set_id"):
         return jsonify({"ok": False, "error": "change_set_id is required"}), 400
     c = cfg()
-    who = _who(body.get("principal"))
+    ident = _identity(c, body.get("principal"))
     try:
-        result = _apply_decision(c, body, who)
+        result = _apply_decision(c, body, ident)
         invalidate_dashboard_cache()
+    except governance.PermissionDenied as e:
+        return _permission_denied(e)
     except Exception as e:  # noqa: BLE001 — surfaced to the reviewer, card left retryable
         invalidate_dashboard_cache()
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -546,11 +728,15 @@ def _as_float(v) -> float:
         return 0.0
 
 
-def _copilot_context(c, cards: list[dict]) -> str:
-    """Compact, factual snapshot of the live queue used to ground the model."""
+def _copilot_context(c, cards: list[dict], include_lifecycle: bool = True,
+                     ceilings: dict | None = None) -> str:
+    """Compact, factual snapshot of the live queue used to ground the model.
+    include_lifecycle=False (non-FinOps viewers) skips the all-change-sets counts, which
+    would otherwise include billing / commitment cards they are not allowed to see."""
     from collections import Counter
 
-    total_mo = sum(_as_float(x.get("net_monthly_value_usd")) for x in cards)
+    headline = pricing.deoverlap_total(cards, ceilings=ceilings)
+    total_mo = headline["total"]
     by_class = Counter(str(x.get("apply_class")) for x in cards)
     by_rule = Counter(r for x in cards for r in (x.get("rule_ids") or []))
     by_route = Counter(str(x.get("execution_route")) for x in cards)
@@ -561,19 +747,23 @@ def _copilot_context(c, cards: list[dict]) -> str:
 
     lines = [
         f"PROJECT: {c.project_id}",
-        f"PENDING REVIEW QUEUE: {len(cards)} cards, total net value ${total_mo:,.2f}/mo (${total_mo * 12:,.2f}/yr)",
+        f"PENDING REVIEW QUEUE: {len(cards)} cards, total net value ${total_mo:,.2f}/mo (${total_mo * 12:,.2f}/yr) "
+        f"after removing overlap between cards that claim the same spend"
+        + (" and capping at the last 30 days' actual compute spend" if headline["ceiling_applied"] else "")
+        + f" (plain sum of the cards: ${headline['naive_total']:,.2f}/mo)",
         "CARDS BY APPLY CLASS: " + ", ".join(
             f"Class {k}: {by_class[k]} cards (${value_by_class[k]:,.2f}/mo)" for k in sorted(by_class)),
         "CARDS BY RULE: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_rule.items())),
         "CARDS BY EXECUTION ROUTE: " + ", ".join(f"{k}: {v}" for k, v in sorted(by_route.items())),
     ]
     # Lifecycle counts across ALL change sets (not just the pending queue)
-    try:
-        rows = bq.query(c, f"SELECT apply_class, state, COUNT(*) AS n FROM `{c.ops}.change_sets` GROUP BY 1, 2 ORDER BY 1, 2")
-        lines.append("ALL CHANGE SETS BY CLASS & STATE (every lifecycle state): " + ", ".join(
-            f"Class {r['apply_class']} {r['state']}: {r['n']}" for r in rows))
-    except Exception:
-        pass
+    if include_lifecycle:
+        try:
+            rows = bq.query(c, f"SELECT apply_class, state, COUNT(*) AS n FROM `{c.ops}.change_sets` GROUP BY 1, 2 ORDER BY 1, 2")
+            lines.append("ALL CHANGE SETS BY CLASS & STATE (every lifecycle state): " + ", ".join(
+                f"Class {r['apply_class']} {r['state']}: {r['n']}" for r in rows))
+        except Exception:
+            pass
 
     lines.append("\nPENDING CARDS (sorted by net monthly value, highest first):")
     for x in sorted(cards, key=lambda x: _as_float(x.get("net_monthly_value_usd")), reverse=True):
@@ -587,13 +777,13 @@ def _copilot_context(c, cards: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _copilot_offline_answer(c, cards: list[dict], q: str) -> str:
+def _copilot_offline_answer(c, cards: list[dict], q: str, ceilings: dict | None = None) -> str:
     """Deterministic fallback used only when Gemini is unreachable. Answers from real queue data."""
     import re
     from collections import Counter
 
     ql = q.lower()
-    total_mo = sum(_as_float(x.get("net_monthly_value_usd")) for x in cards)
+    total_mo = pricing.deoverlap_total(cards, ceilings=ceilings)["total"]
     by_class = Counter(str(x.get("apply_class")) for x in cards)
     note = "\n\n_⚠️ Gemini is currently unreachable — this is an offline answer computed from the live queue._"
 
@@ -645,6 +835,11 @@ def finops_chat():
         cards = store.pending(c)
     except Exception:
         cards = []
+    # Same FinOps split as the dashboard: non-FinOps viewers get no billing/commitment cards.
+    is_finops = governance.is_finops_viewer(_identity(c, payload.get("principal")), c)
+    if not is_finops:
+        cards = [x for x in cards if not governance.is_finops_card(x, c)]
+    ceilings = _spend_ceilings(c)
 
     # Optional short conversation history from the UI: [{"role": "user"|"ai", "text": "..."}]
     history = payload.get("history") or []
@@ -661,7 +856,7 @@ def finops_chat():
         "3. If the data does not contain the answer, say so plainly and suggest where to look.\n"
         "4. Use the PRODUCT REFERENCE only when the user asks how something works; do not paste it for unrelated questions.\n"
         "5. Be concise: markdown, at most ~150 words, bullets when listing items.\n\n"
-        "=== LIVE QUEUE DATA ===\n" + _copilot_context(c, cards) + "\n\n"
+        "=== LIVE QUEUE DATA ===\n" + _copilot_context(c, cards, include_lifecycle=is_finops, ceilings=ceilings) + "\n\n"
         "=== PRODUCT REFERENCE ===\n" + "\n\n".join(f"[{k}]\n{v}" for k, v in _COPILOT_REFERENCE.items())
     )
     contents = (f"Conversation so far:\n{history_txt}\n\n" if history_txt else "") + f"User question: {q}"
@@ -683,30 +878,31 @@ def finops_chat():
     except Exception as e:
         app.logger.warning("Gemini FinOps Assist: google-genai unavailable: %s", e)
 
-    return {"answer": _copilot_offline_answer(c, cards, q), "model": "offline-fallback"}, 200
+    return {"answer": _copilot_offline_answer(c, cards, q, ceilings=ceilings), "model": "offline-fallback"}, 200
 
 
 
-def _apply_decision(c, form, who: str) -> dict:
+def _apply_decision(c, form, ident: dict) -> dict:
     """Single implementation of every reviewer action (classic form and JSON API).
-    `form` is any mapping with .get(). Raises on failure; rollback failures leave the
-    card in ROLLING_BACK so it can be retried."""
+    `form` is any mapping with .get(); `ident` comes from _identity(). Raises on failure;
+    rollback failures leave the card in ROLLING_BACK so it can be retried. Every action on
+    a billing / commitment / reservation / project-level card requires a FinOps approver
+    (governance.PermissionDenied -> HTTP 403)."""
     cs_id = form.get("change_set_id")
     action = form.get("action", "reject")
+    who = ident["email"]
+
+    cs = store.get(c, cs_id)
+    if not cs:
+        raise ValueError(f"change set {cs_id} not found")
+    governance.check_can_decide(cs, ident, c)
 
     if action == "pr_merged":
         from optimizer.executor import pr_handoff
-        cs = store.get(c, cs_id)
-        if not cs:
-            raise ValueError(f"change set {cs_id} not found")
         pr_handoff.mark_merged(c, cs, who, form.get("pr_url"))
         return {"action": action, "status": "VERIFYING"}
 
     if action == "approve":
-        cs = store.get(c, cs_id)
-        if not cs:
-            raise ValueError(f"change set {cs_id} not found")
-
         cls = int(cs.get("apply_class") or 1)
         existing_approvals = cs.get("approvals") or []
         role = form.get("role")
@@ -765,8 +961,12 @@ def decision():
     """Classic HTML form endpoint (used by /classic)."""
     c = cfg()
     try:
-        _apply_decision(c, request.form, _who())
+        _apply_decision(c, request.form, _identity(c))
         invalidate_dashboard_cache()
+    except governance.PermissionDenied as e:
+        from markupsafe import escape
+        return (f"<h3>FinOps approval required</h3><pre>{escape(str(e))}</pre>"
+                f"<a href='{url_for('queue')}'>Back to review queue</a>"), 403
     except Exception as e:  # noqa: BLE001
         invalidate_dashboard_cache()
         from markupsafe import escape

@@ -33,6 +33,11 @@ def apply_summation_cap(f: Finding, table_spend: dict[tuple, float],
         if gross > ceiling:
             f["gross_monthly_savings_usd"] = ceiling
             f.setdefault("risk_notes", []).append("NATIVE_ESTIMATE_CAPPED_AT_TABLE_SPEND")
+            sm = (f.get("evidence") or {}).get("savings_math")
+            if isinstance(sm, dict):
+                # Keep "How this saving is calculated" truthful about the final number.
+                sm["cap_applied"] = (f"capped at {float(max_scan_reduction):.0%} of the table's "
+                                     f"${spend:,.2f}/mo read spend: ${gross:,.2f} -> ${ceiling:,.2f}/mo")
             return 0.5
     return 1.0
 

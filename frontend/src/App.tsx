@@ -1,9 +1,9 @@
-import { useCallback, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Inbox, RefreshCw } from "lucide-react";
+import { AlertTriangle, Inbox, Landmark, Lock, RefreshCw } from "lucide-react";
 import { fetchDashboard, type ChangeSet, type Dashboard } from "@/lib/api";
-import { ReviewerProvider } from "@/lib/store";
+import { ReviewerProvider, useReviewer } from "@/lib/store";
 import { cn, fullPath, needsTwo } from "@/lib/utils";
 import { Header } from "@/components/Header";
 import { KpiCards, type TabKey } from "@/components/KpiCards";
@@ -62,12 +62,25 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
   const [prCard, setPrCard] = useState<ChangeSet | null>(null);
   const closeAssist = useCallback(() => setAssistOpen(false), []);
 
-  const cards = data?.cards || [];
+  // Billing / commitment / reservation / project-level cards live in their own FinOps tab.
+  // The server already strips them for non-FinOps viewers; this only splits the view.
+  const allCards = data?.cards || [];
+  const isFinops = !!data?.viewer?.is_finops;
+  const finopsCards = useMemo(() => allCards.filter((c) => c.governance_scope === "FINOPS"), [allCards]);
+  const engCards = useMemo(() => allCards.filter((c) => c.governance_scope !== "FINOPS"), [allCards]);
+  const cards = tab === "finops" ? finopsCards : engCards;
   const shown = useMemo(() => applyFilters(cards, f), [cards, f]);
   const selected = shown.find((c) => c.change_set_id === selectedId) || cards.find((c) => c.change_set_id === selectedId) || null;
+  const hiddenFinops = data?.viewer?.hidden_finops_items || 0;
+  useEffect(() => {
+    if (tab === "finops" && data && !isFinops && finopsCards.length === 0) setTab("queue");
+  }, [tab, data, isFinops, finopsCards.length]);
 
   const tabs: { key: TabKey; label: string; count: number; tone?: string }[] = [
-    { key: "queue", label: "Review queue", count: cards.length },
+    { key: "queue", label: "Review queue", count: engCards.length },
+    ...(isFinops || finopsCards.length
+      ? [{ key: "finops" as TabKey, label: "FinOps & billing", count: finopsCards.length, tone: "text-amber-300" }]
+      : []),
     { key: "handoffs", label: "PR hand-offs", count: data?.handoff_cards?.length || 0, tone: "text-violet-400" },
     { key: "blocked", label: "Blocked", count: data?.blocked_cards.length || 0, tone: "text-amber-400" },
     { key: "regressed", label: "Regressed", count: data?.regressed_cards.length || 0, tone: "text-rose-400" },
@@ -137,7 +150,27 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           </div>
         )}
 
-        {data && tab === "queue" && (
+        {data && tab === "finops" && (
+          <div className="panel flex items-start gap-3 border-amber-500/30 p-4 text-sm">
+            <Landmark className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+            <div>
+              <div className="font-medium text-zinc-900 dark:text-zinc-100">FinOps &amp; governance view</div>
+              <div className="text-xs text-zinc-500">
+                Billing, commitment, reservation and project-level changes. Only FinOps / governance approvers can see or
+                act on these; the server enforces it on every decision and the executor re-checks before applying.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {data && tab === "queue" && !isFinops && hiddenFinops > 0 && (
+          <div className="flex items-center gap-2 text-xs text-zinc-500">
+            <Lock className="h-3.5 w-3.5" />
+            {hiddenFinops} billing / commitment item{hiddenFinops > 1 ? "s are" : " is"} handled by the FinOps team and not shown in this view.
+          </div>
+        )}
+
+        {data && (tab === "queue" || tab === "finops") && (
           <>
             <Toolbar data={data} f={f} setF={setF} shown={shown.length} total={cards.length} />
             <div className="flex items-start gap-6">
@@ -185,17 +218,29 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
   );
 }
 
-export default function App() {
-  const q = useQuery({ queryKey: ["dashboard"], queryFn: fetchDashboard });
+function DashboardRoot() {
+  // The dashboard is scoped per viewer on the server, so it is cached per identity.
+  const { email } = useReviewer();
+  const q = useQuery({
+    queryKey: ["dashboard", email],
+    queryFn: () => fetchDashboard(email),
+    placeholderData: keepPreviousData,
+  });
   return (
-    <ReviewerProvider initial={q.data?.personas?.[0] || null}>
-      <Shell
-        data={q.data}
-        isLoading={q.isLoading}
-        error={q.error as Error | null}
-        refetch={() => q.refetch()}
-        isFetching={q.isFetching}
-      />
+    <Shell
+      data={q.data}
+      isLoading={q.isLoading}
+      error={q.error as Error | null}
+      refetch={() => q.refetch()}
+      isFetching={q.isFetching}
+    />
+  );
+}
+
+export default function App() {
+  return (
+    <ReviewerProvider>
+      <DashboardRoot />
     </ReviewerProvider>
   );
 }

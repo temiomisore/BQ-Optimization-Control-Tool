@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { postDecision, type DecisionRequest, type Persona } from "./api";
+import { ApiError, postDecision, type DecisionRequest, type Persona } from "./api";
 
 interface ReviewerCtx {
   email: string;
@@ -11,11 +11,10 @@ interface ReviewerCtx {
 
 const Ctx = createContext<ReviewerCtx>({ email: "", role: "approver", setReviewer: () => {} });
 
-export function ReviewerProvider({ initial, children }: { initial: Persona | null; children: React.ReactNode }) {
-  const [state, setState] = useState({ email: initial?.email || "", role: initial?.role || "approver" });
-  React.useEffect(() => {
-    if (initial && !state.email) setState({ email: initial.email, role: initial.role });
-  }, [initial]); // eslint-disable-line react-hooks/exhaustive-deps
+/** email "" = the server's own identity (IAP / REVIEWER_EMAIL / default). A picked persona
+ *  is sent as `principal`; the server only honours it in demo mode (trust_client_identity). */
+export function ReviewerProvider({ initial = null, children }: { initial?: Persona | null; children: React.ReactNode }) {
+  const [state, setState] = useState({ email: initial?.email || "", role: initial?.role || "" });
   return (
     <Ctx.Provider value={{ ...state, setReviewer: (email, role) => setState({ email, role }) }}>{children}</Ctx.Provider>
   );
@@ -38,7 +37,7 @@ export function useDecide() {
   const { email, role } = useReviewer();
   return useMutation({
     mutationFn: (req: Omit<DecisionRequest, "principal"> & { principal?: string }) =>
-      postDecision({ role, ...req, principal: req.principal || email }),
+      postDecision({ ...(role ? { role } : {}), ...req, principal: req.principal || email }),
     onMutate: (req) => {
       const id = toast.loading(LABELS[req.action]?.[0] || "Working…");
       return { id };
@@ -49,7 +48,8 @@ export function useDecide() {
       qc.invalidateQueries({ queryKey: ["dashboard"] });
     },
     onError: (err: Error, _req, ctx) => {
-      toast.error(err.message, { id: ctx?.id, duration: 12000 });
+      const finops = err instanceof ApiError && err.code === "FINOPS_PERMISSION_REQUIRED";
+      toast.error(finops ? `FinOps approval required — ${err.message}` : err.message, { id: ctx?.id, duration: 12000 });
       qc.invalidateQueries({ queryKey: ["dashboard"] });
     },
   });

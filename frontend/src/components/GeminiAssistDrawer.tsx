@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Loader2, RotateCcw, Send, Sparkles, Trash2, X } from "lucide-react";
 import { askAssist, type ChatTurn } from "@/lib/api";
+import { useReviewer } from "@/lib/store";
 import { cn } from "@/lib/utils";
 import { ErrorBoundary } from "./ErrorBoundary";
 
@@ -80,6 +81,8 @@ function Bubble({ t }: { t: ChatTurn }) {
 }
 
 export function GeminiAssistDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
+  // The server answers from the same viewer-scoped queue as the dashboard.
+  const { email: reviewerEmail } = useReviewer();
   const [history, setHistory] = useState<ChatTurn[]>([]);
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);
@@ -103,7 +106,7 @@ export function GeminiAssistDrawer({ open, onClose }: { open: boolean; onClose: 
     setQ("");
     setBusy(true);
     try {
-      const r = await askAssist(text, prior);
+      const r = await askAssist(text, prior, reviewerEmail || undefined);
       const answer = typeof r?.answer === "string" && r.answer.trim() ? r.answer : "I couldn't produce an answer — please try rephrasing.";
       setHistory((h) => [...h, { role: "ai", text: answer, model: typeof r?.model === "string" ? r.model : undefined }]);
     } catch (e) {

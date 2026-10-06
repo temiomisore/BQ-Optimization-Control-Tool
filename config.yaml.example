@@ -7,13 +7,57 @@ location: "US"                             # ops dataset location
 # Scope: JOBS (this project) or JOBS_BY_ORGANIZATION (needs org perms)
 jobs_view: "JOBS"
 
-# Reservation admin project (or null to skip capacity telemetry)
+# Reservation admin project (or null to skip capacity telemetry). Set it: reservation
+# jobs are priced at their reservation's edition slot rate, which is read from there.
 reservation_admin_project: null
 
 # Enterprise Enterprise Governance & Billing Placeholders:
 # Set to custom tables, or leave null to use optimizer_ops.employee_hierarchy
 employee_hierarchy_table: null
 billing_export_table: null
+# Map your column names when they differ from ours (unlisted columns keep our name;
+# map a column to null if your table doesn't have it):
+employee_hierarchy_columns: {}
+#   user_email: email
+#   user_name: full_name
+#   department: dept
+#   manager_email: manager
+#   director_email: director_email
+#   director_name: director
+#   cost_center: null
+
+# Service account -> accountable human owner (PowerBI, ETL ...). Service-account spend rolls
+# up to the owner's Director; unmapped service accounts are listed in
+# optimizer_ops.v_unmapped_service_accounts. `python -m optimizer.cli init` points the views
+# at this table; the review app's service account needs read access to it.
+service_account_owner_table: null          # e.g. "gov-project.iam.sa_owner_map"
+service_account_owner_columns: {}
+#   service_account: sa_email                # required
+#   owner: owner_email                       # required
+#   owner_team: team                         # optional
+#   director_email: director_email           # optional (else taken from the owner's hierarchy row)
+#   director_name: director_name             # optional
+#   application: app_name                    # optional (e.g. "PowerBI", "Airflow ETL")
+
+# Savings math: estimates follow how each job is billed (on-demand: bytes x $/TiB;
+# reservations: slot-hours x edition rate). Never enable demo_mode for a real customer.
+demo_mode: false
+pricing:
+  # Share of a reservation slot-time cut that becomes cash. 1.0 = autoscale slots you stop
+  # paying for; lower it (e.g. 0.3) when most capacity is committed baseline that won't shrink.
+  reservation_savings_realization: 1.0
+  w01_min_on_demand_tib_30d: 100           # W-01 only for projects scanning >= this on-demand / 30d
+
+# FinOps / governance: billing, commitment, reservation and project-level cards are visible
+# to and approvable by these approvers only (server-side 403 + executor re-check).
+governance:
+  finops_approvers: []                     # e.g. [shawn.stark@example.com, finops-team@example.com]
+                                           # empty = nobody (fail closed); env BQOPT_FINOPS_APPROVERS adds more
+  trust_client_identity: false             # keep false in production
+  # Put the review app behind IAP and set its audience; only IAP-verified emails are trusted.
+  # Cloud Run + IAP: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
+  # Load balancer:   "/projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID"
+  iap_audience: null
 
 # Executor
 executor:

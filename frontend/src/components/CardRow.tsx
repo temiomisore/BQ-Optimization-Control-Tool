@@ -19,6 +19,9 @@ export function CardRow({
 }) {
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const partial = (c.approvals || []).length > 0;
+  const sm = c.evidence?.savings_math;
+  const demo = !!sm?.demo_floor_applied;
+  const legacy = !sm;
   return (
     <motion.button
       layout
@@ -44,6 +47,16 @@ export function CardRow({
             {needsTwo(c) && (
               <Badge className={partial ? "bg-amber-500/10 text-amber-300 ring-amber-500/30" : ""} title="Two-person approval">
                 <Users className="h-3 w-3" /> {partial ? "1/2 signed" : "2-person"}
+              </Badge>
+            )}
+            {demo && (
+              <Badge className="bg-amber-500/10 text-amber-300 ring-amber-500/30" title="demo_mode: a synthetic minimum replaced the measured saving">
+                DEMO
+              </Badge>
+            )}
+            {legacy && (
+              <Badge className="text-zinc-400" title="Priced by the old (not billing-aware) math; re-priced or retired on the next rules run">
+                legacy estimate
               </Badge>
             )}
           </div>

@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AlertTriangle, CheckCircle2, ChevronRight, GitPullRequest, History, ShieldCheck, Users, X, XCircle,
+  AlertTriangle, Calculator, CheckCircle2, ChevronRight, GitPullRequest, History, Landmark, ShieldCheck, Users, X, XCircle,
 } from "lucide-react";
-import type { ChangeSet, Dashboard } from "@/lib/api";
+import type { ChangeSet, Dashboard, SavingsMath } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import {
   CLASS_META, cn, ddlFor, fmtDate, fullPath, isW01, isW02, needsTwo, targetLabel, titleize, usd,
@@ -13,6 +13,60 @@ import { CodeBlock, CopyButton } from "./Code";
 import { Rich, StateCompare } from "./StateCompare";
 
 const num = (v: unknown) => Number(v || 0);
+
+const pctTxt = (v: unknown) => `${Math.round(Number(v || 0) * 1000) / 10}%`;
+
+/** "How this saving is calculated": renders evidence.savings_math so every number shows its work. */
+function SavingsMathPanel({ sm, net, gross, recurring }: { sm?: SavingsMath; net: number; gross: number; recurring: number }) {
+  if (!sm) {
+    return (
+      <div className="rounded-lg border border-zinc-200 p-3 text-xs text-zinc-500 dark:border-ink-800">
+        Legacy estimate: this card was priced before billing-aware savings (every job at $/TiB). The next rules run
+        re-prices it, or retires it if the finding no longer applies. Treat the number as an upper bound.
+      </div>
+    );
+  }
+  const rows: [string, React.ReactNode][] = [];
+  if (sm.billing_mix) rows.push(["Billing mix", sm.billing_mix]);
+  if (sm.attributed_monthly_usd != null)
+    rows.push(["Spend this card acts on", `${usd(sm.attributed_monthly_usd, 2)}/mo`
+      + (Number(sm.reservation_monthly_usd || 0) > 0
+        ? ` (${usd(sm.on_demand_monthly_usd, 2)} on-demand + ${usd(sm.reservation_monthly_usd, 2)} reservation)` : "")]);
+  if (sm.reduction != null) rows.push(["Assumed reduction", pctTxt(sm.reduction)]);
+  if (sm.reservation_realization != null && Number(sm.reservation_monthly_usd || 0) > 0)
+    rows.push(["Reservation realization", `${pctTxt(sm.reservation_realization)} of slot savings become cash`]);
+  if (sm.split_rule) rows.push(["Shared jobs", sm.split_rule]);
+  if (sm.window_note) rows.push(["Window", sm.window_note]);
+  if (sm.pool_key) rows.push(["Overlap pool", `${sm.pool_key} — compounded with other cards on the same spend in the headline total`]);
+  if (sm.cost_source && sm.cost_source !== "BILLING_AWARE") rows.push(["Cost source", titleize(String(sm.cost_source).toLowerCase())]);
+  if (recurring > 0) rows.push(["Net of running cost", `${usd(gross, 2)} − ${usd(recurring, 2)} running cost = ${usd(net, 2)}/mo`]);
+  return (
+    <div className="space-y-2 rounded-lg border border-zinc-200 p-3 text-xs dark:border-ink-800">
+      {sm.formula && <div className="font-mono text-[11px] leading-relaxed text-zinc-700 dark:text-zinc-300">{sm.formula}</div>}
+      {rows.length > 0 && (
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1">
+          {rows.map(([k, v]) => (
+            <div key={k} className="contents">
+              <dt className="text-zinc-500">{k}</dt>
+              <dd className="text-zinc-700 dark:text-zinc-300">{v}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {sm.cap_applied && <div className="text-amber-400">Capped: {sm.cap_applied}</div>}
+      {sm.demo_floor_applied && (
+        <div className="text-amber-400">
+          DEMO: a synthetic minimum{sm.demo_floor_usd != null ? ` of ${usd(sm.demo_floor_usd, 2)}` : ""} replaced the measured
+          {sm.measured_gross_usd != null ? ` ${usd(sm.measured_gross_usd, 2)}` : " value"}
+          {sm.demo_floor_inputs?.length ? ` (${sm.demo_floor_inputs.join(", ")})` : ""}. Never shown when demo_mode is off.
+        </div>
+      )}
+      {sm.repriced_from_usd != null && (
+        <div className="text-zinc-500">Re-priced from the legacy estimate of {usd(sm.repriced_from_usd, 2)}/mo.</div>
+      )}
+    </div>
+  );
+}
 
 function Section({ title, icon, children }: { title: string; icon?: React.ReactNode; children: React.ReactNode }) {
   return (
@@ -124,6 +178,11 @@ export function CardDetail({
             {(c.rule_ids || []).map((r) => <Badge key={r} className="font-mono">{r}</Badge>)}
             <Badge>{titleize(c.state || "")}</Badge>
             {two && <Badge className="text-amber-300 ring-amber-500/30">2-person</Badge>}
+            {c.governance_scope === "FINOPS" && (
+              <Badge className="bg-amber-500/10 text-amber-300 ring-amber-500/30" title="Only FinOps / governance approvers can approve this">
+                <Landmark className="h-3 w-3" />FinOps
+              </Badge>
+            )}
           </div>
           <button onClick={onClose} className="rounded-md p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5" aria-label="Close">
             <X className="h-4 w-4" />
@@ -188,6 +247,15 @@ export function CardDetail({
           </Section>
         )}
 
+        <Section title="How this saving is calculated" icon={<Calculator className="h-3.5 w-3.5" />}>
+          <SavingsMathPanel
+            sm={ev.savings_math as SavingsMath | undefined}
+            net={num(c.net_monthly_value_usd)}
+            gross={num(c.gross_monthly_savings_usd)}
+            recurring={num((c as any).recurring_monthly_cost_usd)}
+          />
+        </Section>
+
         {(ev.current_state || ev.proposed_state) && (
           <Section title="Before vs. after">
             <StateCompare before={ev.current_state} after={ev.proposed_state} />
@@ -206,7 +274,15 @@ export function CardDetail({
 
         {(c.director_name || c.department) && (
           <div className="grid grid-cols-3 gap-2 rounded-lg border border-zinc-200 p-3 text-xs dark:border-ink-800">
-            <div><div className="label !text-[10px]">Owner</div><div className="mt-0.5 font-medium">{c.director_name || "—"}</div></div>
+            <div>
+              <div className="label !text-[10px]">Director</div>
+              <div className="mt-0.5 font-medium" title={c.attribution_source ? `Attributed via ${c.attribution_source}` : undefined}>
+                {c.director_name || "—"}
+              </div>
+              {c.attribution_source && (
+                <div className="mt-0.5 text-[10px] text-zinc-500">via {titleize(String(c.attribution_source).toLowerCase())}</div>
+              )}
+            </div>
             <div><div className="label !text-[10px]">Department</div><div className="mt-0.5 font-medium">{c.department || "—"}</div></div>
             <div>
               <div className="label !text-[10px]">Team usage</div>
@@ -215,6 +291,35 @@ export function CardDetail({
           </div>
         )}
 
+
+        {(() => {
+          // Service-account spend rolls up to the human owner in the SA owner table.
+          const sa = (ev.accountable_owner || ev.service_account_owner) as
+            | { principal?: string; owner_email?: string; director_name?: string; application?: string; source?: string }
+            | undefined;
+          const unmapped = (c.risk_notes || []).some((r) => r.includes("UNMAPPED_SERVICE_ACCOUNT"));
+          if (!sa && !unmapped) return null;
+          return (
+            <div className="rounded-lg border border-zinc-200 p-3 text-xs dark:border-ink-800">
+              <div className="label !text-[10px]">Accountable owner</div>
+              {sa && sa.source !== "PRINCIPAL" ? (
+                <div className="mt-0.5">
+                  <span className="font-mono">{sa.principal}</span>
+                  {sa.application ? <span className="text-zinc-500"> ({sa.application})</span> : null} → owned by{" "}
+                  <span className="font-medium">{sa.owner_email}</span>
+                  {sa.director_name ? <span className="text-zinc-500"> · Director {sa.director_name}</span> : null}
+                </div>
+              ) : sa ? (
+                <div className="mt-0.5">Run by <span className="font-medium">{sa.owner_email}</span></div>
+              ) : (
+                <div className="mt-0.5 text-amber-400">
+                  Run by a service account with no owner in the service-account owner table: add it there so this spend
+                  rolls up to a Director.
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {ev.current_sql && ev.proposed_sql && (
           <Section title="SQL rewrite">
