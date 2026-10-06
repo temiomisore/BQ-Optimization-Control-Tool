@@ -29,22 +29,43 @@ function baseTheme(dark: boolean) {
   };
 }
 
-export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (cls: number) => void }) {
+export type CardTab = "queue" | "finops";
+
+export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (cls: number, tab: CardTab) => void }) {
   const dark = useDark();
   const k = data.kpis;
+  // Per class, split by where the cards live: the Review queue (engineering) or the
+  // FinOps & billing tab (W-01/W-02 etc.), so the tooltip ties out to the lists below.
+  const split = [1, 2, 3, 4].map((c) => {
+    const inClass = (data.cards || []).filter((x) => Number(x.apply_class || 1) === c);
+    const sum = (xs: typeof inClass) => xs.reduce((s, x) => s + Number(x.net_monthly_value_usd || 0), 0);
+    const finops = inClass.filter((x) => x.governance_scope === "FINOPS");
+    const queue = inClass.filter((x) => x.governance_scope !== "FINOPS");
+    return { queueN: queue.length, queueUsd: sum(queue), finopsN: finops.length, finopsUsd: sum(finops) };
+  });
   const classData = [1, 2, 3, 4].map((c, i) => ({
     name: `Class ${c}`,
     value: Math.round(k.class_savings?.[c] || 0),
     count: k.class_counts?.[c] || 0,
+    split: split[i],
     itemStyle: { color: CLASS_COLORS[i] },
   }));
+  const cardsTotal = k.monthly_savings_gross_sum ?? classData.reduce((s, d) => s + d.value, 0);
+  const plural = (n: number) => `${n} card${n === 1 ? "" : "s"}`;
 
   const donut = {
     ...baseTheme(dark),
     tooltip: {
       ...baseTheme(dark).tooltip,
       trigger: "item",
-      formatter: (p: any) => `${p.name}<br/><b>${usd(p.value)}/mo</b> · ${p.data.count} cards (${p.percent}%)`,
+      formatter: (p: any) => {
+        const s = p.data.split;
+        const rows = [
+          `Review queue: ${plural(s.queueN)} · <b>${usd(s.queueUsd)}/mo</b>`,
+          ...(s.finopsN ? [`FinOps &amp; billing tab: ${plural(s.finopsN)} · <b>${usd(s.finopsUsd)}/mo</b>`] : []),
+        ];
+        return `${p.name} · cards total <b>${usd(p.value)}/mo</b> (${p.percent}%)<br/>${rows.join("<br/>")}`;
+      },
     },
     legend: { bottom: 0, icon: "circle", itemWidth: 8, textStyle: { color: dark ? "#a1a1aa" : "#52525b", fontSize: 11 } },
     series: [
@@ -57,7 +78,7 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
         label: {
           show: true,
           position: "center",
-          formatter: () => `{v|${usd(k.monthly_savings)}}\n{l|per month}`,
+          formatter: () => `{v|${usd(k.monthly_savings)}}\n{l|net / mo}`,
           rich: {
             v: { fontFamily: "JetBrains Mono", fontSize: 18, fontWeight: 700, color: dark ? "#fafafa" : "#09090b" },
             l: { fontSize: 11, color: "#71717a", padding: [4, 0, 0, 0] },
@@ -115,8 +136,17 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
           option={donut}
           style={{ height: 220 }}
           notMerge
-          onEvents={{ click: (p: any) => onClass(Number(String(p.name).replace("Class ", ""))) }}
+          onEvents={{
+            click: (p: any) => {
+              const s = p.data?.split;
+              onClass(Number(String(p.name).replace("Class ", "")), s && !s.queueN && s.finopsN ? "finops" : "queue");
+            },
+          }}
         />
+        <p className="mt-1 text-center text-[11px] leading-snug text-zinc-500">
+          Slices = card totals ({usd(cardsTotal)}/mo). Cards that target the same spend are counted once in the{" "}
+          {usd(k.monthly_savings)} net.
+        </p>
       </div>
 
       <div className={panel}>

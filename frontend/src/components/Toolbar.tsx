@@ -1,5 +1,5 @@
 import { Search, X } from "lucide-react";
-import type { Dashboard } from "@/lib/api";
+import type { ChangeSet, Dashboard } from "@/lib/api";
 import { NativeSelect } from "./ui";
 import { cn, CLASS_META } from "@/lib/utils";
 
@@ -20,18 +20,22 @@ export const DEFAULT_FILTERS: Filters = {
 
 export function Toolbar({
   data,
+  cards,
   f,
   setF,
   shown,
   total,
 }: {
   data: Dashboard;
+  /** Cards in the current tab (Review queue or FinOps & billing): class counts follow the tab. */
+  cards: ChangeSet[];
   f: Filters;
   setF: (p: Partial<Filters>) => void;
   shown: number;
   total: number;
 }) {
-  const counts = data.kpis.class_counts || {};
+  const counts: Record<number, number> = {};
+  for (const c of cards) counts[Number(c.apply_class || 1)] = (counts[Number(c.apply_class || 1)] || 0) + 1;
   const dirty = JSON.stringify(f) !== JSON.stringify(DEFAULT_FILTERS);
   return (
     <div className="panel relative z-30 flex flex-col gap-3 p-4">

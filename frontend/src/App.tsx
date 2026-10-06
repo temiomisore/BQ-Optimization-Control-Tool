@@ -118,7 +118,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
               exit={{ opacity: 0, height: 0 }}
               className="overflow-hidden"
             >
-              <AnalyticsStrip data={data} onClass={(cls) => { setTab("queue"); setF({ cls }); }} />
+              <AnalyticsStrip data={data} onClass={(cls, t) => { setTab(t); setSelectedId(null); setF({ cls }); }} />
             </motion.div>
           )}
         </AnimatePresence>
@@ -172,7 +172,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
 
         {data && (tab === "queue" || tab === "finops") && (
           <>
-            <Toolbar data={data} f={f} setF={setF} shown={shown.length} total={cards.length} />
+            <Toolbar data={data} cards={cards} f={f} setF={setF} shown={shown.length} total={cards.length} />
             <div className="flex items-start gap-6">
               <div className={cn("min-w-0 transition-all duration-300", selected ? "hidden lg:block lg:flex-[2] xl:flex-[5]" : "w-full")}>
                 {shown.length === 0 ? (
