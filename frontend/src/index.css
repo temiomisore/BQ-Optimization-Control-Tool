@@ -19,6 +19,13 @@
     background-attachment: fixed;
   }
   ::selection { @apply bg-sky-500/30; }
+  /* Native dropdown lists: a transparent <select> (e.g. the header persona picker) passes its
+     light text colour to the options, which the browser then draws on a white popup, making
+     them unreadable. Give options an explicit, theme-matched background and text colour. */
+  select option, select optgroup { @apply bg-white text-zinc-900; }
+  .dark select option, .dark select optgroup { @apply bg-ink-900 text-zinc-100; }
+  select option:checked { @apply bg-sky-100 text-sky-900; }
+  .dark select option:checked { @apply bg-sky-900 text-sky-100; }
   * { scrollbar-width: thin; scrollbar-color: rgba(113, 113, 122, 0.4) transparent; }
 }
 
