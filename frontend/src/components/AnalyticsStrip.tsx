@@ -146,6 +146,17 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
         <p className="mt-1 text-center text-[11px] leading-snug text-zinc-500">
           Slices = card totals ({usd(cardsTotal)}/mo). Cards that target the same spend are counted once in the{" "}
           {usd(k.monthly_savings)} net.
+          {k.headline_capped_at_spend && (
+            <>
+              {" "}
+              {/* The bill amount is only sent to FinOps viewers (server nulls it for everyone else). */}
+              <span className="font-medium text-amber-500">
+                Capped at your actual 30-day query bill
+                {k.compute_spend_30d_usd != null ? ` (${usd(k.compute_spend_30d_usd)})` : ""}. You can't save more than you
+                spend.
+              </span>
+            </>
+          )}
         </p>
       </div>
 

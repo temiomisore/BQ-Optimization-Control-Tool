@@ -28,7 +28,7 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
     `${usd(k.annual_savings)} / year`,
     overlap > 0 ? `${usd(overlap)} overlap removed (sum of cards ${usd(k.monthly_savings_gross_sum)})` : null,
     k.headline_capped_at_spend
-      ? spend != null ? `capped at actual 30-day compute spend (${usd(spend)})` : "capped at actual 30-day compute spend"
+      ? spend != null ? `capped at actual 30-day query bill (${usd(spend)})` : "capped at actual 30-day query bill"
       : null,
     legacyCards > 0 ? `${legacyCards} legacy estimate${legacyCards > 1 ? "s" : ""}` : null,
   ].filter(Boolean).join(" · ");
