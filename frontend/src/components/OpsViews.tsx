@@ -5,6 +5,7 @@ import type { ChangeSet, Dashboard, Receipt } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import { CLASS_META, cn, fmtDate, targetLabel, titleize, usd } from "@/lib/utils";
 import { Badge, Button, Dialog, Empty } from "./ui";
+import { CfoProofReceipt, SimulateDay14Banner, simFor, useDemoDay14 } from "./DemoProofReceipt";
 
 const ROLLBACKABLE = ["APPLIED", "VERIFYING", "VERIFIED", "REGRESSED", "ROLLING_BACK"];
 
@@ -187,8 +188,15 @@ export function RolledBackList({ cards }: { cards: ChangeSet[] }) {
 /* ------------------------------------------------------- receipts table */
 export function ReceiptsTable({ receipts }: { receipts: Receipt[] }) {
   const [target, setTarget] = useState<null | { id: string; label: string; w01: boolean }>(null);
+  const [sim, setSim] = useDemoDay14();
   if (!receipts.length) return <Empty icon={<Undo2 className="h-5 w-5" />} title="No receipts yet" hint="Approved & applied changes show predicted vs. realized savings here." />;
+  // Demo-only Day-14 preview for the seeded demo cards (see DemoProofReceipt.tsx).
+  const simCount = receipts.filter((r) => simFor(r)).length;
+  const showSim = sim && simCount > 0;
   return (
+    <>
+    {simCount > 0 && !sim && <SimulateDay14Banner count={simCount} onSimulate={() => setSim(true)} />}
+    {showSim && <CfoProofReceipt receipts={receipts} onReset={() => setSim(false)} />}
     <div className="panel overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
@@ -201,16 +209,22 @@ export function ReceiptsTable({ receipts }: { receipts: Receipt[] }) {
         <tbody>
           {receipts.map((r) => {
             const label = r.target_dataset === "PROJECT_WIDE_BILLING" ? "Project-wide billing" : `${r.target_dataset}${r.target_table ? "." + r.target_table : ""}`;
-            const ratio = r.realized_over_predicted;
+            const s = showSim ? simFor(r) : null;
+            const realized = s ? s.realized : r.realized_usd == null ? null : Number(r.realized_usd);
+            const ratio = s ? (Number(r.predicted_usd) > 0 ? s.realized / Number(r.predicted_usd) : null) : r.realized_over_predicted;
+            const simTag = s && <span className="ml-1 font-sans text-[10px] text-amber-500">sim</span>;
             return (
               <tr key={r.change_set_id} className="border-b border-zinc-100 transition-colors hover:bg-zinc-50 dark:border-ink-800/60 dark:hover:bg-white/[0.02]">
                 <td className="px-4 py-3 font-medium">{label}</td>
                 <td className="px-4 py-3 font-mono text-xs text-zinc-500">{(r.rule_ids || []).join(", ")}</td>
                 <td className="px-4 py-3 text-xs text-zinc-500">{fmtDate(r.applied_at)}</td>
                 <td className="px-4 py-3 font-mono">{usd(r.predicted_usd)}</td>
-                <td className="px-4 py-3 font-mono text-emerald-400">{r.realized_usd == null ? "—" : usd(Number(r.realized_usd))}</td>
-                <td className="px-4 py-3 font-mono text-xs">{ratio == null ? "—" : `${Math.round(Number(ratio) * 100)}%`}</td>
-                <td className="px-4 py-3"><Badge>{titleize(r.state.toLowerCase())}</Badge></td>
+                <td className="px-4 py-3 font-mono text-emerald-400">{realized == null ? "—" : usd(realized)}{simTag}</td>
+                <td className="px-4 py-3 font-mono text-xs">{ratio == null ? "—" : `${Math.round(Number(ratio) * 100)}%`}{simTag}</td>
+                <td className="px-4 py-3">
+                  <Badge className={s ? "text-emerald-400" : undefined}>{s ? "Verified" : titleize(r.state.toLowerCase())}</Badge>
+                  {simTag}
+                </td>
                 <td className="px-4 py-3 text-right">
                   {ROLLBACKABLE.includes(r.state) && (
                     <Button size="sm" variant="ghost" className="text-rose-400" onClick={() => setTarget({ id: r.change_set_id, label, w01: r.target_dataset === "PROJECT_WIDE_BILLING" })}>
@@ -225,5 +239,6 @@ export function ReceiptsTable({ receipts }: { receipts: Receipt[] }) {
       </table>
       <RollbackDialog target={target} onClose={() => setTarget(null)} />
     </div>
+    </>
   );
 }
