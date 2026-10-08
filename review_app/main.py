@@ -25,7 +25,7 @@ except ModuleNotFoundError:
             os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
     raise
 
-from optimizer import bq, governance, pricing, store, verifier  # noqa: E402
+from optimizer import bq, governance, pricing, schema_guard, store, verifier  # noqa: E402
 from optimizer.config import cfg  # noqa: E402
 from optimizer.executor import recommender_sync  # noqa: E402
 
@@ -190,6 +190,10 @@ def _enrich_repartition(cs: dict) -> None:
 
 def _fetch_dashboard_data_uncached(c) -> dict:
     """Fetch and compute dashboard state using 2 concurrent BigQuery queries instead of 9 sequential calls."""
+    try:
+        schema_guard.ensure_current(c, max_age_sec=60)   # self-heal views rebuilt by an older copy
+    except Exception:
+        pass                                             # never block the dashboard on the guard
     all_cs_sql = f"""
         SELECT *
         FROM `{c.ops}.change_sets`
@@ -896,6 +900,9 @@ def _apply_decision(c, form, ident: dict) -> dict:
     if not cs:
         raise ValueError(f"change set {cs_id} not found")
     governance.check_can_decide(cs, ident, c)
+    # Repair views an older copy of the repo may have rebuilt (e.g. a stale notebook
+    # running demo_setup.py) before anything reads them. One cheap metadata call.
+    schema_guard.ensure_current(c)
 
     if action == "pr_merged":
         from optimizer.executor import pr_handoff
@@ -934,7 +941,14 @@ def _apply_decision(c, form, ident: dict) -> dict:
 
         status = store.approve(c, cs_id, who, role=role, note=claim_note)
         if status == "APPROVED":
-            verifier.freeze_baseline(c, cs)                      # baseline frozen at full approval
+            try:
+                verifier.freeze_baseline(c, cs)                  # baseline frozen at full approval
+            except Exception as e:
+                # Views rebuilt by an older copy mid-session: repair and retry once.
+                if not schema_guard.is_stale_schema_error(e):
+                    raise
+                schema_guard.ensure_current(c)
+                verifier.freeze_baseline(c, cs)
             recommender_sync.mark(cs.get("native_rec_names"), "CLAIMED")
         return {"action": action, "status": status}
     if action == "reset":

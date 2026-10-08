@@ -43,6 +43,13 @@ def cmd_init(c) -> None:
     for stmt in stmts:
         bq.execute(c, stmt)
         print("  + Attribution source view:", stmt.splitlines()[0].replace("CREATE OR REPLACE VIEW ", ""))
+    # Stamp the schema version so the review app can detect (and repair) views later
+    # rebuilt by an older copy of this repo. See optimizer/schema_guard.py.
+    from . import schema_guard
+    try:
+        schema_guard.stamp(c)
+    except Exception as e:  # never fail init over a label
+        print(f"  ! could not stamp schema version: {e}")
     print("✅ Control plane schema initialized successfully!")
 
 
