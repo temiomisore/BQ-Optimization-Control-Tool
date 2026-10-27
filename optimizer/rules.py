@@ -2095,7 +2095,8 @@ def _dry_run_sql(c: Config, sql: str) -> tuple[bool, int]:
         from google.cloud import bigquery
         clean_sql = re.sub(r"@([A-Za-z0-9_]+)", "'1'", sql)
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-        job = bq.client(c).query(clean_sql, job_config=job_config)
+        # AUTO: BigQuery infers the location from the referenced tables (any region).
+        job = bq.client(c, bq.AUTO).query(clean_sql, job_config=job_config)
         return True, int(job.total_bytes_processed or 0)
     except Exception:
         return False, 0
@@ -2119,7 +2120,7 @@ def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
             res = bq.query(c, f"""
                 SELECT ddl FROM `{target_p}.{ds}.INFORMATION_SCHEMA.TABLES`
                 WHERE table_name = '{tbl}' LIMIT 1
-            """)
+            """, location=bq.AUTO)   # the dataset may live in any region
             if res and res[0].get("ddl"):
                 ddls.append(res[0]["ddl"].strip())
         except Exception:

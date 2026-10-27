@@ -97,6 +97,39 @@ service-account spend then rolls up SA → owner → Director in `v_spend_by_dir
 the cards; `v_unmapped_service_accounts` lists what still needs an owner. The review app's
 service account needs read access to that table.
 
+## Multi-region collection and automatic region discovery
+
+A BigQuery query job runs in one location, so `sql/02_collector_run.sql` can only collect the
+**home** location (`location`, where `optimizer_ops` lives). Every other location is collected by
+`optimizer/remote_collector.py` with the "courier" pattern, and everything lands in the same master
+tables (`jobs_events`, `table_state_daily`, … all carry a `region` column):
+
+1. **Watermark:** a query job in the home location reads `MAX(creation_time)` for that region.
+2. **Fetch:** a query job *in that region* reads only newer rows from `region-<r>`.INFORMATION_SCHEMA
+   (1-day safety overlap; the first run backfills 180 days day by day).
+3. **Load:** a load job uploads them to a short-lived staging table `optimizer_ops._stg_*` (expires in 24h).
+4. **Merge:** `MERGE` into the master table (events) or replace today's rows for that region (snapshots).
+
+No dataset is created outside the home location.
+
+**Which regions?** Set `regions: auto` to discover them on every run with Cloud Asset Inventory
+(every `bigquery.googleapis.com/Dataset` in `asset_scope`, ideally `organizations/<id>`). The route is
+the discovered locations, plus `regions_include`, minus `regions_exclude`; home is always visited.
+Each run upserts `optimizer_ops.regions_seen`. A region that appears after the first run is flagged
+in the review UI ("New region detected"). If discovery fails, the collector keeps going with the last
+known regions. A fixed list (`regions: ["us", "us-east4"]`) still works.
+
+```bash
+python -m optimizer.cli regions --no-record     # show tonight's route without writing anything
+python -m optimizer.cli regions                 # discover + record regions_seen
+python -m optimizer.cli collect                 # home SQL + every remote region
+```
+
+Prerequisites for `auto`: the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled in the tool's
+project and **`roles/cloudasset.viewer`** on `asset_scope` for the collector's service account.
+Fixes also run in the right place: the executor and rollback start every statement on a customer
+table in that table's `target_region`.
+
 ## Honest status matrix
 
 | Component | Status |

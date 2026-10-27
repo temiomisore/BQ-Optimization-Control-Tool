@@ -124,7 +124,34 @@ export interface SavingsMath {
   [k: string]: unknown;
 }
 
+/** One BigQuery location the collector visits (review_app/main.py -> optimizer/regions.py). */
+export interface RegionInfo {
+  region: string;
+  dataset_count?: number | null;
+  project_count?: number | null;
+  first_seen_at?: string | null;
+  last_seen_at?: string | null;
+  source?: string | null;
+  /** First seen after a baseline existed, within region_alert_days. */
+  alert?: boolean;
+  home?: boolean;
+}
+
+export interface RegionsInfo {
+  /** "auto" = discovered with Cloud Asset Inventory each run; "list" = fixed list in config.yaml. */
+  mode: "auto" | "list";
+  home: string;
+  /** False until a collector / `optimizer.cli regions` run has recorded regions_seen. */
+  discovered: boolean;
+  scope?: string;
+  regions: RegionInfo[];
+  alerts: RegionInfo[];
+  last_run?: string | null;
+}
+
 export interface Dashboard {
+  /** Which BigQuery locations the collector visits (absent on older servers). */
+  regions?: RegionsInfo;
   cards: ChangeSet[];
   blocked_cards: ChangeSet[];
   regressed_cards: ChangeSet[];

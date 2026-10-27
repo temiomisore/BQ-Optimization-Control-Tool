@@ -16,6 +16,7 @@ import { GeminiAssistDrawer } from "@/components/GeminiAssistDrawer";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PrModal } from "@/components/PrModal";
 import { HandoffList } from "@/components/HandoffList";
+import { RegionsBar } from "@/components/RegionsBar";
 import { Button, Empty, Skeleton } from "@/components/ui";
 
 function applyFilters(cards: ChangeSet[], f: Filters) {
@@ -107,6 +108,8 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
         )}
 
         {data && <RegressedBanner cards={data.regressed_cards} />}
+
+        {data && <RegionsBar info={data.regions} />}
 
         <KpiCards data={data} onTab={(t) => { setTab(t); setSelectedId(null); }} />
 

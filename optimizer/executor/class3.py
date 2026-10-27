@@ -21,6 +21,7 @@ delta_column (quiesce-only migration is fine when writers are truly paused).
 from __future__ import annotations
 
 import datetime as dt
+import re
 import time
 
 from .. import bq
@@ -64,6 +65,12 @@ def _round50(n: int) -> int:
     return max(0, int(round(int(n) / 50.0)) * 50)
 
 
+def _region_of(reservation_fq: str | None) -> str | None:
+    """'proj.region-us-east4.name' -> 'us-east4' (older rollback plans have no region key)."""
+    m = re.search(r"region-([a-z0-9-]+)", reservation_fq or "")
+    return m.group(1) if m else None
+
+
 def capacity_plan(c: Config, cs: dict, change: dict) -> dict:
     """Pure: resolve the approved option into concrete reservation parameters.
     Option precedence: env BQOPT_RESERVATION_OPTION > change.selected_option > 1."""
@@ -104,12 +111,13 @@ def _run_capacity_migration(c: Config, cs: dict, change: dict) -> dict:
                       "set it true in config.yaml to allow a real run.")
     p = capacity_plan(c, cs, change)
     loc = f"region-{p['region']}"
+    rloc = bq.location_for(p["region"])   # reservation statements run in that region
 
     # ---- S0 PRECHECK: never fight an existing reservation assignment ----------
     assigns = bq.query(c, f"""
         SELECT reservation_name, assignment_id, job_type
         FROM `{p['project']}.{loc}.INFORMATION_SCHEMA.ASSIGNMENTS`
-        WHERE assignee_id = @proj AND job_type = 'QUERY'""", {"proj": p["project"]})
+        WHERE assignee_id = @proj AND job_type = 'QUERY'""", {"proj": p["project"]}, location=rloc)
     foreign = [a for a in assigns if a.get("reservation_name") != p["reservation_name"]]
     if foreign:
         raise Blocked(f"project {p['project']} already has a QUERY assignment to reservation "
@@ -117,19 +125,19 @@ def _run_capacity_migration(c: Config, cs: dict, change: dict) -> dict:
     already_assigned = any(a.get("assignment_id") == _ASSIGNMENT_ID for a in assigns)
     existing = bq.query(c, f"""
         SELECT reservation_name FROM `{p['project']}.{loc}.INFORMATION_SCHEMA.RESERVATIONS`
-        WHERE reservation_name = @n""", {"n": p["reservation_name"]})
+        WHERE reservation_name = @n""", {"n": p["reservation_name"]}, location=rloc)
     _progress(c, cs, "S0_PRECHECK", {"option": p["option"], "reservation_exists": bool(existing),
                                      "already_assigned": already_assigned})
 
     plan = {"action": "CAPACITY_PRICING_MIGRATION", "prior_billing_model": "ON_DEMAND",
-            "option": p["option"], "reservation_fq": p["reservation_fq"],
+            "option": p["option"], "region": p["region"], "reservation_fq": p["reservation_fq"],
             "assignment_fq": p["assignment_fq"], "baseline_slots": p["baseline_slots"],
             "autoscale_max_slots": p["autoscale_max_slots"], "max_slots": p["max_slots"],
             "created_reservation": False, "created_assignment": False}
 
     # ---- S1 RESERVATION -------------------------------------------------------
     if not existing:
-        bq.execute(c, p["create_reservation_sql"])
+        bq.execute(c, p["create_reservation_sql"], location=rloc)
         plan["created_reservation"] = True
     # persist the rollback plan immediately so a crash after S1 is still reversible
     bq.execute(c, f"UPDATE `{c.ops}.change_sets` SET rollback_plan_json=@p WHERE change_set_id=@id",
@@ -142,10 +150,10 @@ def _run_capacity_migration(c: Config, cs: dict, change: dict) -> dict:
     # ---- S2 ASSIGNMENT --------------------------------------------------------
     if not already_assigned:
         try:
-            bq.execute(c, p["create_assignment_sql"])
+            bq.execute(c, p["create_assignment_sql"], location=rloc)
         except Exception as e:
             if plan["created_reservation"]:
-                bq.execute(c, f"DROP RESERVATION IF EXISTS `{p['reservation_fq']}`")
+                bq.execute(c, f"DROP RESERVATION IF EXISTS `{p['reservation_fq']}`", location=rloc)
             _progress(c, cs, "ABORTED", {"reason": f"assignment failed: {e}"})
             raise Blocked(f"clean abort: assignment failed ({e}); reservation removed") from e
         plan["created_assignment"] = True
@@ -161,15 +169,16 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
     """Return the project to on-demand: drop the assignment, then the reservation
     (only if this tool created it)."""
     dropped = []
+    rloc = bq.location_for(plan.get("region") or _region_of(plan.get("reservation_fq")))
     if plan.get("assignment_fq"):
-        bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{plan['assignment_fq']}`")
+        bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{plan['assignment_fq']}`", location=rloc)
         dropped.append(plan["assignment_fq"])
     # Keep the reservation alive until routing has propagated back to on-demand; dropping it
     # immediately makes queries fail for a few minutes ("project does not have the reservation").
     res_short = (plan.get("reservation_fq") or "").split(".")[-1]
     routed_back = False
     for _ in range(18):                      # up to ~3 minutes
-        rid = bq.probe_reservation(c)
+        rid = bq.probe_reservation(c, location=rloc)
         if not rid or not res_short or not str(rid).endswith(res_short):
             routed_back = True
             break
@@ -177,7 +186,7 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
     if plan.get("created_reservation") and plan.get("reservation_fq"):
         for attempt in range(6):
             try:
-                bq.execute(c, f"DROP RESERVATION IF EXISTS `{plan['reservation_fq']}`")
+                bq.execute(c, f"DROP RESERVATION IF EXISTS `{plan['reservation_fq']}`", location=rloc)
                 dropped.append(plan["reservation_fq"])
                 break
             except Exception:
@@ -203,6 +212,7 @@ def run(c: Config, cs: dict) -> dict:
                       f"CONSOLIDATE_SHARDS and ARCHIVE_TO_GCS_THEN_DROP are runbook-only for now")
 
     cli = bq.client(c)
+    loc = bq.location_for(cs.get("target_region"))   # every statement on the target runs in its region
     fq = _fq(cs)
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M")
     new_name = f"{cs['target_table']}__bqopt_new"
@@ -215,7 +225,7 @@ def run(c: Config, cs: dict) -> dict:
         """Clean abort — pre-swap only. Leaves the world exactly as found."""
         _resume_transfers(paused_transfers)
         try:
-            bq.execute(c, f"DROP TABLE IF EXISTS `{fq_new}`")
+            bq.execute(c, f"DROP TABLE IF EXISTS `{fq_new}`", location=loc)
         finally:
             _progress(c, cs, "ABORTED", {"reason": reason})
         raise Blocked(f"clean abort: {reason}")
@@ -257,7 +267,7 @@ def run(c: Config, cs: dict) -> dict:
     # ---- S1 CAPTURE -------------------------------------------------------
     ddl = bq.query(c, f"""
         SELECT ddl FROM `{cs['target_project']}.{cs['target_dataset']}.INFORMATION_SCHEMA.TABLES`
-        WHERE table_name = @t""", {"t": cs["target_table"]})[0]["ddl"]
+        WHERE table_name = @t""", {"t": cs["target_table"]}, location=loc)[0]["ddl"]
     iam_policy = cli.get_iam_policy(table).to_api_repr()
     row_policies = []
     try:
@@ -269,7 +279,7 @@ def run(c: Config, cs: dict) -> dict:
                                      "filter_predicate": rp.filter_predicate})
         else:
             try:
-                rls_rows = bq.query(c, f"SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.INFORMATION_SCHEMA.ROW_ACCESS_POLICIES` WHERE table_name = @t", {"t": cs["target_table"]})
+                rls_rows = bq.query(c, f"SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.INFORMATION_SCHEMA.ROW_ACCESS_POLICIES` WHERE table_name = @t", {"t": cs["target_table"]}, location=loc)
                 for rp in rls_rows:
                     row_policies.append({"policy_id": rp.get("row_access_policy_id"),
                                          "grantees": list(rp.get("grantees") or []),
@@ -280,7 +290,7 @@ def run(c: Config, cs: dict) -> dict:
         abort(f"could not enumerate row access policies ({e}) — will not risk dropping RLS")
     snap = f"{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}__bqopt_snap_{ts}"
     bq.execute(c, f"""CREATE SNAPSHOT TABLE `{snap}` CLONE `{fq}`
-        OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {int(c['executor']['backup_hold_days'])} DAY))""")
+        OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {int(c['executor']['backup_hold_days'])} DAY))""", location=loc)
     rollback_plan = {"snapshot": snap, "backup": fq_bak, "iam_policy": iam_policy,
                      "row_policies": row_policies, "original_ddl": ddl,
                      "labels": dict(table.labels or {})}
@@ -319,7 +329,7 @@ def run(c: Config, cs: dict) -> dict:
             CREATE TABLE `{fq_new}`
             PARTITION BY {part_expr}
             {cluster_sql}
-            AS SELECT * FROM `{fq}`""")
+            AS SELECT * FROM `{fq}`""", location=loc)
     except Exception as e:
         abort(f"build failed: {e}")
     _progress(c, cs, "S3_BUILD", {"partition_by": part_expr,
@@ -332,7 +342,7 @@ def run(c: Config, cs: dict) -> dict:
             n = bq.execute(c, f"""
                 INSERT INTO `{fq_new}`
                 SELECT * FROM `{fq}` WHERE {delta_col} > @b""",
-                {"b": build_start.isoformat()})
+                {"b": build_start.isoformat()}, location=loc)
         except Exception as e:
             abort(f"delta sync failed: {e}")
         _progress(c, cs, "S4_DELTA", {"rows": n})
@@ -342,22 +352,22 @@ def run(c: Config, cs: dict) -> dict:
     # ---- S5 VALIDATE ------------------------------------------------------
     counts = bq.query(c, f"""
         SELECT (SELECT COUNT(*) FROM `{fq}`) AS old_n,
-               (SELECT COUNT(*) FROM `{fq_new}`) AS new_n""")[0]
+               (SELECT COUNT(*) FROM `{fq_new}`) AS new_n""", location=loc)[0]
     if counts["old_n"] != counts["new_n"]:
         abort(f"row count mismatch old={counts['old_n']} new={counts['new_n']}")
     sums = bq.query(c, f"""
         SELECT (SELECT BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) FROM `{fq}` t)     AS old_h,
-               (SELECT BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) FROM `{fq_new}` t) AS new_h""")[0]
+               (SELECT BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(t))) FROM `{fq_new}` t) AS new_h""", location=loc)[0]
     if sums["old_h"] != sums["new_h"]:
         abort("checksum mismatch between original and rebuilt table")
     _progress(c, cs, "S5_VALIDATE", {"rows": int(counts["old_n"]), "checksum": "match"})
 
     # ---- S6 SWAP ----------------------------------------------------------
-    bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{bak_name}`")
+    bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{bak_name}`", location=loc)
     try:
-        bq.execute(c, f"ALTER TABLE `{fq_new}` RENAME TO `{cs['target_table']}`")
+        bq.execute(c, f"ALTER TABLE `{fq_new}` RENAME TO `{cs['target_table']}`", location=loc)
     except Exception as e:
-        bq.execute(c, f"ALTER TABLE `{fq_bak}` RENAME TO `{cs['target_table']}`")
+        bq.execute(c, f"ALTER TABLE `{fq_bak}` RENAME TO `{cs['target_table']}`", location=loc)
         _resume_transfers(paused_transfers)
         _progress(c, cs, "SWAP_REVERTED", {"error": str(e)})
         raise Blocked(f"swap failed and was reverted: {e}") from e
@@ -378,7 +388,7 @@ def run(c: Config, cs: dict) -> dict:
         grantees = ", ".join(f'"{g}"' for g in rp["grantees"])
         bq.execute(c, f"""
             CREATE ROW ACCESS POLICY `{rp['policy_id']}` ON `{fq}`
-            GRANT TO ({grantees}) FILTER USING ({rp['filter_predicate']})""")
+            GRANT TO ({grantees}) FILTER USING ({rp['filter_predicate']})""", location=loc)
     if rollback_plan["labels"]:
         new_table.labels = rollback_plan["labels"]
         cli.update_table(new_table, ["labels"])
@@ -399,13 +409,13 @@ def run(c: Config, cs: dict) -> dict:
                          f"WHERE {pcol} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
                       if col_types[pcol] != "DATE" else
                       f"SELECT COUNT(*) AS n FROM `{fq}` "
-                      f"WHERE {pcol} >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)")[0]
+                      f"WHERE {pcol} >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)", location=loc)[0]
     _progress(c, cs, "S8_POSTCHECK", {"recent_rows": int(canary["n"])})
 
     # ---- S9 HOLD ----------------------------------------------------------
     hold = int(c["executor"]["backup_hold_days"])
     bq.execute(c, f"""ALTER TABLE `{fq_bak}` SET OPTIONS (
-        expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))""")
+        expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))""", location=loc)
     _progress(c, cs, "S9_HOLD", {"backup_expires_days": hold,
                                  "note": "new table has no time-travel history; snapshot is the pre-swap anchor"})
     return rollback_plan
@@ -421,6 +431,7 @@ def rollback(c: Config, cs: dict) -> None:
     if not bak:
         raise Blocked("no backup recorded; restore from snapshot " + str(plan.get("snapshot")))
     cli = bq.client(c)
+    loc = bq.location_for(cs.get("target_region"))
     hold = int(c["executor"]["backup_hold_days"])
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M")
     regressed_name = f"{cs['target_table']}__bqopt_regressed_{ts}"
@@ -433,10 +444,10 @@ def rollback(c: Config, cs: dict) -> None:
         bak_exists = False
 
     if bak_exists:
-        bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{regressed_name}`")
-        bq.execute(c, f"ALTER TABLE `{bak}` RENAME TO `{cs['target_table']}`")
-        bq.execute(c, f"ALTER TABLE `{fq}` SET OPTIONS (expiration_timestamp = NULL)")
-        bq.execute(c, f"ALTER TABLE `{regressed}` SET OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))")
+        bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{regressed_name}`", location=loc)
+        bq.execute(c, f"ALTER TABLE `{bak}` RENAME TO `{cs['target_table']}`", location=loc)
+        bq.execute(c, f"ALTER TABLE `{fq}` SET OPTIONS (expiration_timestamp = NULL)", location=loc)
+        bq.execute(c, f"ALTER TABLE `{regressed}` SET OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))", location=loc)
     else:
         # Backup table already restored in a prior step; preserve existing forensics reference if any
         prog = bq.loads(cs.get("progress_json")) or {}

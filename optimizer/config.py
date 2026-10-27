@@ -13,7 +13,15 @@ import yaml
 
 _DEFAULTS: dict[str, Any] = {
     "ops_dataset": "optimizer_ops",
+    # Regions the collector visits. A list (e.g. ["us", "us-east4"]) or "auto": discover every
+    # location that holds a BigQuery dataset with Cloud Asset Inventory each run (optimizer/regions.py).
     "regions": ["us"],
+    "regions_include": [],        # always visit these (even if discovery finds no datasets there)
+    "regions_exclude": [],        # never visit these
+    # Where discovery looks: "organizations/ORG_ID" (recommended), "folders/ID" or "projects/ID".
+    # None = this project only. Needs roles/cloudasset.viewer on the scope + the Cloud Asset API.
+    "asset_scope": None,
+    "region_alert_days": 7,       # how long a newly discovered region stays flagged in the UI
     "location": "US",
     "jobs_view": "JOBS",
     "reservation_admin_project": None,
@@ -108,6 +116,11 @@ def cfg(path: str | None = None, **overrides: Any) -> Config:
             pass
     if os.environ.get("BQOPT_LOCATION"):
         merged["location"] = os.environ["BQOPT_LOCATION"]
+    if os.environ.get("BQOPT_REGIONS"):       # "auto" or comma-separated, e.g. "us,us-east4"
+        raw = os.environ["BQOPT_REGIONS"].strip()
+        merged["regions"] = "auto" if raw.lower() == "auto" else [r.strip() for r in raw.split(",") if r.strip()]
+    if os.environ.get("BQOPT_ASSET_SCOPE"):
+        merged["asset_scope"] = os.environ["BQOPT_ASSET_SCOPE"]
     if os.environ.get("BQOPT_EMPLOYEE_HIERARCHY_TABLE"):
         merged["employee_hierarchy_table"] = os.environ["BQOPT_EMPLOYEE_HIERARCHY_TABLE"]
     if os.environ.get("BQOPT_SERVICE_ACCOUNT_OWNER_TABLE"):

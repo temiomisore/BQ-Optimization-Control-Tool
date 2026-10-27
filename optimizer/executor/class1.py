@@ -35,6 +35,7 @@ def apply(c: Config, cs: dict) -> dict:
     change = bq.loads(cs["proposed_change_json"]) or {}
     action = change.get("action")
     cli = bq.client(c)
+    loc = bq.location_for(cs.get("target_region"))   # statements on the target run in its region
 
     if action == "SET_CLUSTERING":
         table = cli.get_table(_table_ref(cs))
@@ -96,15 +97,15 @@ def apply(c: Config, cs: dict) -> dict:
         archive_uri = change.get("archive_uri") or f"gs://{bucket_name}/{ds_id}/{tbl_id}/*.parquet"
 
         # 1. Create a zero-copy clone backup first for safety
-        bq.execute(c, f"CREATE OR REPLACE TABLE {backup_fqn} CLONE {target_fqn}")
+        bq.execute(c, f"CREATE OR REPLACE TABLE {backup_fqn} CLONE {target_fqn}", location=loc)
 
         # 2. Export table data to Cloud Storage Parquet
         export_sql = f"EXPORT DATA OPTIONS(uri='{archive_uri}', format='PARQUET') AS SELECT * FROM {target_fqn}"
-        bq.execute(c, export_sql)
+        bq.execute(c, export_sql, location=loc)
 
         # 3. If action is ARCHIVE_AND_DROP_TABLE, drop the original table
         if action == "ARCHIVE_AND_DROP_TABLE":
-            bq.execute(c, f"DROP TABLE {target_fqn}")
+            bq.execute(c, f"DROP TABLE {target_fqn}", location=loc)
 
         return {
             "action": action,
@@ -117,7 +118,7 @@ def apply(c: Config, cs: dict) -> dict:
         ds = cli.get_dataset(f"{cs['target_project']}.{cs['target_dataset']}")
         prior = getattr(ds, "max_time_travel_hours", 168)
         hours = int(change.get("hours", 48))
-        bq.execute(c, f"ALTER SCHEMA `{cs['target_project']}.{cs['target_dataset']}` SET OPTIONS(max_time_travel_hours = {hours});")
+        bq.execute(c, f"ALTER SCHEMA `{cs['target_project']}.{cs['target_dataset']}` SET OPTIONS(max_time_travel_hours = {hours});", location=loc)
         return {"action": action, "prior_hours": prior, "note": f"Time-travel window reduced to {hours}h."}
 
     if action == "ENABLE_ADAPTIVE_OPTIMIZATION":
@@ -127,7 +128,7 @@ def apply(c: Config, cs: dict) -> dict:
 
     if action == "ADD_PK_FK_CONSTRAINT":
         ddl = change.get("generated_ddl") or f"ALTER TABLE `{_table_ref(cs)}` ADD PRIMARY KEY (id) NOT ENFORCED;"
-        bq.execute(c, ddl)
+        bq.execute(c, ddl, location=loc)
         return {"action": action, "applied_ddl": ddl, "note": "Unenforced constraint added for join elimination."}
 
     if action == "PAUSE_SCHEDULED_QUERY":
@@ -150,6 +151,7 @@ def rollback(c: Config, cs: dict) -> None:
     plan = bq.loads(cs.get("rollback_plan_json")) or {}
     action = plan.get("action")
     cli = bq.client(c)
+    loc = bq.location_for(cs.get("target_region"))
     if action == "SET_CLUSTERING":
         table = cli.get_table(_table_ref(cs))
         table.clustering_fields = plan.get("prior_clustering") or None
@@ -168,7 +170,7 @@ def rollback(c: Config, cs: dict) -> None:
         if plan.get("dropped") and plan.get("backup_table"):
             target_fqn = f"`{_table_ref(cs)}`"
             backup_fqn = f"`{plan['backup_table']}`"
-            bq.execute(c, f"CREATE OR REPLACE TABLE {target_fqn} CLONE {backup_fqn}")
+            bq.execute(c, f"CREATE OR REPLACE TABLE {target_fqn} CLONE {backup_fqn}", location=loc)
     elif action == "APPLY_HUMAN_COST_GUARDRAIL":
         return
 

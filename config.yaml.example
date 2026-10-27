@@ -1,8 +1,17 @@
 # Copy to config.yaml and edit. All components read this via optimizer/config.py.
 project_id: "my-analytics-project"        # project holding optimizer_ops + workload
 ops_dataset: "optimizer_ops"
-regions: ["us"]                            # every region holding your data
-location: "US"                             # ops dataset location
+location: "US"                             # ops dataset location ("home" — collected directly)
+
+# Which BigQuery locations to collect. "auto" (recommended) discovers every location that holds
+# a dataset with Cloud Asset Inventory on each run; other locations are fetched there and merged
+# into the master tables here (optimizer/remote_collector.py). Or give a fixed list: ["us", "us-east4"].
+# auto needs the Cloud Asset API + roles/cloudasset.viewer on asset_scope for the collector SA.
+regions: auto
+asset_scope: null                          # e.g. "organizations/123456789012" (null = this project only)
+regions_include: []                        # always visit, e.g. ["us-east4"]
+regions_exclude: []                        # never visit, e.g. ["europe-west2"]
+region_alert_days: 7                       # how long a newly discovered region is flagged in the UI
 
 # Scope: JOBS (this project) or JOBS_BY_ORGANIZATION (needs org perms)
 jobs_view: "JOBS"

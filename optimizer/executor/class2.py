@@ -12,9 +12,10 @@ from ..config import Config
 def apply(c: Config, cs: dict) -> dict:
     change = bq.loads(cs["proposed_change_json"]) or {}
     action = change.get("action")
+    loc = bq.location_for(cs.get("target_region"))   # DDL on the target runs in its region
     if action == "CREATE_MATERIALIZED_VIEW":
         ddl = change.get("ddl") or change.get("generated_ddl")
-        bq.execute(c, ddl)
+        bq.execute(c, ddl, location=loc)
         bq.execute(c, f"""
             INSERT INTO `{c.ops}.cost_watchdogs`
               (change_set_id, kind, target, monthly_limit_usd, created_at)
@@ -25,7 +26,7 @@ def apply(c: Config, cs: dict) -> dict:
 
     if action == "CREATE_SEARCH_INDEX":
         ddl = change.get("generated_ddl") or f"CREATE SEARCH INDEX ON {change.get('target')}(ALL COLUMNS);"
-        bq.execute(c, ddl)
+        bq.execute(c, ddl, location=loc)
         bq.execute(c, f"""
             INSERT INTO `{c.ops}.cost_watchdogs`
               (change_set_id, kind, target, monthly_limit_usd, created_at)
@@ -40,4 +41,4 @@ def apply(c: Config, cs: dict) -> dict:
 def rollback(c: Config, cs: dict) -> None:
     plan = bq.loads(cs.get("rollback_plan_json")) or {}
     if plan.get("rollback"):
-        bq.execute(c, plan["rollback"])
+        bq.execute(c, plan["rollback"], location=bq.location_for(cs.get("target_region")))

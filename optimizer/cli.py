@@ -53,15 +53,47 @@ def cmd_init(c) -> None:
     print("✅ Control plane schema initialized successfully!")
 
 
+def _print_route(route: list[str], info: dict, home: str) -> None:
+    mode = "auto-discovered" if info.get("mode") == "auto" else "from config"
+    print(f"[*] Regions ({mode}, source: {info.get('source')}): {', '.join(route) or '(none)'}")
+    for reg, d in sorted((info.get("discovered") or {}).items()):
+        flag = "" if reg in route else "  (excluded)"
+        print(f"    - {reg:<14} {d.get('datasets', 0):>4} datasets in {d.get('projects', 0)} project(s)"
+              f"{'  [home]' if reg == home else ''}{flag}")
+    if info.get("error"):
+        print(f"  ! region discovery failed, using last known regions: {info['error'][:200]}")
+    if info.get("new_regions"):
+        print(f"  🆕 NEW REGION(S) DETECTED: {', '.join(info['new_regions'])}")
+
+
+def cmd_regions(c, record_result: bool = True) -> list[str]:
+    """Show (and record) which regions the collector would visit this run."""
+    from . import regions
+    route, info = regions.plan_route(c, run_id="regions-cli", record_result=record_result)
+    print(f"[*] Discovery scope: {info['scope']}  |  home location: {regions.home_region(c)}")
+    _print_route(route, info, regions.home_region(c))
+    if not record_result:
+        print("  (dry run: optimizer_ops.regions_seen not updated)")
+    return route
+
+
 def cmd_collect(c) -> None:
     print(f"[*] Running BigQuery metadata & query collector on project: {c['project_id']}...")
     import re
+    import uuid
+    from . import regions, remote_collector
+    run_id = str(uuid.uuid4())
+    # Which regions to visit: config list, or `regions: auto` -> Cloud Asset Inventory discovery.
+    route, route_info = regions.plan_route(c, run_id=run_id)
+    home = regions.home_region(c)
+    _print_route(route, route_info, home)
+    local = [r for r in route if r == home]      # collector SQL writes straight into optimizer_ops
+    remote = [r for r in route if r != home]     # other locations: query there, load + MERGE here
     with open("sql/02_collector_run.sql") as f:
         sql = f.read()
-    if c.get("regions"):
-        regions_list = [f"'{r}'" for r in c["regions"]]
-        sql = re.sub(r"DECLARE regions\s+ARRAY<STRING>\s+DEFAULT\s+\[[^\]]*\];",
-                     f"DECLARE regions               ARRAY<STRING> DEFAULT [{', '.join(regions_list)}];", sql)
+    regions_list = [f"'{r}'" for r in local]
+    sql = re.sub(r"DECLARE regions\s+ARRAY<STRING>\s+DEFAULT\s+\[[^\]]*\];",
+                 f"DECLARE regions               ARRAY<STRING> DEFAULT [{', '.join(regions_list)}];", sql)
     if c.get("jobs_view"):
         sql = re.sub(r"DECLARE jobs_view\s+STRING\s+DEFAULT\s+'[^']*';",
                      f"DECLARE jobs_view             STRING DEFAULT '{c['jobs_view']}';", sql)
@@ -86,7 +118,13 @@ def cmd_collect(c) -> None:
     sql = re.sub(r"DECLARE lookback_days\s+INT64\s+DEFAULT\s+[^;]+;",
                  f"DECLARE lookback_days         INT64  DEFAULT {effective_days};", sql)
     bq.client(c).query(sql).result()
-    print(f"  + Executed SQL collector: sql/02_collector_run.sql (lookback={effective_days}d)")
+    print(f"  + Executed SQL collector: sql/02_collector_run.sql for {', '.join(local) or 'no home region'} "
+          f"(lookback={effective_days}d)")
+    for reg in remote:
+        print(f"[*] Collecting remote region {reg} (query there -> load + MERGE into {c.ops})...")
+        res = remote_collector.collect_region(c, reg, run_id)
+        for step, n in res.items():
+            print(f"    {step:<18} {n}")
     target_ds = c.get("target_dataset")
     if target_ds:
         print(f"[*] Filtering telemetry tables to target dataset: {target_ds}...")
@@ -338,7 +376,7 @@ def cmd_rollback(c, change_set_id: str, reason: str = "Manual 1-Click Rollback v
 def main() -> None:
     p = argparse.ArgumentParser(prog="bq-optimizer", description="BigQuery Optimization Control Plane CLI")
     p.add_argument("command", choices=["init", "collect", "collector", "collect-backfill", "rules", "execute",
-                                       "verify", "sync-recommender", "rollback", "pipeline"],
+                                       "verify", "sync-recommender", "rollback", "pipeline", "regions"],
                    help="Command to run")
     p.add_argument("--id", help="change_set_id (for rollback)")
     p.add_argument("--reason", default="Manual 1-Click Rollback via CLI", help="Rollback audit reason note")
@@ -359,6 +397,12 @@ def main() -> None:
     p.add_argument("--lookback-days", type=int, help="Telemetry lookback window in days (e.g. 3, 7, 14, 30)")
     p.add_argument("--reservation-admin-project",
                    help="Reservation admin project for slot/capacity telemetry")
+    p.add_argument("--regions",
+                   help="Regions to collect: 'auto' (discover with Cloud Asset Inventory) or a comma list, e.g. us,us-east4")
+    p.add_argument("--asset-scope",
+                   help="Region discovery scope, e.g. organizations/123456789 (default: this project)")
+    p.add_argument("--no-record", action="store_true",
+                   help="regions command: show the route without updating optimizer_ops.regions_seen")
     
     a = p.parse_args()
     
@@ -379,6 +423,11 @@ def main() -> None:
         overrides["lookback_days"] = a.lookback_days
     if a.reservation_admin_project:
         overrides["reservation_admin_project"] = a.reservation_admin_project
+    if a.regions:
+        raw = a.regions.strip()
+        overrides["regions"] = "auto" if raw.lower() == "auto" else [r.strip() for r in raw.split(",") if r.strip()]
+    if a.asset_scope:
+        overrides["asset_scope"] = a.asset_scope
         
     c = cfg(path=a.config, **overrides)
     
@@ -404,6 +453,8 @@ def main() -> None:
                          snooze_days=getattr(a, "snooze_days", 90))
         elif a.command == "pipeline":
             cmd_pipeline(c)
+        elif a.command == "regions":
+            cmd_regions(c, record_result=not a.no_record)
     except Exception as e:
         err_msg = str(e)
         if "404 Not found: Dataset" in err_msg or "optimizer_ops was not found" in err_msg:

@@ -310,3 +310,23 @@ CREATE TABLE IF NOT EXISTS optimizer_ops.service_account_owners (
   updated_at            TIMESTAMP
 );
 
+
+-- -----------------------------------------------------------------------------
+-- Regions the collector visits (written by optimizer/regions.py)
+-- -----------------------------------------------------------------------------
+-- With `regions: auto`, every collector run asks Cloud Asset Inventory which
+-- locations hold BigQuery datasets and upserts one row per location here.
+-- is_new_alert marks a region first seen after a baseline existed, so the review
+-- UI can flag "new region detected" (e.g. a dataset created where no reservation
+-- exists). included = on the route of the last run.
+CREATE TABLE IF NOT EXISTS optimizer_ops.regions_seen (
+  region         STRING NOT NULL,   -- lowercase location, e.g. 'us', 'us-east4'
+  first_seen_at  TIMESTAMP,
+  last_seen_at   TIMESTAMP,
+  dataset_count  INT64,
+  project_count  INT64,
+  included       BOOL,
+  source         STRING,            -- 'asset_inventory' | 'config'
+  is_new_alert   BOOL,
+  run_id         STRING
+);

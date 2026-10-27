@@ -25,7 +25,7 @@ except ModuleNotFoundError:
             os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
     raise
 
-from optimizer import bq, governance, pricing, schema_guard, store, verifier  # noqa: E402
+from optimizer import bq, governance, pricing, regions, schema_guard, store, verifier  # noqa: E402
 from optimizer.config import cfg  # noqa: E402
 from optimizer.executor import recommender_sync  # noqa: E402
 
@@ -220,20 +220,29 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             except Exception:
                 return []
 
+    def _regions_info() -> dict:
+        try:
+            return regions.dashboard_info(c)
+        except Exception:
+            return {}
+
     try:
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             f_cs = pool.submit(bq.query, c, all_cs_sql)
             f_dir = pool.submit(_dir_rows)
             f_spend = pool.submit(_compute_spend_30d, c)
+            f_regions = pool.submit(_regions_info)
             raw_rows = f_cs.result()
             dir_rows = f_dir.result()
             compute_spend = f_spend.result()
+            regions_info = f_regions.result()
     except Exception:
         from optimizer import cli
         cli.cmd_init(c)
         raw_rows = bq.query(c, all_cs_sql)
         dir_rows = _dir_rows()
         compute_spend = _compute_spend_30d(c)
+        regions_info = _regions_info()
 
     now_utc = _dt.datetime.now(_dt.timezone.utc)
 
@@ -411,6 +420,8 @@ def _fetch_dashboard_data_uncached(c) -> dict:
         reviewer_email=_default_reviewer(),
         # Actual spend the savings come out of; the headline is capped at it.
         spend_ceilings={pricing.COMPUTE: compute_spend},
+        # Which BigQuery locations the collector visits (auto-discovered or from config).
+        regions=regions_info,
     )
     data.update(_summaries(c, data))
     return data
