@@ -22,7 +22,7 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 | Path | What it is |
 |---|---|
 | `sql/01_ops_schema.sql` | Ops dataset + telemetry tables + pricing config + **employee hierarchy** |
-| `sql/02_collector_run.sql` | Daily collector (paste into a scheduled query) |
+| `sql/02_collector_run.sql` | Daily collector for the home location (a scheduled query covers one location; `python -m optimizer.cli collect` also visits every other region) |
 | `sql/03_derived_views.sql` | Views the rules engine reads + **executive spend rollup (`v_spend_by_director`) & director recommendations (`v_director_recommendations`)** |
 | `sql/04_change_sets.sql` | Recommendation store, rule accuracy, watchdogs, queue views |
 | `optimizer/rules.py` | 14 infra & billing rules (including `W-01` Option 1 vs Option 2 Reservation Sizing, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, and **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** |

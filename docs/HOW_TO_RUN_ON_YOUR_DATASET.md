@@ -140,8 +140,15 @@ Edit [config.yaml](file:///usr/local/google/home/temiomisore/My-Jetski-Folder/Je
 ```yaml
 project_id: "your-gcp-project-id"
 ops_dataset: "optimizer_ops"
-location: "US"
-regions: ["us"]
+location: "US"                         # home location: where optimizer_ops lives
+
+# Which BigQuery locations to collect: "auto" finds every location that holds a dataset
+# (Cloud Asset Inventory: needs the Cloud Asset API + roles/cloudasset.viewer on asset_scope),
+# or a fixed list such as ["us", "us-east4"]. The home location is always collected.
+regions: auto
+asset_scope: "organizations/123456789012"   # where "auto" looks (null = this project only)
+regions_include: []                    # always visit, e.g. ["us-east4"]
+regions_exclude: []                    # never visit
 
 # Telemetry Scope:
 # Set to JOBS_BY_ORGANIZATION to collect query telemetry across all projects in your GCP Org:
@@ -230,6 +237,7 @@ Extract metadata and recent query history:
 1. Queries `INFORMATION_SCHEMA.JOBS` (or `JOBS_BY_ORGANIZATION` when `--org` is active) for the query executions, bytes scanned, and slot milliseconds.
 2. Snapshots table sizes and column data types from `INFORMATION_SCHEMA.TABLES` and `INFORMATION_SCHEMA.COLUMNS`.
 3. Checks Cloud Storage / BigQuery billing models (Physical vs. Logical).
+4. Repeats steps 1–2 for every other BigQuery location on the route (`regions: auto` discovers them with Cloud Asset Inventory): each region is queried in place, and the rows are loaded and merged into the same `optimizer_ops` tables, tagged with `region`. Preview the route first with `./run.sh regions --no-record`.
 
 > [!TIP]
 > **What if your dataset was just created or had no queries recently?**

@@ -145,9 +145,12 @@ python3 -m optimizer.cli collect
 *What this does:*
 1. Runs `sql/02_collector_run.sql` against BigQuery `INFORMATION_SCHEMA` to populate query traces into `optimizer_ops.jobs_events`.
 2. Calls the Datasets API to backfill storage billing models and Transfer Configs.
+3. Visits every other BigQuery location on the route (`regions: auto` discovers them with Cloud Asset Inventory): each region's `INFORMATION_SCHEMA` is queried in that region, and the rows are loaded and merged into the same `optimizer_ops` tables. Preview the route with `python3 -m optimizer.cli regions --no-record` (see the README section *Multi-region collection and automatic region discovery*).
 
-#### Option B: Automated Daily Scheduled Query (Production)
-In customer production environments, schedule `sql/02_collector_run.sql` as a BigQuery Scheduled Query running nightly at 2:00 AM.
+#### Option B: Automated Nightly Collector (Production)
+In customer production environments, run `python3 -m optimizer.cli collect` nightly (for example at 2:00 AM) as a Cloud Run job triggered by Cloud Scheduler, like the other workers in `terraform/main.tf` (add `collect = { args = ["-m", "optimizer.cli", "collect"], schedule = "0 2 * * *" }` to `locals.jobs`).
+
+> **Why not a BigQuery Scheduled Query?** A scheduled query runs in a single location, so scheduling `sql/02_collector_run.sql` directly only collects the home location (where `optimizer_ops` lives). That's fine only if all of your datasets are in one location.
 
 > **Note:** The `rules` command reads telemetry that is **already stored** in `optimizer_ops`. Running `collect` ensures your query and table logs are fresh before evaluating rules!
 
