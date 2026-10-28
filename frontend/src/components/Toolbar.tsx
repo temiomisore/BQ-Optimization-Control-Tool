@@ -44,7 +44,7 @@ export function Toolbar({
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
           <input
             className="input pl-9"
-            placeholder="Search tables, datasets, rules, SQL, IDs…"
+            placeholder="Search tables, datasets, regions, rules, SQL, IDs…"
             value={f.q}
             onChange={(e) => setF({ q: e.target.value })}
           />

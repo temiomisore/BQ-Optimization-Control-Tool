@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { AlertTriangle, Inbox, Landmark, Lock, RefreshCw } from "lucide-react";
 import { fetchDashboard, type ChangeSet, type Dashboard } from "@/lib/api";
 import { ReviewerProvider, useReviewer } from "@/lib/store";
-import { cn, fullPath, needsTwo } from "@/lib/utils";
+import { cn, fullPath, needsTwo, regionName, regionOf } from "@/lib/utils";
 import { Header } from "@/components/Header";
 import { KpiCards, type TabKey } from "@/components/KpiCards";
 import { AnalyticsStrip } from "@/components/AnalyticsStrip";
@@ -35,6 +35,7 @@ function applyFilters(cards: ChangeSet[], f: Filters) {
       const hay = [
         fullPath(c), c.change_set_id, (c.rule_ids || []).join(" "), c.finding_summary,
         c.director_name, c.department, c.evidence?.current_sql, c.evidence?.proposed_sql, c.proposed?.generated_ddl,
+        regionOf(c), regionName(regionOf(c)),
       ].join(" ").toLowerCase();
       if (!hay.includes(q)) return false;
     }
@@ -107,7 +108,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           </div>
         )}
 
-        {data && <RegressedBanner cards={data.regressed_cards} />}
+        {data && <RegressedBanner cards={data.regressed_cards} regions={data.regions} />}
 
         {data && <RegionsBar info={data.regions} />}
 
@@ -189,6 +190,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
                         index={i}
                         selected={c.change_set_id === selectedId}
                         compact={!!selected}
+                        regions={data.regions}
                         onClick={() => setSelectedId(c.change_set_id === selectedId ? null : c.change_set_id)}
                       />
                     ))}
@@ -206,10 +208,10 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           </>
         )}
 
-        {data && tab === "handoffs" && <HandoffList cards={data.handoff_cards || []} />}
+        {data && tab === "handoffs" && <HandoffList cards={data.handoff_cards || []} regions={data.regions} />}
         {data && tab === "blocked" && <BlockedList cards={data.blocked_cards} data={data} />}
-        {data && tab === "regressed" && <RegressedList cards={data.regressed_cards} />}
-        {data && tab === "rolled_back" && <RolledBackList cards={data.rolled_back_cards} />}
+        {data && tab === "regressed" && <RegressedList cards={data.regressed_cards} regions={data.regions} />}
+        {data && tab === "rolled_back" && <RolledBackList cards={data.rolled_back_cards} regions={data.regions} />}
         {data && tab === "receipts" && <ReceiptsTable receipts={data.receipts} />}
       </main>
 

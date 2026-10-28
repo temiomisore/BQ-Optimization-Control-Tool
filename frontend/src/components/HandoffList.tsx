@@ -1,14 +1,15 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { ChevronDown, GitBranch, GitMerge, GitPullRequest, FileCode2 } from "lucide-react";
-import type { ChangeSet } from "@/lib/api";
+import type { ChangeSet, RegionsInfo } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import { ago, cn, fmtDate, targetLabel, usd } from "@/lib/utils";
 import { Badge, Button, Dialog, Empty } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
+import { RegionBadge } from "./RegionBadge";
 
 /** Class 4 SQL rewrites handed off for code review (state PR_HANDED_OFF). */
-export function HandoffList({ cards }: { cards: ChangeSet[] }) {
+export function HandoffList({ cards, regions }: { cards: ChangeSet[]; regions?: RegionsInfo }) {
   const decide = useDecide();
   const [open, setOpen] = useState<string | null>(cards[0]?.change_set_id ?? null);
   const [merge, setMerge] = useState<ChangeSet | null>(null);
@@ -50,6 +51,7 @@ export function HandoffList({ cards }: { cards: ChangeSet[] }) {
               <GitPullRequest className="h-4 w-4 text-violet-400" />
               <span className="font-medium">{targetLabel(c)}</span>
               <span className="font-mono text-xs text-zinc-500">{(c.rule_ids || []).join(", ")}</span>
+              <RegionBadge c={c} info={regions} />
               <Badge className="text-violet-600 ring-violet-500/30 dark:text-violet-300">Awaiting PR merge</Badge>
               {h.handed_off_at && <span className="text-xs text-zinc-500">handed off {ago(h.handed_off_at)}</span>}
               <span className="ml-auto font-mono text-emerald-500 dark:text-emerald-400">{usd(c.net_monthly_value_usd)}/mo</span>

@@ -11,6 +11,7 @@ import {
 import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
 import { Rich, StateCompare } from "./StateCompare";
+import { RegionBadge } from "./RegionBadge";
 
 const num = (v: unknown) => Number(v || 0);
 
@@ -176,6 +177,7 @@ export function CardDetail({
           <div className="flex flex-wrap items-center gap-1.5">
             <Badge className={cn(meta.color, meta.ring)}>{meta.label}</Badge>
             {(c.rule_ids || []).map((r) => <Badge key={r} className="font-mono">{r}</Badge>)}
+            <RegionBadge c={c} info={data.regions} withName />
             <Badge>{titleize(c.state || "")}</Badge>
             {two && <Badge className="text-amber-300 ring-amber-500/30">2-person</Badge>}
             {c.governance_scope === "FINOPS" && (

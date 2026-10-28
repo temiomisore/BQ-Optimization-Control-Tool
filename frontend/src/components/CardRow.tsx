@@ -1,7 +1,8 @@
 import { motion } from "framer-motion";
 import { Users } from "lucide-react";
-import type { ChangeSet } from "@/lib/api";
+import type { ChangeSet, RegionsInfo } from "@/lib/api";
 import { Badge, Meter } from "./ui";
+import { RegionBadge } from "./RegionBadge";
 import { cn, CLASS_META, needsTwo, targetLabel, usd } from "@/lib/utils";
 
 export function CardRow({
@@ -10,12 +11,15 @@ export function CardRow({
   selected,
   compact,
   onClick,
+  regions,
 }: {
   c: ChangeSet;
   index: number;
   selected: boolean;
   compact: boolean;
   onClick: () => void;
+  /** Regions strip data: colors the region badge (home / other / newly detected). */
+  regions?: RegionsInfo;
 }) {
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const partial = (c.approvals || []).length > 0;
@@ -44,6 +48,7 @@ export function CardRow({
             {(c.rule_ids || []).slice(0, 2).map((r) => (
               <Badge key={r} className="font-mono">{r}</Badge>
             ))}
+            <RegionBadge c={c} info={regions} />
             {needsTwo(c) && (
               <Badge className={partial ? "bg-amber-500/10 text-amber-300 ring-amber-500/30" : ""} title="Two-person approval">
                 <Users className="h-3 w-3" /> {partial ? "1/2 signed" : "2-person"}

@@ -54,6 +54,38 @@ export function fullPath(c: ChangeSet) {
   return `${c.target_project}.${c.target_dataset}${t}`;
 }
 
+/** A card's BigQuery region (change_sets.target_region), written like the regions strip:
+ *  "US" → "us", "region-us-east4" → "us-east4". Null when the card has no region. */
+export function regionOf(c: Pick<ChangeSet, "target_region">): string | null {
+  const r = String(c.target_region ?? "").trim().toLowerCase().replace(/^region-/, "");
+  return r && r !== "none" && r !== "null" ? r : null;
+}
+
+/** Plain-English names for common BigQuery locations (tooltips, detail panel, search). */
+const REGION_NAMES: Record<string, string> = {
+  us: "US multi-region",
+  eu: "EU multi-region",
+  "us-central1": "Iowa",
+  "us-east1": "South Carolina",
+  "us-east4": "Northern Virginia",
+  "us-east5": "Columbus",
+  "us-south1": "Dallas",
+  "us-west1": "Oregon",
+  "us-west2": "Los Angeles",
+  "us-west3": "Salt Lake City",
+  "us-west4": "Las Vegas",
+  "northamerica-northeast1": "Montréal",
+  "northamerica-northeast2": "Toronto",
+  "europe-west1": "Belgium",
+  "europe-west2": "London",
+  "europe-west3": "Frankfurt",
+  "europe-west4": "Netherlands",
+  "asia-northeast1": "Tokyo",
+  "asia-southeast1": "Singapore",
+  "australia-southeast1": "Sydney",
+};
+export const regionName = (r?: string | null) => (r && REGION_NAMES[r]) || "";
+
 export const isW01 = (c: ChangeSet) => (c.rule_ids || []).includes("W-01") || c.proposed?.action === "CAPACITY_PRICING_MIGRATION";
 export const isW02 = (c: ChangeSet) => (c.rule_ids || []).includes("W-02");
 export const needsTwo = (c: ChangeSet) => c.apply_class === 3 || (c.risk_notes || []).includes("REQUIRES_TWO_PERSON_APPROVAL");

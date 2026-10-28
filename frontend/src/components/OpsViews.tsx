@@ -1,10 +1,11 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { AlertOctagon, ChevronDown, Lock, RotateCcw, ShieldAlert, Undo2 } from "lucide-react";
-import type { ChangeSet, Dashboard, Receipt } from "@/lib/api";
+import type { ChangeSet, Dashboard, Receipt, RegionsInfo } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import { CLASS_META, cn, fmtDate, targetLabel, titleize, usd } from "@/lib/utils";
 import { Badge, Button, Dialog, Empty } from "./ui";
+import { RegionBadge } from "./RegionBadge";
 import { CfoProofReceipt, SimulateDay14Banner, simFor, useDemoDay14 } from "./DemoProofReceipt";
 
 const ROLLBACKABLE = ["APPLIED", "VERIFYING", "VERIFIED", "REGRESSED", "ROLLING_BACK"];
@@ -61,7 +62,7 @@ const rowAnim = (i: number) => ({
 });
 
 /* ------------------------------------------------------ regression banner */
-export function RegressedBanner({ cards }: { cards: ChangeSet[] }) {
+export function RegressedBanner({ cards, regions }: { cards: ChangeSet[]; regions?: RegionsInfo }) {
   const [target, setTarget] = useState<null | { id: string; label: string; w01: boolean; category?: string }>(null);
   if (!cards.length) return null;
   return (
@@ -76,7 +77,8 @@ export function RegressedBanner({ cards }: { cards: ChangeSet[] }) {
           <AlertOctagon className="h-5 w-5 shrink-0 animate-pulse text-rose-400" />
           <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold text-rose-200">
-              Regression detected · {targetLabel(c)} <span className="font-mono text-xs text-rose-300/70">{(c.rule_ids || []).join(", ")}</span>
+              Regression detected · {targetLabel(c)} <span className="font-mono text-xs text-rose-300/70">{(c.rule_ids || []).join(", ")}</span>{" "}
+              <RegionBadge c={c} info={regions} />
             </div>
             <div className="text-xs text-rose-200/80">{c.regression_message}</div>
           </div>
@@ -107,6 +109,7 @@ export function BlockedList({ cards, data }: { cards: ChangeSet[]; data: Dashboa
             <Badge className={cn(CLASS_META[c.apply_class]?.color, CLASS_META[c.apply_class]?.ring)}>{CLASS_META[c.apply_class]?.short}</Badge>
             <span className="font-medium">{targetLabel(c)}</span>
             <span className="font-mono text-xs text-zinc-500">{(c.rule_ids || []).join(", ")}</span>
+            <RegionBadge c={c} info={data.regions} />
             <span className="ml-auto font-mono text-emerald-400">{usd(c.net_monthly_value_usd)}/mo</span>
           </div>
           <div className="flex gap-2 rounded-lg bg-amber-500/10 p-3 text-xs text-amber-200">
@@ -142,13 +145,13 @@ export function BlockedList({ cards, data }: { cards: ChangeSet[]; data: Dashboa
 }
 
 /* ------------------------------------------------------ regressed list tab */
-export function RegressedList({ cards }: { cards: ChangeSet[] }) {
+export function RegressedList({ cards, regions }: { cards: ChangeSet[]; regions?: RegionsInfo }) {
   if (!cards.length) return <Empty icon={<AlertOctagon className="h-5 w-5" />} title="No regressions" hint="Every applied change is performing within tolerance." />;
-  return <RegressedBanner cards={cards} />;
+  return <RegressedBanner cards={cards} regions={regions} />;
 }
 
 /* --------------------------------------------------- rolled back list */
-export function RolledBackList({ cards }: { cards: ChangeSet[] }) {
+export function RolledBackList({ cards, regions }: { cards: ChangeSet[]; regions?: RegionsInfo }) {
   const decide = useDecide();
   const [open, setOpen] = useState<string | null>(null);
   if (!cards.length) return <Empty icon={<Undo2 className="h-5 w-5" />} title="No rollbacks" hint="Nothing has been reverted yet." />;
@@ -162,6 +165,7 @@ export function RolledBackList({ cards }: { cards: ChangeSet[] }) {
               <Undo2 className="h-4 w-4 text-zinc-500" />
               <span className="font-medium">{targetLabel(c)}</span>
               <span className="font-mono text-xs text-zinc-500">{(c.rule_ids || []).join(", ")}</span>
+              <RegionBadge c={c} info={regions} />
               {c.snooze_until && <Badge>snoozed until {fmtDate(c.snooze_until)}</Badge>}
               <ChevronDown className={cn("ml-auto h-4 w-4 text-zinc-500 transition-transform", isOpen && "rotate-180")} />
             </button>
