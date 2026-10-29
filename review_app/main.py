@@ -26,7 +26,11 @@ except ModuleNotFoundError:
     raise
 
 from optimizer import bq, governance, pricing, regions, schema_guard, store, verifier  # noqa: E402
+from optimizer import config as _config, settings_catalog, settings_store  # noqa: E402
 from optimizer.config import cfg  # noqa: E402
+
+# Values saved on the Settings page sit between config.yaml and env vars (optimizer/settings_store.py).
+_config.use_ui_settings(settings_store.provider)
 from optimizer.executor import recommender_sync  # noqa: E402
 
 app = Flask(__name__)
@@ -693,15 +697,196 @@ def _check_command() -> str:
     return "gcloud run jobs execute <your-nightly-job> --args=-m,optimizer.cli,check --wait"
 
 
+def _settings_context(principal: str | None):
+    """(config, saved values, access) for the person making this request."""
+    c = cfg()
+    try:
+        saved = settings_store.current(c)
+        eds = settings_store.editors(c)
+    except Exception as e:  # noqa: BLE001
+        print(f"[settings] could not read saved settings: {e}")
+        saved, eds = {}, []
+    access = settings_catalog.access_for(_identity(c, principal), c, eds)
+    return c, saved, access
+
+
 @app.get("/api/settings")
 def api_settings():
     from flask import jsonify
-    from optimizer import settings_catalog
-    c = cfg()
-    data = settings_catalog.explain(c)
+    c, saved, access = _settings_context(request.args.get("principal"))
+    data = settings_catalog.explain(c, saved=saved, access=access)
     data["yaml"] = settings_catalog.to_yaml(data)
     data["check_command"] = _check_command()
-    return jsonify(data)
+    data["access"] = access
+    return jsonify(_jsonable(data))
+
+
+def _settings_denied(msg: str):
+    from flask import jsonify
+    return jsonify({"ok": False, "error": msg, "code": "SETTINGS_PERMISSION_REQUIRED"}), 403
+
+
+def _settings_bad(msg: str):
+    from flask import jsonify
+    return jsonify({"ok": False, "error": msg}), 400
+
+
+def _live_check(c, key: str, value) -> str | None:
+    """Checks that need BigQuery: the table exists and the owner lookups still compile."""
+    from google.api_core.exceptions import NotFound
+    from optimizer import attribution
+    s = settings_catalog.BY_KEY[key]
+    if s["kind"] == "table" and value:
+        try:
+            bq.client(c).get_table(value)
+        except NotFound:
+            return f"Table {value} doesn't exist, or this app's account can't see it."
+        except Exception as e:  # noqa: BLE001
+            return f"Can't read {value}: {str(e).splitlines()[0][:200]}"
+    if key in settings_catalog.OWNER_KEYS:
+        cand = copy.deepcopy(dict(c))
+        _config._set_dotted(cand, key, value)
+        try:
+            attribution.source_view_sql(cand)
+        except attribution.AttributionConfigError as e:
+            return str(e)
+    return None
+
+
+def _after_settings_change(key: str) -> str | None:
+    """Apply what can be applied right away. Returns a warning if a step failed."""
+    settings_store.invalidate()
+    invalidate_dashboard_cache()
+    with _SETUP_LOCK:
+        _SETUP_CACHE["data"] = None
+    if key in settings_catalog.OWNER_KEYS:
+        from optimizer import attribution
+        try:
+            for stmt in attribution.source_view_sql(cfg()):
+                bq.execute(cfg(), stmt)
+        except Exception as e:  # noqa: BLE001
+            return f"Saved, but the owner lookups couldn't be rebuilt yet: {str(e).splitlines()[0][:200]}"
+    return None
+
+
+def _apply_setting(c, saved: dict, access: dict, key: str, action: str, value, note: str | None,
+                   undo_of: str | None = None):
+    from flask import jsonify
+    s = settings_catalog.BY_KEY[key]
+    before = settings_catalog._effective(s, c)
+    had = key in saved
+    prev_override = saved[key]["value"] if had else None
+    if action == "RESET" and not had:
+        return _settings_bad("Nothing is saved in the app for this setting.")
+    if action == "SET":
+        try:
+            value = settings_catalog.validate(key, value, c)
+        except ValueError as e:
+            return _settings_bad(str(e))
+        err = _live_check(c, key, value)
+        if err:
+            return _settings_bad(err)
+    note = note or (f"Undo of change {undo_of[:8]}" if undo_of else None)
+    change_id = settings_store.record(c, key, action, value, access["email"], note,
+                                      previous_value=before, previous_override=prev_override,
+                                      had_override=had)
+    warning = _after_settings_change(key)
+    return jsonify({"ok": True, "change_id": change_id, "key": key, "action": action,
+                    "applies": settings_catalog.APPLIES.get(s["applies"], ""), "warning": warning})
+
+
+@app.post("/api/settings")
+def api_settings_save():
+    """Save (action=set) or clear (action=reset: back to config.yaml / default) one setting."""
+    body = request.get_json(silent=True) or {}
+    key = str(body.get("key") or "")
+    s = settings_catalog.BY_KEY.get(key)
+    if s is None:
+        return _settings_bad(f"Unknown setting {key!r}.")
+    c, saved, access = _settings_context(body.get("principal"))
+    ok, why = settings_catalog.can_edit(s, access)
+    if not ok:
+        return _settings_denied(why or "Not allowed.")
+    action = "RESET" if str(body.get("action") or "set").lower() == "reset" else "SET"
+    return _apply_setting(c, saved, access, key, action, body.get("value"), body.get("note"))
+
+
+@app.post("/api/settings/revert")
+def api_settings_revert():
+    """Undo one change: put the setting (or the editors list) back the way it was before it."""
+    from flask import jsonify
+    body = request.get_json(silent=True) or {}
+    c, saved, access = _settings_context(body.get("principal"))
+    change = settings_store.get_change(c, str(body.get("change_id") or ""))
+    if not change:
+        return jsonify({"ok": False, "error": "Change not found."}), 404
+    action, value = settings_store.undo_plan(change)
+    if change["key"] == settings_store.EDITORS_KEY:
+        if not access["is_admin"]:
+            return _settings_denied("Only settings admins can change the editors list.")
+        had = change["key"] in saved
+        settings_store.record(c, change["key"], action, value, access["email"],
+                              f"Undo of change {change['change_id'][:8]}",
+                              previous_value=settings_store.editors(c),
+                              previous_override=saved.get(change["key"], {}).get("value"), had_override=had)
+        _after_settings_change(change["key"])
+        return jsonify({"ok": True, "key": change["key"], "action": action})
+    s = settings_catalog.BY_KEY.get(change["key"])
+    if s is None:
+        return _settings_bad("That setting no longer exists.")
+    ok, why = settings_catalog.can_edit(s, access)
+    if not ok:
+        return _settings_denied(why or "Not allowed.")
+    if action == "RESET" and change["key"] not in saved:
+        return _settings_bad("Already back to the config.yaml value.")
+    return _apply_setting(c, saved, access, change["key"], action, value, None, undo_of=change["change_id"])
+
+
+@app.get("/api/settings/history")
+def api_settings_history():
+    from flask import jsonify
+    c = cfg()
+    key = request.args.get("key") or None
+    try:
+        limit = max(1, min(int(request.args.get("limit") or 50), 500))
+    except ValueError:
+        limit = 50
+    return jsonify(_jsonable({"changes": settings_store.history(c, key=key, limit=limit)}))
+
+
+@app.post("/api/settings/editors")
+def api_settings_editors():
+    """Settings admins add or remove settings editors."""
+    from flask import jsonify
+    import re as _re
+    body = request.get_json(silent=True) or {}
+    c, saved, access = _settings_context(body.get("principal"))
+    if not access["is_admin"]:
+        return _settings_denied("Only settings admins can add or remove editors.")
+    email = str(body.get("email") or "").strip().lower()
+    if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return _settings_bad("Enter an email address.")
+    current = list(access["editors"])
+    action = str(body.get("action") or "add").lower()
+    if action == "add":
+        if email in access["admins"]:
+            return _settings_bad(f"{email} is already a settings admin.")
+        if email in current:
+            return _settings_bad(f"{email} is already an editor.")
+        new = sorted(set(current) | {email})
+    elif action == "remove":
+        if email not in current:
+            return _settings_bad(f"{email} isn't an editor.")
+        new = sorted(set(current) - {email})
+    else:
+        return _settings_bad("action must be add or remove.")
+    key = settings_store.EDITORS_KEY
+    note = body.get("note") or f"{'Added' if action == 'add' else 'Removed'} editor {email}"
+    change_id = settings_store.record(c, key, "SET", new, access["email"], note, previous_value=current,
+                                      previous_override=saved.get(key, {}).get("value"),
+                                      had_override=key in saved)
+    _after_settings_change(key)
+    return jsonify({"ok": True, "change_id": change_id, "editors": new})
 
 
 @app.get("/api/setup-check")

@@ -140,9 +140,27 @@ Open the review UI's **Settings** button (or `<app-url>/#settings`):
   shows the exact `gcloud` / `GRANT` / `ALTER` command that fixes it.
 - **All settings**: every setting the tool reads (`optimizer/settings_catalog.py`), grouped into
   Startup, Everyday and Safety switches, with its current value, where the value comes from
-  (default, `config.yaml` or an environment variable) and a plain-English description.
+  (default, `config.yaml`, saved in the app or an environment variable) and a plain-English description.
   **Download config.yaml** exports a commented file with the values in use (secrets left out).
-  Read-only for now.
+
+**Editing everyday settings** (click ✏️ next to a value): changes are validated (ranges, real
+regions, tables that exist, owner-column mappings that compile) and saved to
+`optimizer_ops.settings_changes`, one row per change, so every change has who / when / why and
+an **Undo**. Precedence: built-in default < `config.yaml` < saved in the app < environment variable
+(env-pinned values show a lock). The app uses a change right away; the nightly job picks it up on its
+next run (`optimizer.cli` reads saved values at start).
+
+Who may edit:
+
+| Role | Set by | Can change |
+|---|---|---|
+| Settings admin | `governance.settings_admins` in config.yaml (or `BQOPT_SETTINGS_ADMINS`), deploy-time only | everyday settings, verification thresholds, and the editors list |
+| Settings editor | added on the Settings page by an admin | everyday settings (regions, scope, history windows, lookup tables, engines) |
+| + FinOps approver | `governance.finops_approvers` | the savings-math settings (minimum card value, realization, caps, weights) |
+
+Startup settings and safety switches (approvers, executor flags, identity) are never editable in the
+UI. Permissions are only as strong as the sign-in: in production set `trust_client_identity: false`
+and put the app behind Identity-Aware Proxy (`iap_audience`), so every change is signed by a real login.
 
 Run the same checks from a terminal or as another account (exit code 1 when something blocks the tool):
 

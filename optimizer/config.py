@@ -6,8 +6,9 @@ source of truth for projects, thresholds, and feature flags.
 """
 from __future__ import annotations
 
+import copy
 import os
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -51,6 +52,9 @@ _DEFAULTS: dict[str, Any] = {
         # Cloud Run + IAP: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
         # Load balancer:   "/projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID"
         "iap_audience": None,
+        # Who may change settings from the review UI's Settings page and add / remove editors.
+        # Deploy-time only (never editable in the UI). Env BQOPT_SETTINGS_ADMINS adds emails.
+        "settings_admins": [],
     },
     "executor": {
         "enable_class1": True,
@@ -99,13 +103,32 @@ class Config(dict):
         return f"{self['project_id']}.{self['ops_dataset']}"
 
 
-def cfg(path: str | None = None, **overrides: Any) -> Config:
-    path = path or os.environ.get("BQOPT_CONFIG", "config.yaml")
-    user = {}
-    if os.path.exists(path):
-        with open(path) as f:
-            user = yaml.safe_load(f) or {}
-    merged = _merge(_DEFAULTS, user)
+# Values saved from the review UI's Settings page (optimizer/settings_store.py). Entry points
+# (review app, CLI) switch this on with use_ui_settings(); plain cfg() calls (unit tests,
+# scripts) stay config.yaml + env only. Order: defaults < config.yaml < UI < env vars < kwargs.
+_UI_SETTINGS: Callable[[Config], dict] | None = None
+
+
+def use_ui_settings(provider: Callable[[Config], dict] | None) -> None:
+    """provider(config) -> {dotted.key: value} for the settings saved in the UI."""
+    global _UI_SETTINGS
+    _UI_SETTINGS = provider
+
+
+def _set_dotted(d: dict, dotted: str, value: Any) -> None:
+    parts = dotted.split(".")
+    cur = d
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        if not isinstance(nxt, dict):
+            nxt = {}
+        cur[p] = dict(nxt)
+        cur = cur[p]
+    cur[parts[-1]] = value
+
+
+def _finish(merged: dict, overrides: dict) -> dict:
+    """Environment variables, keyword overrides, project resolution and normalisation."""
     # Apply environment variable overrides if present
     if os.environ.get("BQOPT_JOBS_VIEW"):
         merged["jobs_view"] = os.environ["BQOPT_JOBS_VIEW"]
@@ -155,4 +178,23 @@ def cfg(path: str | None = None, **overrides: Any) -> Config:
         raise SystemExit("config.yaml (or --project / GOOGLE_CLOUD_PROJECT) must set project_id")
     # yaml reads risk_weights keys as ints already; normalise anyway
     merged["risk_weights"] = {int(k): float(v) for k, v in merged["risk_weights"].items()}
-    return Config(merged)
+    return merged
+
+
+def cfg(path: str | None = None, *, ui: bool = True, **overrides: Any) -> Config:
+    path = path or os.environ.get("BQOPT_CONFIG", "config.yaml")
+    user = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            user = yaml.safe_load(f) or {}
+    merged = _merge(_DEFAULTS, user)
+    if ui and _UI_SETTINGS is not None:
+        # Find this deployment's project / dataset first, then layer the UI-saved values on top
+        # of config.yaml (env vars and keyword overrides still win). Never fails config loading.
+        try:
+            saved = _UI_SETTINGS(Config(_finish(copy.deepcopy(merged), dict(overrides)))) or {}
+        except (Exception, SystemExit):
+            saved = {}
+        for key, value in saved.items():
+            _set_dotted(merged, key, copy.deepcopy(value))
+    return Config(_finish(merged, overrides))

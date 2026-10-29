@@ -330,3 +330,21 @@ CREATE TABLE IF NOT EXISTS optimizer_ops.regions_seen (
   is_new_alert   BOOL,
   run_id         STRING
 );
+
+-- ---------------------------------------------------------------------------
+-- settings_changes: values saved from the review UI's Settings page, one row per change
+-- (append-only = full history). The value in force for a key is its latest row; RESET means
+-- "back to config.yaml / the default". Also holds the settings editors list
+-- (key _access.settings_editors). Read by optimizer/settings_store.py.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS optimizer_ops.settings_changes (
+  change_id              STRING NOT NULL,
+  key                    STRING NOT NULL,
+  action                 STRING NOT NULL,   -- SET | RESET
+  value_json             STRING,
+  previous_value_json    STRING,
+  previous_override_json STRING,
+  changed_by             STRING,
+  changed_at             TIMESTAMP NOT NULL,
+  note                   STRING
+);

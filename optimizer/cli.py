@@ -423,7 +423,11 @@ def main() -> None:
                    help="regions command: show the route without updating optimizer_ops.regions_seen")
     
     a = p.parse_args()
-    
+
+    # Values saved on the review UI's Settings page apply to every command (nightly job included).
+    from . import config as _config, settings_store
+    _config.use_ui_settings(settings_store.provider)
+
     overrides = {}
     if a.project:
         overrides["project_id"] = a.project

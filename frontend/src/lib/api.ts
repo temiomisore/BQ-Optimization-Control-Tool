@@ -264,8 +264,32 @@ export interface SettingItem {
   secret?: boolean;
   value: unknown;
   default: unknown;
-  /** "default" | "config.yaml" | "env BQOPT_X" | "config.yaml + env X" | "gcloud default project" */
+  /** "default" | "config.yaml" | "saved in the app" | "env BQOPT_X" | "config.yaml + env X" | "gcloud default project" */
   source: string;
+  /** Who may edit: editor | finops | admin | locked */
+  edit: "editor" | "finops" | "admin" | "locked";
+  kind: string;
+  nullable?: boolean;
+  min?: number | null;
+  max?: number | null;
+  choices?: string[] | null;
+  applies?: string;
+  applies_text?: string;
+  editable_by_you?: boolean;
+  locked_reason?: string | null;
+  saved?: { by?: string | null; at?: string | null; note?: string | null };
+}
+
+export interface SettingsAccess {
+  email: string;
+  source?: string;
+  verified: boolean;
+  demo_identity: boolean;
+  is_admin: boolean;
+  is_editor: boolean;
+  is_finops: boolean;
+  admins: string[];
+  editors: string[];
 }
 
 export interface SettingsResponse {
@@ -276,6 +300,19 @@ export interface SettingsResponse {
   /** Commented config.yaml with the values in use now (secrets left out). */
   yaml: string;
   check_command: string;
+  access?: SettingsAccess;
+}
+
+export interface SettingChange {
+  change_id: string;
+  key: string;
+  action: "SET" | "RESET";
+  value: unknown;
+  previous_value: unknown;
+  had_previous_override: boolean;
+  changed_by?: string | null;
+  changed_at?: string | null;
+  note?: string | null;
 }
 
 export type CheckStatus = "ok" | "warn" | "fail" | "info" | "skip";
@@ -305,8 +342,30 @@ export interface SetupCheckResponse {
   check_command?: string;
 }
 
-export async function fetchSettings(): Promise<SettingsResponse> {
-  return asJson<SettingsResponse>(await fetch("/api/settings", { headers: { Accept: "application/json" } }));
+export async function fetchSettings(principal?: string): Promise<SettingsResponse> {
+  const qs = principal ? `?principal=${encodeURIComponent(principal)}` : "";
+  return asJson<SettingsResponse>(await fetch(`/api/settings${qs}`, { headers: { Accept: "application/json" } }));
+}
+
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  return asJson<T>(
+    await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  );
+}
+
+export interface SaveSettingResult { ok: true; change_id: string; key: string; action: string; applies: string; warning?: string | null }
+
+export const saveSetting = (b: { key: string; value?: unknown; action?: "set" | "reset"; note?: string; principal?: string }) =>
+  postJson<SaveSettingResult>("/api/settings", b);
+
+export const revertSettingChange = (b: { change_id: string; principal?: string }) =>
+  postJson<SaveSettingResult>("/api/settings/revert", b);
+
+export const updateSettingsEditors = (b: { action: "add" | "remove"; email: string; note?: string; principal?: string }) =>
+  postJson<{ ok: true; editors: string[] }>("/api/settings/editors", b);
+
+export async function fetchSettingsHistory(limit = 50): Promise<{ changes: SettingChange[] }> {
+  return asJson(await fetch(`/api/settings/history?limit=${limit}`, { headers: { Accept: "application/json" } }));
 }
 
 export async function fetchSetupCheck(refresh = false): Promise<SetupCheckResponse> {

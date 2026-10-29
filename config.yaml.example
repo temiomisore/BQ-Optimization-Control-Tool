@@ -67,6 +67,10 @@ governance:
   # Cloud Run + IAP: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
   # Load balancer:   "/projects/PROJECT_NUMBER/global/backendServices/BACKEND_SERVICE_ID"
   iap_audience: null
+  # Settings page (review UI): who can change everyday settings and add / remove settings editors.
+  # Deploy-time only, so nobody can make themselves an admin from the UI; editors are added in the UI.
+  # Env BQOPT_SETTINGS_ADMINS adds more. Example: [data-platform-lead@example.com]
+  settings_admins: []
 
 # Executor
 executor:

@@ -1,19 +1,26 @@
 """Settings catalog: every setting the tool reads, in one list, in plain English.
 
-Powers the review UI's Settings page (`GET /api/settings`) and its "copy config.yaml" export.
-tests/test_settings.py keeps it complete: every default in optimizer/config.py and every
-BQOPT_* environment variable must be listed here, so this is the single list of parameters.
+Powers the review UI's Settings page (`GET /api/settings`), its "Download config.yaml" export
+and Phase 2 editing (`POST /api/settings`). tests/test_settings.py keeps it complete: every
+default in optimizer/config.py and every BQOPT_* environment variable must be listed here.
 
-Buckets (Phase 1 shows all of them read-only):
-  startup   needed before the tool can read anything; set when deploying
-  everyday  regions, scope, ownership tables, thresholds; safe to tune
-  safety    who can approve and what the tool may change on its own; deploy-time on purpose
+Buckets:
+  startup   needed before the tool can read anything; set when deploying (never editable in the UI)
+  everyday  regions, scope, ownership tables, thresholds; editable in the UI by the right people
+  safety    who can approve and what the tool may change on its own; deploy-time only on purpose
+
+Who may edit an everyday setting (`edit`):
+  editor   settings editors (added by a settings admin in the UI) and settings admins
+  finops   editors / admins who are also FinOps approvers: these change the savings numbers
+  admin    settings admins only (governance.settings_admins, set at deploy time)
+  locked   nobody in the UI (startup + safety switches)
 """
 from __future__ import annotations
 
 import datetime as dt
 import os
-from typing import Any
+import re
+from typing import Any, Mapping
 
 import yaml
 
@@ -23,18 +30,32 @@ BUCKETS = [
     {"id": "startup", "title": "Startup",
      "summary": "Set once when the tool is deployed. The tool needs these to find everything else."},
     {"id": "everyday", "title": "Everyday settings",
-     "summary": "Regions, scope, ownership tables and thresholds. Safe to tune."},
+     "summary": "Regions, scope, ownership tables and thresholds. Editable here by settings editors."},
     {"id": "safety", "title": "Safety switches",
-     "summary": "Who can approve and what the tool may change on its own. Deliberately kept out of the UI."},
+     "summary": "Who can approve or edit, and what the tool may change on its own. Deliberately deploy-time only."},
 ]
+
+APPLIES = {
+    "now": "Right away",
+    "owners": "Right away (owner lookups are rebuilt)",
+    "collect": "At the next collector run (nightly)",
+    "rules": "At the next rules run (nightly)",
+    "verify": "At the next verification run",
+    "deploy": "At the next deploy",
+}
 
 _UNSET = object()
 
 
 def _s(key: str, label: str, bucket: str, group: str, desc: str, *, env: str | None = None,
-       default: Any = _UNSET, secret: bool = False) -> dict:
-    return {"key": key, "label": label, "bucket": bucket, "group": group, "desc": desc,
-            "env": env, "default": default, "secret": secret}
+       default: Any = _UNSET, secret: bool = False, edit: str = "locked", kind: str = "text",
+       nullable: bool = False, min: float | None = None, max: float | None = None,
+       choices: list[str] | None = None, applies: str = "deploy") -> dict:
+    if bucket != "everyday":
+        edit = "locked"
+    return {"key": key, "label": label, "bucket": bucket, "group": group, "desc": desc, "env": env,
+            "default": default, "secret": secret, "edit": edit, "kind": kind, "nullable": nullable,
+            "min": min, "max": max, "choices": choices, "applies": applies}
 
 
 SETTINGS: list[dict] = [
@@ -51,108 +72,144 @@ SETTINGS: list[dict] = [
     # ----------------------------------------------------------------- everyday
     _s("regions", "Regions to collect", "everyday", "Regions",
        '"auto" finds every location that holds a BigQuery dataset (Cloud Asset Inventory) on each '
-       'run. Or a fixed list, e.g. ["us", "us-east4"].', env="BQOPT_REGIONS"),
+       'run. Or a fixed list, e.g. us, us-east4.', env="BQOPT_REGIONS",
+       edit="editor", kind="regions_mode", applies="collect"),
     _s("asset_scope", "Discovery scope", "everyday", "Regions",
        'Where "auto" looks: organizations/ID (recommended), folders/ID or projects/ID. '
-       "Not set = this project only.", env="BQOPT_ASSET_SCOPE"),
+       "Not set = this project only.", env="BQOPT_ASSET_SCOPE",
+       edit="editor", kind="scope", nullable=True, applies="collect"),
     _s("regions_include", "Always collect", "everyday", "Regions",
-       "Regions to collect even if no datasets are found there."),
-    _s("regions_exclude", "Never collect", "everyday", "Regions", "Regions to skip."),
+       "Regions to collect even if no datasets are found there.",
+       edit="editor", kind="region_list", applies="collect"),
+    _s("regions_exclude", "Never collect", "everyday", "Regions", "Regions to skip.",
+       edit="editor", kind="region_list", applies="collect"),
     _s("region_alert_days", "New-region alert (days)", "everyday", "Regions",
-       "How long a newly found region stays flagged in the UI."),
+       "How long a newly found region stays flagged in the UI.",
+       edit="editor", kind="int", min=1, max=90, applies="now"),
 
     _s("jobs_view", "Query history scope", "everyday", "Query history",
        "JOBS = this project only. JOBS_BY_ORGANIZATION = every project in the organization "
-       "(needs an org-level role; BigQuery leaves query text out of that view).", env="BQOPT_JOBS_VIEW"),
+       "(needs an org-level role; BigQuery leaves query text out of that view).", env="BQOPT_JOBS_VIEW",
+       edit="editor", kind="enum", choices=["JOBS", "JOBS_BY_ORGANIZATION"], applies="collect"),
     _s("recs_view", "Google recommendations view", "everyday", "Query history",
-       "RECOMMENDATIONS (this project) or RECOMMENDATIONS_BY_ORGANIZATION.", default="RECOMMENDATIONS"),
+       "RECOMMENDATIONS (this project) or RECOMMENDATIONS_BY_ORGANIZATION.", default="RECOMMENDATIONS",
+       edit="editor", kind="enum", choices=["RECOMMENDATIONS", "RECOMMENDATIONS_BY_ORGANIZATION"],
+       applies="collect"),
     _s("initial_backfill_days", "First run reads (days)", "everyday", "Query history",
-       "How far back the first collection reads. BigQuery keeps 180 days of job history.", default=180),
+       "How far back the first collection reads. BigQuery keeps 180 days of job history.", default=180,
+       edit="editor", kind="int", min=1, max=180, applies="collect"),
     _s("incremental_lookback_days", "Daily overlap (days)", "everyday", "Query history",
-       "Each daily run re-reads this many days so late-finishing jobs aren't missed.", default=3),
+       "Each daily run re-reads this many days so late-finishing jobs aren't missed.", default=3,
+       edit="editor", kind="int", min=1, max=30, applies="collect"),
     _s("remote_fetch_chunk_hours", "Remote fetch window (hours)", "everyday", "Query history",
-       "Size of each fetch for non-home regions. Bigger = fewer queries, larger loads.", default=24),
+       "Size of each fetch for non-home regions. Bigger = fewer queries, larger loads.", default=24,
+       edit="editor", kind="int", min=1, max=4380, applies="collect"),
     _s("target_dataset", "Only this dataset", "everyday", "Query history",
        "Optional: collect and analyze a single dataset. Not set = every dataset.",
-       env="BQOPT_TARGET_DATASET", default=None),
+       env="BQOPT_TARGET_DATASET", default=None,
+       edit="editor", kind="dataset", nullable=True, applies="collect"),
 
     _s("reservation_admin_project", "Reservation admin project", "everyday", "Ownership & billing",
        "Project that owns your slot reservations. Reservation jobs are priced at their edition's "
-       "slot rate (Enterprise list price if not set).", env="BQOPT_RESERVATION_ADMIN_PROJECT"),
+       "slot rate (Enterprise list price if not set).", env="BQOPT_RESERVATION_ADMIN_PROJECT",
+       edit="editor", kind="project", nullable=True, applies="collect"),
     _s("employee_hierarchy_table", "HR hierarchy table", "everyday", "Ownership & billing",
-       "Employee -> manager -> director table, for card owners and spend by director. "
-       "Not set = optimizer_ops.employee_hierarchy.", env="BQOPT_EMPLOYEE_HIERARCHY_TABLE"),
+       "Employee -> manager -> director table (project.dataset.table), for card owners and spend by "
+       "director. Not set = optimizer_ops.employee_hierarchy.", env="BQOPT_EMPLOYEE_HIERARCHY_TABLE",
+       edit="editor", kind="table", nullable=True, applies="owners"),
     _s("employee_hierarchy_columns", "HR table column names", "everyday", "Ownership & billing",
-       "Your column names, when they differ from ours (e.g. user_email: email)."),
+       "Your column names, when they differ from ours: one per line, e.g. user_email: email.",
+       edit="editor", kind="map", applies="owners"),
     _s("service_account_owner_table", "Service-account owner table", "everyday", "Ownership & billing",
-       "Maps service accounts (Power BI, ETL ...) to the person accountable for their spend.",
-       env="BQOPT_SERVICE_ACCOUNT_OWNER_TABLE"),
+       "Maps service accounts (Power BI, ETL ...) to the person accountable for their spend "
+       "(project.dataset.table).", env="BQOPT_SERVICE_ACCOUNT_OWNER_TABLE",
+       edit="editor", kind="table", nullable=True, applies="owners"),
     _s("service_account_owner_columns", "Owner table column names", "everyday", "Ownership & billing",
-       "Your column names, when they differ from ours (service_account is required)."),
+       "Your column names: service_account and owner are required, one per line.",
+       edit="editor", kind="map", applies="owners"),
     _s("billing_export_table", "Billing export table", "everyday", "Ownership & billing",
-       "Optional: your Cloud Billing export table.", env="BQOPT_BILLING_EXPORT_TABLE"),
+       "Optional: your Cloud Billing export table (project.dataset.table).", env="BQOPT_BILLING_EXPORT_TABLE",
+       edit="editor", kind="table", nullable=True, applies="rules"),
     _s("default_owner", "Fallback owner", "everyday", "Ownership & billing",
        "Owner used when a card's owner can't be found. Not set = data-platform-admin@<project>.",
-       default=None),
-    _s("iac_managed_datasets", "Datasets managed in code", "everyday", "Ownership & billing",
-       "Datasets owned by Terraform, dbt etc. Changes to them become pull requests, never direct changes.",
-       default=[]),
-    _s("iac_codeowner", "Reviewer for those pull requests", "everyday", "Ownership & billing",
-       "Who reviews pull requests for datasets managed in code.", default=None),
+       default=None, edit="editor", kind="email", nullable=True, applies="rules"),
 
     _s("min_card_net_monthly_usd", "Minimum card value ($/month)", "everyday", "Savings math",
        "Fixes worth less than this per month, after running costs, never become cards. "
-       "0 = never queue a fix that loses money."),
+       "0 = never queue a fix that loses money.",
+       edit="finops", kind="float", min=0, max=100000, applies="rules"),
     _s("pricing.reservation_savings_realization", "Reservation savings that become cash", "everyday",
        "Savings math", "Share (0-1) of slot-time savings that turns into cash. 1.0 = autoscale slots "
-       "you stop paying for; lower it when most capacity is committed baseline."),
+       "you stop paying for; lower it when most capacity is committed baseline.",
+       edit="finops", kind="float", min=0, max=1, applies="rules"),
     _s("pricing.w01_min_on_demand_tib_30d", "Editions card threshold (TiB / 30 days)", "everyday",
        "Savings math", "Only suggest moving a project to slot billing (W-01) when it scans at least "
-       "this much on-demand in 30 days.", default=100.0),
+       "this much on-demand in 30 days.", default=100.0,
+       edit="finops", kind="float", min=0, max=1000000, applies="rules"),
     _s("amortization_months", "Spread one-time costs over (months)", "everyday", "Savings math",
-       "One-time costs of a fix (e.g. a rebuild) are divided over this many months in its net value."),
+       "One-time costs of a fix (e.g. a rebuild) are divided over this many months in its net value.",
+       edit="finops", kind="int", min=1, max=60, applies="rules"),
     _s("native_cap_scan_reduction", "Cap on Google's own estimates", "everyday", "Savings math",
-       "Google recommender savings are capped at this share of the table's real spend.", default=0.68),
+       "Google recommender savings are capped at this share (0-1) of the table's real spend.", default=0.68,
+       edit="finops", kind="float", min=0, max=1, applies="rules"),
     _s("risk_weights", "Risk weight by class", "everyday", "Savings math",
-       "A card's ranking score is divided by its class's weight (riskier classes rank lower)."),
-    _s("approval_ttl_days", "Approvals expire after (days)", "everyday", "Savings math",
-       "An approved change not applied within this many days needs approval again."),
-    _s("evidence_stale_days", "Evidence expires after (days)", "everyday", "Savings math",
-       "Cards whose evidence is older than this are expired."),
-    _s("max_bytes_billed_per_query", "Byte cap on the tool's own queries", "everyday", "Savings math",
-       "Optional cost guardrail for every query the tool runs. Not set = no cap.", default=None),
+       "A card's ranking score is divided by its class's weight (riskier classes rank lower). "
+       "One per line: class: weight, for classes 1-4.",
+       edit="finops", kind="weights", applies="rules"),
+
+    _s("evidence_stale_days", "Evidence expires after (days)", "everyday", "Cards & queries",
+       "Cards whose evidence is older than this are expired.",
+       edit="editor", kind="int", min=1, max=365, applies="rules"),
+    _s("max_bytes_billed_per_query", "Byte cap on the tool's own queries", "everyday", "Cards & queries",
+       "Optional cost guardrail for every query the tool runs. Not set = no cap. "
+       "Keep it above about 10 GB so collection still works.", default=None,
+       edit="editor", kind="int", nullable=True, min=10485760, max=10 ** 15, applies="now"),
 
     _s("verify_window_days", "Verify savings after (days)", "everyday", "Verification",
-       "How long after a change the tool measures real savings and writes the receipt."),
+       "How long after a change the tool measures real savings and writes the receipt.",
+       edit="admin", kind="int", min=0, max=90, applies="verify"),
     _s("regression_pct", "Regression threshold (%)", "everyday", "Verification",
-       "A query family counts as regressed when it scans this much more than before."),
+       "A query family counts as regressed when it scans this much more than before.",
+       edit="admin", kind="float", min=1, max=1000, applies="verify"),
     _s("min_family_execs", "Minimum runs per query family", "everyday", "Verification",
-       "Query families with fewer runs are ignored when checking for regressions."),
+       "Query families with fewer runs are ignored when checking for regressions.",
+       edit="admin", kind="int", min=1, max=100000, applies="verify"),
     _s("min_regressed_families", "Regressed families to flag a change", "everyday", "Verification",
-       "How many regressed query families mark a change as REGRESSED."),
+       "How many regressed query families mark a change as REGRESSED.",
+       edit="admin", kind="int", min=1, max=1000, applies="verify"),
 
     _s("ai_judge.enabled", "Gemini SQL judge", "everyday", "Detection engines",
        "Use Gemini to review expensive SQL for anti-patterns (each finding is validated with a dry run).",
-       default=True),
+       default=True, edit="editor", kind="bool", applies="rules"),
     _s("ai_judge.model", "Gemini model", "everyday", "Detection engines",
-       "Model used by the SQL judge.", default="gemini-3-flash-preview"),
+       "Model used by the SQL judge.", default="gemini-3-flash-preview",
+       edit="editor", kind="model", applies="rules"),
     _s("antipattern_tool.enabled", "Google anti-pattern analyzer", "everyday", "Detection engines",
-       "Run Google's open-source BigQuery anti-pattern recognizer on expensive queries.", default=True),
+       "Run Google's open-source BigQuery anti-pattern recognizer on expensive queries.", default=True,
+       edit="editor", kind="bool", applies="rules"),
     _s("antipattern_tool.top_expensive_queries_limit", "Queries analyzed per run", "everyday",
-       "Detection engines", "How many of the most expensive queries the SQL engines look at.", default=100),
+       "Detection engines", "How many of the most expensive queries the SQL engines look at.", default=100,
+       edit="editor", kind="int", min=1, max=1000, applies="rules"),
     _s("antipattern_tool.expensive_query_cost_usd", "Expensive query threshold ($)", "everyday",
-       "Detection engines", "Only queries costing at least this much are analyzed.", default=5.0),
+       "Detection engines", "Only queries costing at least this much are analyzed.", default=5.0,
+       edit="editor", kind="float", min=0, max=100000, applies="rules"),
 
     # ------------------------------------------------------------------- safety
-    _s("governance.finops_approvers", "FinOps approvers", "safety", "Who can approve",
-       "People who can see and approve billing, commitment and reservation cards. Empty = nobody.",
-       env="BQOPT_FINOPS_APPROVERS"),
-    _s("governance.finops_rule_ids", "FinOps-only rules", "safety", "Who can approve",
+    _s("governance.settings_admins", "Settings admins", "safety", "Who can approve and edit",
+       "People who can change settings on this page and add or remove settings editors. "
+       "Set at deploy time, so nobody can make themselves an admin from the UI.",
+       env="BQOPT_SETTINGS_ADMINS"),
+    _s("governance.finops_approvers", "FinOps approvers", "safety", "Who can approve and edit",
+       "People who can see and approve billing, commitment and reservation cards, and change the "
+       "savings-math settings. Empty = nobody.", env="BQOPT_FINOPS_APPROVERS"),
+    _s("governance.finops_rule_ids", "FinOps-only rules", "safety", "Who can approve and edit",
        "Rules whose cards only FinOps approvers can see and approve."),
+    _s("approval_ttl_days", "Approvals expire after (days)", "safety", "Who can approve and edit",
+       "An approved change not applied within this many days needs approval again."),
     _s("governance.trust_client_identity", "Trust the identity picker (demo only)", "safety",
-       "Who can approve", "Lets anyone choose who they are in the header. Keep off in production and "
-       "put the app behind Identity-Aware Proxy."),
-    _s("governance.iap_audience", "IAP audience", "safety", "Who can approve",
+       "Who can approve and edit", "Lets anyone choose who they are in the header. Keep off in production "
+       "and put the app behind Identity-Aware Proxy."),
+    _s("governance.iap_audience", "IAP audience", "safety", "Who can approve and edit",
        "When set, the app only trusts identities verified by Identity-Aware Proxy."),
     _s("executor.enable_class1", "Apply Class 1 changes", "safety", "What the tool may change",
        "In-place settings such as clustering, partition filters and expirations."),
@@ -168,6 +225,11 @@ SETTINGS: list[dict] = [
        "How long the zero-copy backup of a rebuilt table is kept for rollback."),
     _s("executor.max_structural_changes_per_table_per_days", "One rebuild per table every (days)",
        "safety", "What the tool may change", "Stops repeated rebuilds of the same table."),
+    _s("iac_managed_datasets", "Datasets managed in code", "safety", "What the tool may change",
+       "Datasets owned by Terraform, dbt etc. Changes to them become pull requests, never direct changes.",
+       default=[]),
+    _s("iac_codeowner", "Reviewer for those pull requests", "safety", "What the tool may change",
+       "Who reviews pull requests for datasets managed in code.", default=None),
     _s("demo_mode", "Demo mode (sandbox only)", "safety", "Other",
        "Shows labelled synthetic minimum savings so a tiny demo has every card type. "
        "Never turn on for a real customer."),
@@ -176,10 +238,192 @@ SETTINGS: list[dict] = [
        "(kept in Secret Manager).", env="SLACK_WEBHOOK_URL", secret=True),
 ]
 
+BY_KEY = {s["key"]: s for s in SETTINGS}
+EDITABLE_KEYS = frozenset(s["key"] for s in SETTINGS if s["edit"] != "locked")
+OWNER_KEYS = frozenset(s["key"] for s in SETTINGS if s["applies"] == "owners")
+
 # Environment variables optimizer/config.py reads, mapped to the setting they override.
 ENV_VARS = {s["env"]: s["key"] for s in SETTINGS if s["env"]}
 ENV_VARS.update({"GCP_PROJECT": "project_id"})
 
+
+# ----------------------------------------------------------------------------- access
+
+def settings_admins(c: Mapping) -> set[str]:
+    gov = c.get("governance") if isinstance(c.get("governance"), Mapping) else {}
+    out = {str(x).strip().lower() for x in (gov.get("settings_admins") or []) if str(x).strip()}
+    out |= {x.strip().lower() for x in os.environ.get("BQOPT_SETTINGS_ADMINS", "").split(",") if x.strip()}
+    return out
+
+
+def access_for(identity: Mapping | None, c: Mapping, editors: list[str] | None = None) -> dict:
+    """What this person may do on the Settings page. Mirrors the FinOps identity rules: a
+    client-picked identity counts only in demo mode, and an unidentified visitor never counts."""
+    from . import governance
+    identity = identity or {}
+    email = str(identity.get("email") or "").strip().lower()
+    src = identity.get("source")
+    demo = governance.trust_client_identity(c)
+    trusted = bool(email) and not (src in (governance.SOURCE_CLIENT, governance.SOURCE_PLACEHOLDER) and not demo)
+    admins = settings_admins(c)
+    eds = sorted({str(e).strip().lower() for e in (editors or []) if str(e).strip()})
+    is_admin = trusted and email in admins
+    is_editor = is_admin or (trusted and email in eds)
+    return {"email": email, "source": src, "verified": src == governance.SOURCE_IAP,
+            "demo_identity": demo and src != governance.SOURCE_IAP,
+            "is_admin": is_admin, "is_editor": is_editor,
+            "is_finops": governance.is_finops_viewer(identity, c),
+            "admins": sorted(admins), "editors": eds}
+
+
+def can_edit(s: Mapping, access: Mapping) -> tuple[bool, str | None]:
+    """(allowed, reason when not allowed) for one setting."""
+    if s["edit"] == "locked":
+        return False, ("Startup setting: set when the tool is deployed." if s["bucket"] == "startup"
+                       else "Safety switch: changed only at deploy time, on purpose.")
+    if s.get("env") and os.environ.get(s["env"]):
+        return False, f"Pinned by the deployment's {s['env']} environment variable."
+    if s["edit"] == "admin" and not access.get("is_admin"):
+        return False, "Only settings admins can change this."
+    if s["edit"] == "finops" and not (access.get("is_editor") and access.get("is_finops")):
+        return False, "Changes the savings numbers: only settings editors who are FinOps approvers."
+    if s["edit"] == "editor" and not access.get("is_editor"):
+        return False, "Only settings editors can change this."
+    return True, None
+
+
+# ----------------------------------------------------------------------------- validation
+
+_SCOPE_RE = re.compile(r"^(organizations|folders|projects)/[A-Za-z0-9_.:\-]+$")
+_TABLE_RE = re.compile(r"^[A-Za-z0-9_.:\-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_\-$]+$")
+_PROJECT_RE = re.compile(r"^[a-z][-a-z0-9:.]{4,62}[a-z0-9]$")
+_DATASET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,99}$")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _as_list(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        v = re.split(r"[,\s]+", v)
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+def _as_map(v: Any) -> dict:
+    if isinstance(v, str):
+        v = yaml.safe_load(v) if v.strip() else {}
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise ValueError("Use one 'name: value' pair per line.")
+    return v
+
+
+def _regions(values: list[str]) -> list[str]:
+    from .regions import normalize
+    out: list[str] = []
+    for v in values:
+        n = normalize(v)
+        if not n:
+            raise ValueError(f"'{v}' isn't a BigQuery location (e.g. us, eu, us-east4).")
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def validate(key: str, raw: Any, c: Mapping | None = None) -> Any:
+    """Normalized value for an everyday setting, or ValueError with a plain-English reason."""
+    s = BY_KEY.get(key)
+    if s is None:
+        raise ValueError(f"Unknown setting {key!r}.")
+    if s["edit"] == "locked":
+        raise ValueError("This setting can only be changed at deploy time.")
+    kind = s["kind"]
+    if kind in ("region_list",):
+        vals = _regions(_as_list(raw))
+        if key == "regions_exclude" and c is not None:
+            from .regions import home_region
+            if home_region(c) in vals:
+                raise ValueError(f"You can't skip the home location ({home_region(c)}): the tool's own "
+                                 "dataset lives there.")
+        return vals
+    if kind == "regions_mode":
+        if isinstance(raw, str) and raw.strip().lower() == "auto":
+            return "auto"
+        vals = _regions(_as_list(raw))
+        if not vals:
+            raise ValueError('Use "auto" or list at least one region.')
+        return vals
+    if kind in ("map", "weights"):
+        m = _as_map(raw)
+        if kind == "weights":
+            try:
+                w = {int(k): float(v) for k, v in m.items()}
+            except (TypeError, ValueError):
+                raise ValueError("Use one 'class: weight' pair per line, e.g. 1: 1.0") from None
+            if sorted(w) != [1, 2, 3, 4] or any(x <= 0 for x in w.values()):
+                raise ValueError("Give a positive weight for each class 1, 2, 3 and 4.")
+            return {str(k): v for k, v in sorted(w.items())}
+        out = {}
+        for k, v in m.items():
+            if not _IDENT_RE.match(str(k)) or (v is not None and not _IDENT_RE.match(str(v))):
+                raise ValueError(f"'{k}: {v}' isn't a valid column mapping (letters, digits, underscores).")
+            out[str(k)] = None if v is None else str(v)
+        return out
+    if _blank(raw):
+        if s["nullable"]:
+            return None
+        raise ValueError("A value is required.")
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        t = str(raw).strip().lower()
+        if t in ("true", "on", "yes", "1"):
+            return True
+        if t in ("false", "off", "no", "0"):
+            return False
+        raise ValueError("Use On or Off.")
+    if kind in ("int", "float"):
+        try:
+            num = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError("Enter a number.") from None
+        if kind == "int":
+            if num != int(num):
+                raise ValueError("Enter a whole number.")
+            num = int(num)
+        if s["min"] is not None and num < s["min"]:
+            raise ValueError(f"Must be at least {s['min']:g}.")
+        if s["max"] is not None and num > s["max"]:
+            raise ValueError(f"Must be at most {s['max']:g}.")
+        return num
+    text = str(raw).strip()
+    if kind == "enum":
+        t = text.upper()
+        if t not in (s["choices"] or []):
+            raise ValueError("Choose one of: " + ", ".join(s["choices"] or []) + ".")
+        return t
+    checks = {"scope": (_SCOPE_RE, "Use organizations/ID, folders/ID or projects/ID."),
+              "table": (_TABLE_RE, "Use the full name project.dataset.table."),
+              "project": (_PROJECT_RE, "That doesn't look like a project ID."),
+              "dataset": (_DATASET_RE, "That doesn't look like a dataset name."),
+              "email": (_EMAIL_RE, "Enter an email address."),
+              "model": (_MODEL_RE, "That doesn't look like a model name.")}
+    if kind in checks:
+        rx, msg = checks[kind]
+        if not rx.match(text.strip("`")):
+            raise ValueError(msg)
+        return text.strip("`")
+    return text
+
+
+# ----------------------------------------------------------------------------- explain
 
 def _dig(d: Any, dotted: str) -> Any:
     cur = d
@@ -198,7 +442,7 @@ def _jsonable(v: Any) -> Any:
     return v
 
 
-def _source(s: dict, raw: dict) -> str:
+def _source(s: dict, raw: dict, saved: Mapping) -> str:
     key, env = s["key"], s["env"]
     in_yaml = _dig(raw, key) is not _UNSET
     if key == "project_id":
@@ -213,17 +457,21 @@ def _source(s: dict, raw: dict) -> str:
         in_yaml = in_yaml or _dig(raw, "slack_webhook_url") is not _UNSET
         return "config.yaml" if in_yaml else "default"
     if env and os.environ.get(env):
-        if key == "governance.finops_approvers" and in_yaml:
-            return f"config.yaml + env {env}"     # governance.py adds the env list to the file's
+        if key in ("governance.finops_approvers", "governance.settings_admins") and in_yaml:
+            return f"config.yaml + env {env}"     # these env lists are added to the file's list
         return f"env {env}"
+    if key in saved:
+        return "saved in the app"
     return "config.yaml" if in_yaml else "default"
 
 
-def _effective(s: dict, c: dict) -> Any:
+def _effective(s: dict, c: Mapping) -> Any:
     key = s["key"]
     if key == "governance.finops_approvers":
         from .governance import finops_approvers
         return sorted(finops_approvers(c))
+    if key == "governance.settings_admins":
+        return sorted(settings_admins(c))
     if key == "slack_webhook":
         return os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url") or c.get("slack_webhook")
     v = _dig(c, key)
@@ -232,8 +480,16 @@ def _effective(s: dict, c: dict) -> Any:
     return v
 
 
-def explain(c: dict | None = None, path: str | None = None) -> dict:
-    """Every setting with its current value, default and where the value came from."""
+def file_value(key: str, path: str | None = None) -> Any:
+    """Value a setting would have without anything saved in the app (config.yaml or default)."""
+    c = cfg(path, ui=False)
+    return _jsonable(_effective(BY_KEY[key], c))
+
+
+def explain(c: Mapping | None = None, path: str | None = None, saved: Mapping | None = None,
+            access: Mapping | None = None) -> dict:
+    """Every setting with its current value, default, where the value came from and, when
+    `access` is given, whether this person may edit it."""
     path = path or os.environ.get("BQOPT_CONFIG", "config.yaml")
     raw: dict = {}
     found = os.path.exists(path)
@@ -241,6 +497,7 @@ def explain(c: dict | None = None, path: str | None = None) -> dict:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
     c = c if c is not None else cfg(path)
+    saved = saved or {}
     items = []
     for s in SETTINGS:
         value = _effective(s, c)
@@ -249,10 +506,17 @@ def explain(c: dict | None = None, path: str | None = None) -> dict:
             default = None if s["default"] is _UNSET else s["default"]
         if s["secret"]:
             value = "set (hidden)" if value else None
-        items.append({"key": s["key"], "label": s["label"], "bucket": s["bucket"], "group": s["group"],
-                      "desc": s["desc"], "env": s["env"], "secret": s["secret"],
-                      "value": _jsonable(value), "default": _jsonable(default),
-                      "source": _source(s, raw)})
+        item = {k: s[k] for k in ("key", "label", "bucket", "group", "desc", "env", "secret", "edit",
+                                  "kind", "nullable", "min", "max", "choices", "applies")}
+        item.update({"value": _jsonable(value), "default": _jsonable(default),
+                     "source": _source(s, raw, saved), "applies_text": APPLIES.get(s["applies"], "")})
+        if s["key"] in saved:
+            sv = saved[s["key"]]
+            item["saved"] = {"by": sv.get("changed_by"), "at": sv.get("changed_at"), "note": sv.get("note")}
+        if access is not None:
+            ok, why = can_edit(s, access)
+            item["editable_by_you"], item["locked_reason"] = ok, why
+        items.append(item)
     return {"config_file": os.path.basename(path), "config_file_found": found,
             "buckets": BUCKETS, "settings": items}
 
@@ -266,7 +530,8 @@ def to_yaml(explained: dict) -> str:
     """A commented config.yaml with the values the tool is using now (secrets left out)."""
     today = dt.date.today().isoformat()
     lines = [f"# bq-optimizer config.yaml, exported from the Settings page on {today}.",
-             "# Values are what the tool is using now. Secrets are not exported.", ""]
+             "# Values are what the tool is using now, including any saved in the app.",
+             "# Secrets are not exported.", ""]
     by_bucket = {b["id"]: [i for i in explained["settings"] if i["bucket"] == b["id"]] for b in BUCKETS}
     for b in BUCKETS:
         lines += [f"# ---- {b['title']}: {b['summary']}", ""]
