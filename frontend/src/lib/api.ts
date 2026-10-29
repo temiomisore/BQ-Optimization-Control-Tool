@@ -253,6 +253,68 @@ export async function fetchDashboard(principal?: string): Promise<Dashboard> {
   return asJson<Dashboard>(await fetch(`/api/dashboard${qs}`, { headers: { Accept: "application/json" } }));
 }
 
+/* ------------------------------------------------------- settings + setup check (read-only) */
+export interface SettingItem {
+  key: string;
+  label: string;
+  bucket: "startup" | "everyday" | "safety";
+  group: string;
+  desc: string;
+  env?: string | null;
+  secret?: boolean;
+  value: unknown;
+  default: unknown;
+  /** "default" | "config.yaml" | "env BQOPT_X" | "config.yaml + env X" | "gcloud default project" */
+  source: string;
+}
+
+export interface SettingsResponse {
+  config_file: string;
+  config_file_found: boolean;
+  buckets: { id: string; title: string; summary: string }[];
+  settings: SettingItem[];
+  /** Commented config.yaml with the values in use now (secrets left out). */
+  yaml: string;
+  check_command: string;
+}
+
+export type CheckStatus = "ok" | "warn" | "fail" | "info" | "skip";
+
+export interface SetupCheck {
+  id: string;
+  title: string;
+  why: string;
+  status: CheckStatus;
+  detail: string;
+  fix?: string | null;
+  region?: string | null;
+  optional?: boolean;
+}
+
+export interface SetupCheckResponse {
+  ran_at: string;
+  duration_s: number;
+  identity?: string | null;
+  project_id: string;
+  home: string;
+  route: string[];
+  mode?: string;
+  checks: SetupCheck[];
+  summary: { ok: number; warn: number; fail: number; info: number; skip: number; ready: boolean; blocking: number };
+  cached_seconds_ago?: number;
+  check_command?: string;
+}
+
+export async function fetchSettings(): Promise<SettingsResponse> {
+  return asJson<SettingsResponse>(await fetch("/api/settings", { headers: { Accept: "application/json" } }));
+}
+
+export async function fetchSetupCheck(refresh = false): Promise<SetupCheckResponse> {
+  return asJson<SetupCheckResponse>(
+    await fetch(`/api/setup-check${refresh ? "?refresh=1" : ""}`, { headers: { Accept: "application/json" } }),
+  );
+}
+
 export async function postDecision(req: DecisionRequest): Promise<{ ok: true; status: string; action: string }> {
   return asJson(
     await fetch("/api/decisions", {

@@ -236,7 +236,7 @@ def _send_webhook_notification(c: Config, event_type: str, cs: dict, detail: str
     """Sends a non-blocking Slack/Teams FinOps alert when SLACK_WEBHOOK_URL is configured."""
     import os
     import urllib.request
-    webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url")
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url") or c.get("slack_webhook")
     if not webhook_url:
         return
     try:

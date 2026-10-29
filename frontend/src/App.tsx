@@ -17,7 +17,26 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PrModal } from "@/components/PrModal";
 import { HandoffList } from "@/components/HandoffList";
 import { RegionsBar } from "@/components/RegionsBar";
+import { SettingsPage } from "@/components/SettingsPage";
 import { Button, Empty, Skeleton } from "@/components/ui";
+
+/** "#settings" opens the Settings & setup page, so it can be linked directly. */
+function useView(): ["dashboard" | "settings", (v: "dashboard" | "settings") => void] {
+  const read = () => (window.location.hash.replace("#", "") === "settings" ? "settings" : "dashboard");
+  const [view, setView] = useState<"dashboard" | "settings">(read);
+  useEffect(() => {
+    const on = () => setView(read());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  const go = (v: "dashboard" | "settings") => {
+    if (v === "settings") window.location.hash = "settings";
+    else history.replaceState(null, "", window.location.pathname + window.location.search);
+    setView(v);
+    window.scrollTo({ top: 0 });
+  };
+  return [view, go];
+}
 
 function applyFilters(cards: ChangeSet[], f: Filters) {
   const q = f.q.trim().toLowerCase();
@@ -62,6 +81,7 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
   const [assistOpen, setAssistOpen] = useState(false);
   const [analytics, setAnalytics] = useState(true);
   const [prCard, setPrCard] = useState<ChangeSet | null>(null);
+  const [view, go] = useView();
   const closeAssist = useCallback(() => setAssistOpen(false), []);
 
   // Billing / commitment / reservation / project-level cards live in their own FinOps tab.
@@ -92,9 +112,24 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
 
   return (
     <div className="min-h-screen">
-      <Header data={data} onAssist={() => setAssistOpen(true)} showAnalytics={analytics} onToggleAnalytics={() => setAnalytics((a) => !a)} />
+      <Header
+        data={data}
+        onAssist={() => setAssistOpen(true)}
+        showAnalytics={analytics}
+        onToggleAnalytics={() => setAnalytics((a) => !a)}
+        settingsOpen={view === "settings"}
+        onSettings={() => go(view === "settings" ? "dashboard" : "settings")}
+      />
 
-      <main className="mx-auto max-w-[1600px] space-y-6 px-4 pb-16 pt-6 sm:px-6">
+      {view === "settings" && (
+        <main className="mx-auto max-w-[1600px] space-y-6 px-4 pb-16 pt-6 sm:px-6">
+          <ErrorBoundary where="settings" fallback={() => <div className="text-sm text-rose-400">Settings couldn't load.</div>}>
+            <SettingsPage onBack={() => go("dashboard")} />
+          </ErrorBoundary>
+        </main>
+      )}
+
+      <main className={cn("mx-auto max-w-[1600px] space-y-6 px-4 pb-16 pt-6 sm:px-6", view === "settings" && "hidden")}>
         {error && (
           <div className="panel flex flex-wrap items-center gap-3 border-rose-500/40 p-4">
             <AlertTriangle className="h-5 w-5 text-rose-400" />

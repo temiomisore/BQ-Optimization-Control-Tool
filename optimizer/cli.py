@@ -394,7 +394,7 @@ def cmd_rollback(c, change_set_id: str, reason: str = "Manual 1-Click Rollback v
 def main() -> None:
     p = argparse.ArgumentParser(prog="bq-optimizer", description="BigQuery Optimization Control Plane CLI")
     p.add_argument("command", choices=["init", "collect", "collector", "collect-backfill", "rules", "execute",
-                                       "verify", "sync-recommender", "rollback", "pipeline", "regions"],
+                                       "verify", "sync-recommender", "rollback", "pipeline", "regions", "check"],
                    help="Command to run")
     p.add_argument("--id", help="change_set_id (for rollback)")
     p.add_argument("--reason", default="Manual 1-Click Rollback via CLI", help="Rollback audit reason note")
@@ -473,6 +473,13 @@ def main() -> None:
             cmd_pipeline(c)
         elif a.command == "regions":
             cmd_regions(c, record_result=not a.no_record)
+        elif a.command == "check":
+            # Read-only setup check: can this account collect, analyze and write? Exit 1 if not.
+            from . import setup_check
+            rep = setup_check.run_checks(c)
+            setup_check.print_report(rep)
+            if not rep["summary"]["ready"]:
+                sys.exit(1)
     except Exception as e:
         err_msg = str(e)
         if "404 Not found: Dataset" in err_msg or "optimizer_ops was not found" in err_msg:

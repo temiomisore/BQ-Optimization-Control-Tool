@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Moon, Sparkles, Sun, UserRound, BarChart3, ExternalLink, Landmark } from "lucide-react";
+import { Moon, Sparkles, Sun, UserRound, BarChart3, ExternalLink, Landmark, Settings2 } from "lucide-react";
 import type { Dashboard } from "@/lib/api";
 import { useReviewer } from "@/lib/store";
 import { Button } from "./ui";
@@ -10,11 +10,16 @@ export function Header({
   onAssist,
   showAnalytics,
   onToggleAnalytics,
+  settingsOpen = false,
+  onSettings,
 }: {
   data?: Dashboard;
   onAssist: () => void;
   showAnalytics: boolean;
   onToggleAnalytics: () => void;
+  /** Settings & setup page is showing. */
+  settingsOpen?: boolean;
+  onSettings?: () => void;
 }) {
   const { email, setReviewer } = useReviewer();
   const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
@@ -118,6 +123,17 @@ export function Header({
           >
             <BarChart3 className="h-4 w-4" /> Analytics
           </Button>
+          {onSettings && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onSettings}
+              className={cn(settingsOpen && "bg-zinc-100 dark:bg-white/5")}
+              title="Settings & setup check"
+            >
+              <Settings2 className="h-4 w-4" /> Settings
+            </Button>
+          )}
           <a href="/classic" className="hidden md:block" title="Open the classic UI">
             <Button variant="ghost" size="sm">
               <ExternalLink className="h-4 w-4" /> Classic

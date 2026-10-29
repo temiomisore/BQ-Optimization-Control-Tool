@@ -130,6 +130,27 @@ project and **`roles/cloudasset.viewer`** on `asset_scope` for the collector's s
 Fixes also run in the right place: the executor and rollback start every statement on a customer
 table in that table's `target_region`.
 
+## Settings page and setup check
+
+Open the review UI's **Settings** button (or `<app-url>/#settings`):
+
+- **Setup check**: read-only probes run as the app's service account. They cover running queries, the
+  `optimizer_ops` dataset, region discovery, and, for each region, query history, table details,
+  table sizes, Google recommendations and reservations, plus your lookup tables. Anything that fails
+  shows the exact `gcloud` / `GRANT` / `ALTER` command that fixes it.
+- **All settings**: every setting the tool reads (`optimizer/settings_catalog.py`), grouped into
+  Startup, Everyday and Safety switches, with its current value, where the value comes from
+  (default, `config.yaml` or an environment variable) and a plain-English description.
+  **Download config.yaml** exports a commented file with the values in use (secrets left out).
+  Read-only for now.
+
+Run the same checks from a terminal or as another account (exit code 1 when something blocks the tool):
+
+```bash
+python -m optimizer.cli check
+gcloud run jobs execute <your-nightly-job> --args=-m,optimizer.cli,check --wait   # as the job's account
+```
+
 ## Honest status matrix
 
 | Component | Status |

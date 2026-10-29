@@ -681,6 +681,46 @@ def _permission_denied(e: Exception):
     return jsonify({"ok": False, "error": str(e), "code": "FINOPS_PERMISSION_REQUIRED"}), 403
 
 
+# ----------------------------------------------------------------- settings + setup check
+# Read-only (Phase 1): every setting with its value and source, and live permission checks.
+_SETUP_LOCK = threading.Lock()
+_SETUP_CACHE: dict = {"ts": 0.0, "data": None}
+_SETUP_TTL_SEC = 300.0
+
+
+def _check_command() -> str:
+    """How to run the same checks as another account (e.g. the nightly job's)."""
+    return "gcloud run jobs execute <your-nightly-job> --args=-m,optimizer.cli,check --wait"
+
+
+@app.get("/api/settings")
+def api_settings():
+    from flask import jsonify
+    from optimizer import settings_catalog
+    c = cfg()
+    data = settings_catalog.explain(c)
+    data["yaml"] = settings_catalog.to_yaml(data)
+    data["check_command"] = _check_command()
+    return jsonify(data)
+
+
+@app.get("/api/setup-check")
+def api_setup_check():
+    """Runs read-only probes as this app's identity; cached 5 minutes (?refresh=1 re-runs)."""
+    from flask import jsonify
+    from optimizer import setup_check
+    refresh = request.args.get("refresh") in ("1", "true")
+    with _SETUP_LOCK:
+        fresh = _SETUP_CACHE["data"] is not None and time.time() - _SETUP_CACHE["ts"] < _SETUP_TTL_SEC
+        if refresh or not fresh:
+            _SETUP_CACHE["data"] = setup_check.run_checks(cfg())
+            _SETUP_CACHE["ts"] = time.time()
+        data = dict(_SETUP_CACHE["data"])
+    data["cached_seconds_ago"] = int(time.time() - _SETUP_CACHE["ts"])
+    data["check_command"] = _check_command()
+    return jsonify(data)
+
+
 @app.post("/api/decisions")
 def api_decisions():
     from flask import jsonify
