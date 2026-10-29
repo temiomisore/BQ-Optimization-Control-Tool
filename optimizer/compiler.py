@@ -131,6 +131,24 @@ def pending_refreshes(findings: list[Finding], open_sets: Iterable[dict],
 NON_DETERMINISTIC_SOURCES = ("GEMINI_AI_JUDGE", "GOOGLE_ANTIPATTERN_AST")
 
 
+def split_money_losing(findings: list[Finding], min_net: float = 0.0) -> tuple[list[Finding], list[str]]:
+    """Drop scored findings whose net monthly value is below `min_net` (default $0): the fix
+    would cost more to run than it saves (e.g. a materialized view refreshing for $6.50/mo to
+    save $0.01/mo). Returns (findings_to_keep, notes). $0 cards (guardrails such as
+    require_partition_filter, W-02 byte caps) are kept: they protect, they don't lose money."""
+    keep: list[Finding] = []
+    notes: list[str] = []
+    for f in findings:
+        net = float(f.get("net_monthly_value_usd") or 0)
+        if net < min_net:
+            notes.append(f"SKIPPED_MONEY_LOSING:{f.get('rule_id')}:{_tkey(f)}: net ${net:,.2f}/mo "
+                         f"(saves ${float(f.get('gross_monthly_savings_usd') or 0):,.2f}, "
+                         f"costs ${float(f.get('recurring_monthly_cost_usd') or 0):,.2f} to run)")
+            continue
+        keep.append(f)
+    return keep, notes
+
+
 def stale_legacy_cards(findings: list[Finding], legacy_pending: Iterable[dict]) -> list[dict]:
     """Unapproved cards priced by the pre-billing-aware engine (no savings_math) that this
     run did not detect again. Their old number cannot be re-priced, so the caller retires

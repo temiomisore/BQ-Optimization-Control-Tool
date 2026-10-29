@@ -62,6 +62,10 @@ _DEFAULTS: dict[str, Any] = {
         "max_structural_changes_per_table_per_days": 7,
     },
     "approval_ttl_days": 14,
+    # Never put a card in the review queue that costs more to run than it saves: the rules
+    # engine skips findings (and retires unsigned PENDING_REVIEW cards) whose net monthly value
+    # is below this. $0 guardrail cards (require_partition_filter, byte caps) are kept.
+    "min_card_net_monthly_usd": 0.0,
     "evidence_stale_days": 45,
     "verify_window_days": 14,
     "regression_pct": 15.0,

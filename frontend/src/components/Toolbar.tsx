@@ -37,6 +37,10 @@ export function Toolbar({
   const counts: Record<number, number> = {};
   for (const c of cards) counts[Number(c.apply_class || 1)] = (counts[Number(c.apply_class || 1)] || 0) + 1;
   const dirty = JSON.stringify(f) !== JSON.stringify(DEFAULT_FILTERS);
+  // Cards that cost more to run than they save. The rules engine no longer creates them, but
+  // older or approved ones can still exist: say they're hidden instead of silently dropping them.
+  const losing = cards.filter((c) => Number(c.net_monthly_value_usd || 0) < 0).length;
+  const losingHidden = losing > 0 && f.minSavings >= 0;
   return (
     <div className="panel relative z-30 flex flex-col gap-3 p-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -77,6 +81,7 @@ export function Toolbar({
           <option value="100">$100+ / mo</option>
           <option value="500">$500+ / mo</option>
           <option value="1000">$1,000+ / mo</option>
+          <option value="-Infinity">Incl. money-losing</option>
         </NativeSelect>
         <NativeSelect label="Project" value={f.project} onChange={(v) => setF({ project: v })}>
           <option value="">All projects ({data.projects.length})</option>
@@ -109,6 +114,17 @@ export function Toolbar({
         <span>
           Showing <b className="font-mono text-zinc-800 dark:text-zinc-200">{shown}</b> of{" "}
           <b className="font-mono text-zinc-800 dark:text-zinc-200">{total}</b> recommendations
+          {losingHidden && (
+            <>
+              {" · "}
+              <span title="These fixes cost more to run than they save (net value below $0 / month)">
+                {losing} money-losing card{losing === 1 ? "" : "s"} hidden
+              </span>{" "}
+              <button type="button" onClick={() => setF({ minSavings: -Infinity })} className="text-sky-500 hover:text-sky-400">
+                Show
+              </button>
+            </>
+          )}
         </span>
         {dirty && (
           <button type="button" onClick={() => setF(DEFAULT_FILTERS)} className="flex items-center gap-1 text-sky-500 hover:text-sky-400">

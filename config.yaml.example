@@ -79,6 +79,7 @@ executor:
 
 # Approvals
 approval_ttl_days: 14
+min_card_net_monthly_usd: 0               # skip / retire unsigned cards that cost more to run than they save
 evidence_stale_days: 45
 
 # Verification

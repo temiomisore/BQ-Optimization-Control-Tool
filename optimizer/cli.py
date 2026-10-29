@@ -177,6 +177,9 @@ def cmd_rules(c) -> None:
         f["owner_principal"], f["owner_source"] = router.resolve_owner(c, f, sa_owners)
         if int(f.get("apply_class") or 0) == 4:
             _annotate_query_runner(f, sa_owners)
+    # Never propose a fix that costs more to run than it saves (net < min_card_net_monthly_usd).
+    min_net = float(c.get("min_card_net_monthly_usd", 0.0) or 0.0)
+    findings, losing_notes = compiler.split_money_losing(findings, min_net)
     open_sets = store.open_sets(c)
 
     # Re-price (not duplicate) every card that is still awaiting its first approval and
@@ -188,16 +191,29 @@ def cmd_rules(c) -> None:
     if refreshed:
         print(f"[*] Re-priced {refreshed} pending card(s) still awaiting their first approval")
 
+    # Unsigned cards that would lose money (created before this check, or re-priced below the
+    # floor): retire them so the queue only holds fixes worth doing.
+    retired = 0
+    for cs in store.unapproved_money_losing_pending(c, min_net):
+        if not _in_scope(cs, target_ds):
+            continue
+        store.transition(c, cs["change_set_id"], "SUPERSEDED", "rules-engine",
+                         f"Retired: costs more to run than it saves (net ${float(cs.get('net') or 0):,.2f}/mo "
+                         f"< ${min_net:,.2f}). Re-created automatically if it becomes worth doing.")
+        retired += 1
+    if retired:
+        print(f"[*] Retired {retired} money-losing card(s) nobody had signed yet")
+
     # Unapproved cards priced by the old (not billing-aware) math and not detected again:
     # retire them so a stale number never stays on the board. Query cards from the
     # non-deterministic engines are re-priced from the query's current cost instead.
     legacy = [cs for cs in store.unapproved_legacy_pending(c) if _in_scope(cs, target_ds)]
-    retired = 0
+    legacy_retired = 0
     for cs in compiler.stale_legacy_cards(findings, legacy):
         store.transition(c, cs["change_set_id"], "SUPERSEDED", "rules-engine",
                          "Retired: priced by the pre-billing-aware engine and not detected again; "
                          "re-created with billing-aware savings if the finding still applies")
-        retired += 1
+        legacy_retired += 1
     repriced, unpriceable = rules.reprice_legacy_query_cards(
         c, compiler.legacy_to_reprice(findings, legacy))
     for cs_id, r in repriced:
@@ -209,15 +225,17 @@ def cmd_rules(c) -> None:
         store.transition(c, cs["change_set_id"], "SUPERSEDED", "rules-engine",
                          "Retired: legacy estimate could not be re-priced (query no longer runs "
                          "in the 28-day window, or the card has no recorded reduction ratio)")
-        retired += 1
-    if retired or repriced:
-        print(f"[*] Legacy estimates: re-priced {len(repriced)}, retired {retired}")
+        legacy_retired += 1
+    if legacy_retired or repriced:
+        print(f"[*] Legacy estimates: re-priced {len(repriced)}, retired {legacy_retired}")
+    retired += legacy_retired
 
     sets, notes = compiler.compile(findings, open_sets, c)
+    notes = losing_notes + notes
     n = store.insert(c, sets)
     floors = sum(1 for f in findings if "DEMO_SYNTHETIC_FLOOR_APPLIED" in (f.get("risk_notes") or []))
     print(f"expired={expired} findings={len(findings)} inserted={n} suppressed={len(notes)} "
-          f"refreshed={refreshed} retired={retired}"
+          f"refreshed={refreshed} retired={retired} money_losing_skipped={len(losing_notes)}"
           + (f" demo_floors={floors} (demo_mode is on: synthetic minimums applied)" if floors else ""))
     for note in notes:
         print("  ", note)

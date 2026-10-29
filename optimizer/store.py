@@ -123,6 +123,19 @@ def refresh_pending(c: Config, change_set_id: str, f: Finding, actor: str = "rul
          "actor": actor})
 
 
+def unapproved_money_losing_pending(c: Config, min_net: float = 0.0) -> list[dict]:
+    """PENDING_REVIEW cards nobody has signed yet whose net monthly value is below `min_net`
+    (the fix costs more to run than it saves). Cards with any approval are left alone:
+    a person has already weighed in on them."""
+    return bq.query(c, f"""
+        SELECT change_set_id, rule_ids, target_project, target_dataset, target_table,
+               CAST(net_monthly_value_usd AS FLOAT64) AS net
+        FROM {_t(c)}
+        WHERE state = 'PENDING_REVIEW'
+          AND ARRAY_LENGTH(IFNULL(approvals, [])) = 0
+          AND net_monthly_value_usd < CAST(@min_net AS NUMERIC)""", {"min_net": float(min_net)})
+
+
 def unapproved_legacy_pending(c: Config) -> list[dict]:
     """PENDING_REVIEW cards nobody has approved that were priced before billing-aware
     savings (their evidence has no savings_math block)."""

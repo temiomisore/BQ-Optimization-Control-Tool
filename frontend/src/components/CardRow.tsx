@@ -64,6 +64,11 @@ export function CardRow({
                 legacy estimate
               </Badge>
             )}
+            {Number(c.net_monthly_value_usd || 0) < 0 && (
+              <Badge className="bg-rose-500/10 text-rose-600 ring-rose-500/30 dark:text-rose-300" title="Costs more to run than it saves">
+                Loses money
+              </Badge>
+            )}
           </div>
           <div className="truncate font-mono text-[13px] font-medium text-zinc-800 dark:text-zinc-100" title={targetLabel(c)}>
             {targetLabel(c)}
@@ -73,7 +78,16 @@ export function CardRow({
           )}
         </div>
         <div className="shrink-0 text-right">
-          <div className="font-mono text-lg font-semibold text-emerald-500 dark:text-emerald-400">{usd(c.net_monthly_value_usd)}</div>
+          <div
+            className={cn(
+              "font-mono text-lg font-semibold",
+              Number(c.net_monthly_value_usd || 0) < 0 ? "text-rose-500 dark:text-rose-400" : "text-emerald-500 dark:text-emerald-400",
+            )}
+          >
+            {Number(c.net_monthly_value_usd || 0) < 0
+              ? `−${usd(Math.abs(Number(c.net_monthly_value_usd)), 2)}`
+              : usd(c.net_monthly_value_usd)}
+          </div>
           <div className="text-[10px] uppercase tracking-wider text-zinc-500">net / mo</div>
         </div>
       </div>

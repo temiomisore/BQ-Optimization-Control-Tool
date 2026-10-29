@@ -78,6 +78,27 @@ class TestCompiler(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertTrue(any("SUPPRESSED_INTERNAL_TABLE" in n for n in notes))
 
+    def test_money_losing_findings_skipped(self):
+        # A materialized view that saves $0.01/mo but costs $6.50/mo to refresh is never proposed.
+        mv = finding("C2-01", 2, target=("p", "optimizer_ops", "jobs_events"),
+                     gross_monthly_savings_usd=0.01, recurring_monthly_cost_usd=6.5)
+        guard = finding("C1-02", 1, gross_monthly_savings_usd=0.0)       # $0 guardrail: kept
+        good = finding("C1-01", 1, target=("p", "d", "t2"))              # $100 saving: kept
+        for f in (mv, guard, good):
+            scoring.score(f, CFG, table_spend={}, table_cv={}, rule_history={})
+        self.assertEqual(mv["net_monthly_value_usd"], -6.49)
+        keep, notes = compiler.split_money_losing([mv, guard, good])
+        self.assertEqual([f["rule_id"] for f in keep], ["C1-02", "C1-01"])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("SKIPPED_MONEY_LOSING:C2-01", notes[0])
+        self.assertIn("net $-6.49/mo", notes[0])
+
+    def test_money_losing_threshold_configurable(self):
+        f = finding(gross_monthly_savings_usd=3.0)
+        scoring.score(f, CFG, table_spend={}, table_cv={}, rule_history={})
+        self.assertEqual(len(compiler.split_money_losing([f], 0.0)[0]), 1)
+        self.assertEqual(len(compiler.split_money_losing([f], 5.0)[0]), 0)   # below a $5 floor
+
 
 class TestAntiPatterns(unittest.TestCase):
     def test_select_star_detection(self):
