@@ -208,6 +208,12 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         self.assertIn("--project=PROJECT_ID", hlp.stdout)
         self.assertIn("--ops-dataset=DATASET", hlp.stdout)
 
+        with open(script, encoding="utf-8") as f:
+            script_text = f.read()
+        self.assertIn("roles/run.builder", script_text)
+        self.assertIn("--build-service-account=", script_text)
+        self.assertIn("spec.template.spec.containers[0].image", script_text)
+
         with open(tutorial, encoding="utf-8") as f:
             tut_text = f.read()
         self.assertIn("<walkthrough-project-setup", tut_text)

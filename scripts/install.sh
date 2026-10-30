@@ -263,7 +263,16 @@ else
   ok "Service account ${SA_EMAIL} already exists."
 fi
 
+HAD_RUN_BUILDER="false"
+if gcloud projects get-iam-policy "$PROJECT_ID" \
+     --flatten="bindings[].members" \
+     --filter="bindings.role:roles/run.builder AND bindings.members:serviceAccount:${SA_EMAIL}" \
+     --format="value(bindings.role)" --quiet 2>/dev/null | tr -d '[:space:]' | python3 -c "import sys; sys.exit(0 if sys.stdin.read().strip() else 1)"; then
+  HAD_RUN_BUILDER="true"
+fi
+
 PROJECT_ROLES=(
+  "roles/run.builder"
   "roles/bigquery.jobUser"
   "roles/bigquery.dataEditor"
   "roles/bigquery.metadataViewer"
@@ -278,7 +287,12 @@ for ROLE in "${PROJECT_ROLES[@]}"; do
     --condition=None \
     --quiet >/dev/null
 done
-ok "Granted project-level BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
+if [[ "$HAD_RUN_BUILDER" == "false" ]]; then
+  ok "Granted project-level Cloud Run Builder, BigQuery, Recommender & Vertex AI roles (waiting 10s for IAM propagation)..."
+  sleep 10
+else
+  ok "Granted project-level Cloud Run Builder, BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
+fi
 
 # Attempt org-wide read-only discovery & JOBS_BY_ORGANIZATION grants if in an org.
 ORG_IAM_READY="false"
@@ -412,62 +426,94 @@ if [[ -n "$IAP_AUDIENCE" ]]; then
   ENV_VARS="${ENV_VARS},IAP_AUDIENCE=${IAP_AUDIENCE}"
 fi
 
+BUILD_SA_RESOURCE="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
+_DEPLOY_LOG="$(mktemp "${TMPDIR:-/tmp}/bqopt_deploy.XXXXXX")"
+trap 'rm -f "$_DEPLOY_LOG"' EXIT
+
+run_source_deploy() {
+  local _use_iap="$1"
+  local _env_str="$2"
+  local -a _cmd=(
+    gcloud run deploy "$SERVICE_NAME"
+    --project="$PROJECT_ID"
+    --region="$RUN_REGION"
+    --source=.
+    --build-service-account="$BUILD_SA_RESOURCE"
+    --service-account="$SA_EMAIL"
+    --memory=1Gi
+    --cpu=1
+    --timeout=900
+    --no-allow-unauthenticated
+    --set-env-vars="$_env_str"
+    --quiet
+  )
+  if [[ "$_use_iap" == "true" ]]; then
+    _cmd+=(--iap)
+  fi
+
+  if "${_cmd[@]}" 2>&1 | tee "$_DEPLOY_LOG"; then
+    return 0
+  fi
+
+  # Newly granted roles/run.builder on a fresh project can take ~10-15s to propagate to Cloud Build / GCS.
+  if python3 - "$_DEPLOY_LOG" <<'PY'
+import sys
+txt = open(sys.argv[1], encoding="utf-8", errors="ignore").read().lower()
+sys.exit(0 if ("storage.objects.get" in txt or "artifactregistry" in txt or "permission" in txt) else 1)
+PY
+  then
+    warn "Waiting 15s for new Cloud Run Builder IAM permissions to finish propagating, then retrying..."
+    sleep 15
+    if "${_cmd[@]}" 2>&1 | tee "$_DEPLOY_LOG"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 DEPLOY_IAP_ACTIVE="false"
 if [[ "$ENABLE_IAP" == "true" ]]; then
   # Provision the Google-managed IAP Service Agent so IAP can invoke the private Cloud Run service.
   gcloud beta services identity create --service=iap.googleapis.com --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
 
-  if gcloud run deploy "$SERVICE_NAME" \
-       --project="$PROJECT_ID" \
-       --region="$RUN_REGION" \
-       --source=. \
-       --service-account="$SA_EMAIL" \
-       --memory=1Gi \
-       --cpu=1 \
-       --timeout=900 \
-       --no-allow-unauthenticated \
-       --iap \
-       --set-env-vars="$ENV_VARS" \
-       --quiet; then
+  if run_source_deploy "true" "$ENV_VARS"; then
     DEPLOY_IAP_ACTIVE="true"
-  else
+  elif python3 - "$_DEPLOY_LOG" <<'PY'
+import sys
+txt = open(sys.argv[1], encoding="utf-8", errors="ignore").read().lower()
+# Only fall back when the failure is actually IAP-related (never on a source/Docker build failure).
+is_iap_err = ("iap" in txt) and ("invalid build request" not in txt) and ("storage.objects.get" not in txt)
+sys.exit(0 if is_iap_err else 1)
+PY
+  then
     warn "Direct --iap flag was rejected by project/org policy; redeploying private service without --iap flag..."
     IAP_AUDIENCE=""
     write_config_yaml ""
-    gcloud run deploy "$SERVICE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$RUN_REGION" \
-      --source=. \
-      --service-account="$SA_EMAIL" \
-      --memory=1Gi \
-      --cpu=1 \
-      --timeout=900 \
-      --no-allow-unauthenticated \
-      --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}" \
-      --quiet
+    run_source_deploy "false" "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}"
+  else
+    echo "❌ Cloud Run source build/deployment failed (see error above)." >&2
+    exit 1
   fi
 else
-  gcloud run deploy "$SERVICE_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$RUN_REGION" \
-    --source=. \
-    --service-account="$SA_EMAIL" \
-    --memory=1Gi \
-    --cpu=1 \
-    --timeout=900 \
-    --no-allow-unauthenticated \
-    --set-env-vars="$ENV_VARS" \
-    --quiet
+  run_source_deploy "false" "$ENV_VARS"
 fi
 
 if [[ "$DEPLOY_IAP_ACTIVE" == "true" ]]; then
   IAP_SA="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
-  gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$RUN_REGION" \
-    --member="serviceAccount:${IAP_SA}" \
-    --role="roles/run.invoker" \
-    --quiet >/dev/null
+  if ! gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+       --project="$PROJECT_ID" \
+       --region="$RUN_REGION" \
+       --member="serviceAccount:${IAP_SA}" \
+       --role="roles/run.invoker" \
+       --quiet >/dev/null 2>&1; then
+    sleep 5
+    gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$RUN_REGION" \
+      --member="serviceAccount:${IAP_SA}" \
+      --role="roles/run.invoker" \
+      --quiet >/dev/null
+  fi
 
   gcloud iap web add-iam-policy-binding \
     --project="$PROJECT_ID" \
@@ -507,7 +553,14 @@ if [[ "$DEPLOY_IAP_ACTIVE" == "true" ]]; then
 fi
 
 SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(status.url)" --quiet)"
-IMAGE_URI="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(template.containers[0].image)" --quiet)"
+IMAGE_URI="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(spec.template.spec.containers[0].image)" --quiet)"
+if [[ -z "$IMAGE_URI" ]]; then
+  IMAGE_URI="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(template.containers[0].image)" --quiet)"
+fi
+if [[ -z "$IMAGE_URI" ]]; then
+  echo "❌ Could not read deployed container image URI from ${SERVICE_NAME}." >&2
+  exit 1
+fi
 ok "Web UI deployed at: ${SERVICE_URL}"
 
 # ---- Step 6: Nightly Cloud Run Job + BigQuery Schema Init --------------------
