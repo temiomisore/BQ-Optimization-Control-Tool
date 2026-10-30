@@ -306,13 +306,17 @@ if [[ -n "$ORG_ID" ]]; then
        --member="serviceAccount:${SA_EMAIL}" \
        --role="roles/bigquery.resourceViewer" \
        --condition=None --quiet >/dev/null 2>&1; then
-    # Optional org-level metadataViewer for cross-project storage summary (best-effort)
+    # Optional org-level metadata & recommender viewers for cross-project table cards (best-effort)
     gcloud organizations add-iam-policy-binding "$ORG_ID" \
       --member="serviceAccount:${SA_EMAIL}" \
       --role="roles/bigquery.metadataViewer" \
       --condition=None --quiet >/dev/null 2>&1 || true
+    gcloud organizations add-iam-policy-binding "$ORG_ID" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="roles/recommender.bigqueryPartitionClusterViewer" \
+      --condition=None --quiet >/dev/null 2>&1 || true
     ORG_IAM_READY="true"
-    ok "Granted org-wide read-only discovery (cloudasset.viewer + bigquery.resourceViewer)."
+    ok "Granted org-wide read-only discovery & table metadata roles (cloudasset, resourceViewer, metadataViewer)."
   else
     warn "Your account doesn't manage Organization-level IAM — starting safely in single-project mode."
     warn "Everything will still deploy cleanly! We'll print 1 command at the end for your GCP Admin if you want org-wide scanning."

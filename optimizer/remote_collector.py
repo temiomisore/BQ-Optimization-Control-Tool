@@ -29,7 +29,7 @@ CHUNK = dt.timedelta(days=1)        # default fetch window (config remote_fetch_
 RETENTION_DAYS = 180                # INFORMATION_SCHEMA.JOBS* history limit
 _JOBS_VIEWS = {"JOBS", "JOBS_BY_PROJECT", "JOBS_BY_USER", "JOBS_BY_FOLDER", "JOBS_BY_ORGANIZATION"}
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_PROJECT_RE = re.compile(r"^[a-z][a-z0-9.:-]{4,62}$")
+_PROJECT_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
 
 
 # ----------------------------------------------------------------------------- pure helpers
@@ -56,7 +56,11 @@ def fetch_start(watermark: dt.datetime | None, now: dt.datetime, backfill_days: 
     return max(start, floor)
 
 
-def _src(region: str) -> str:
+def _src(region: str, project: str | None = None) -> str:
+    if project:
+        if not _PROJECT_RE.match(project):
+            raise ValueError(f"invalid project_id {project!r}")
+        return f"`{project}.region-{region}`.INFORMATION_SCHEMA"
     return f"`region-{region}`.INFORMATION_SCHEMA"
 
 
@@ -120,10 +124,22 @@ _STORAGE_COLS = [("total_rows", "INT64"), ("total_partitions", "INT64"),
                  ("time_travel_physical_bytes", "INT64"), ("fail_safe_physical_bytes", "INT64")]
 
 
-def table_state_sql(region: str, with_storage: bool = True) -> str:
+def org_storage_sql(region: str) -> str:
+    """One-shot org-wide table sizes in `region` (optional fast path when org metadataViewer +
+    enable_info_schema_storage are active; caller falls back to per-project TABLE_STORAGE if not)."""
+    cols = ", ".join(n for n, _ in _STORAGE_COLS)
+    return f"""
+      SELECT project_id, table_schema, table_name,
+             {cols},
+             storage_last_modified_time AS storage_last_modified
+      FROM {_src(region)}.TABLE_STORAGE_BY_ORGANIZATION
+      WHERE deleted = FALSE"""
+
+
+def table_state_sql(region: str, with_storage: bool = True, project: str | None = None) -> str:
     """Mirror of collector step 3; without TABLE_STORAGE (not enabled / not permitted in the
     region) the size columns are NULL instead of skipping the whole snapshot."""
-    src = _src(region)
+    src = _src(region, project)
     if with_storage:
         sizes = ", ".join(f"s.{n} AS {n}" for n, _ in _STORAGE_COLS)
         sizes += ", s.storage_last_modified_time AS storage_last_modified"
@@ -152,18 +168,18 @@ def table_state_sql(region: str, with_storage: bool = True) -> str:
         ON opt.table_catalog = t.table_catalog AND opt.table_schema = t.table_schema
        AND opt.table_name = t.table_name
       {join}
-      WHERE t.table_schema != @ops_ds AND INSTR(t.table_name, '__bqopt_') = 0"""
+      WHERE t.table_schema NOT IN (@ops_ds, 'optimizer_ops') AND INSTR(t.table_name, '__bqopt_') = 0"""
 
 
-def columns_sql(region: str) -> str:
+def columns_sql(region: str, project: str | None = None) -> str:
     """Mirror of collector step 4."""
     return f"""
       SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region,
              table_catalog AS project_id, table_schema AS dataset_id, table_name AS table_id,
              column_name, data_type, is_partitioning_column, clustering_ordinal_position,
              @run AS run_id
-      FROM {_src(region)}.COLUMNS
-      WHERE table_schema != @ops_ds AND INSTR(table_name, '__bqopt_') = 0"""
+      FROM {_src(region, project)}.COLUMNS
+      WHERE table_schema NOT IN (@ops_ds, 'optimizer_ops') AND INSTR(table_name, '__bqopt_') = 0"""
 
 
 def partitions_sql(region: str, project: str, dataset: str) -> str:
@@ -178,9 +194,9 @@ def partitions_sql(region: str, project: str, dataset: str) -> str:
       WHERE INSTR(table_name, '__bqopt_') = 0"""
 
 
-def datasets_sql(region: str) -> str:
+def datasets_sql(region: str, project: str | None = None) -> str:
     """Mirror of collector step 6 (storage_billing_model is backfilled by the driver)."""
-    src = _src(region)
+    src = _src(region, project)
     return f"""
       SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region,
              s.catalog_name AS project_id, s.schema_name AS dataset_id, s.location,
@@ -195,26 +211,26 @@ def datasets_sql(region: str) -> str:
         FROM {src}.SCHEMATA_OPTIONS
         GROUP BY 1, 2
       ) o USING (catalog_name, schema_name)
-      WHERE s.schema_name != @ops_ds"""
+      WHERE s.schema_name NOT IN (@ops_ds, 'optimizer_ops')"""
 
 
-def objects_sql(region: str, kind: str) -> str:
+def objects_sql(region: str, kind: str, project: str | None = None) -> str:
     """Mirror of collector step 7 (raw-JSON snapshots) for one object kind."""
-    src = _src(region)
+    src = _src(region, project)
     if kind == "TABLE_CONSTRAINT":
         return f"""
           SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region, 'TABLE_CONSTRAINT' AS kind,
                  t.constraint_catalog AS project_id, t.constraint_schema AS dataset_id,
                  t.table_name AS object_id, TO_JSON_STRING(t) AS raw_json, @run AS run_id
-          FROM {src}.TABLE_CONSTRAINTS t"""
+          FROM {src}.TABLE_CONSTRAINTS t
+          WHERE t.constraint_schema NOT IN (@ops_ds, 'optimizer_ops')"""
     view = {"MATERIALIZED_VIEW": "MATERIALIZED_VIEWS", "VIEW": "VIEWS"}[kind]
-    where = "WHERE t.table_schema != @ops_ds" if kind == "VIEW" else ""
     return f"""
       SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region, '{kind}' AS kind,
              t.table_catalog AS project_id, t.table_schema AS dataset_id,
              t.table_name AS object_id, TO_JSON_STRING(t) AS raw_json, @run AS run_id
       FROM {src}.{view} t
-      {where}"""
+      WHERE t.table_schema NOT IN (@ops_ds, 'optimizer_ops')"""
 
 
 def reservations_sql(region: str, admin_project: str, kind: str) -> str:
@@ -286,27 +302,103 @@ def _stage_chunks(c: Config, region: str, table: str, sql: str, start: dt.dateti
 
 
 def _replace_today(c: Config, region: str, table: str, rows: list[dict],
-                   kinds: list[str] | None = None) -> int:
-    """Snapshot tables: atomically replace today's rows for this region (and kinds)."""
+                   kinds: list[str] | None = None,
+                   exclude_project: str | None = None) -> int:
+    """Snapshot tables: atomically replace today's rows for this region (and kinds).
+
+    When `exclude_project` is given (home-region cross-project collection), rows belonging to
+    `exclude_project` (already written by sql/02_collector_run.sql) are preserved untouched.
+    """
     schema = _schema(c, table)
     cols = ", ".join(f"`{f.name}`" for f in schema)
-    stg = _stg(c, table, region)
+    stg = _stg(c, table, f"{region}_xproj" if exclude_project else region)
     params: dict = {"r": region}
-    kind_sql = ""
+    extra_where = ""
+    if exclude_project:
+        extra_where += " AND project_id != @excl_proj"
+        params["excl_proj"] = exclude_project
     if kinds:
-        kind_sql, params["kinds"] = " AND kind IN UNNEST(@kinds)", list(kinds)
+        extra_where += " AND kind IN UNNEST(@kinds)"
+        params["kinds"] = list(kinds)
     insert_sql = ""
     if rows:
         bq.load_rows(c, stg, rows, schema)
         insert_sql = f"INSERT INTO `{c.ops}.{table}` ({cols}) SELECT {cols} FROM `{stg}`;"
     bq.execute(c, f"""
         BEGIN TRANSACTION;
-        DELETE FROM `{c.ops}.{table}` WHERE snapshot_date = CURRENT_DATE() AND region = @r{kind_sql};
+        DELETE FROM `{c.ops}.{table}` WHERE snapshot_date = CURRENT_DATE() AND region = @r{extra_where};
         {insert_sql}
         COMMIT TRANSACTION;""", params)
     if rows:
         _drop(c, stg)
     return len(rows)
+
+
+def projects_for_region(c: Config, region: str, route_info: dict | None = None) -> list[str]:
+    """Ordered list of GCP project IDs to scan for table/dataset metadata in `region`.
+
+    Host `c['project_id']` comes first. In organization/folder scope (or JOBS_BY_ORGANIZATION),
+    appends every project discovered by Cloud Asset Inventory in `region` — falling back to
+    distinct project IDs seen in `jobs_events` when Cloud Asset Inventory wasn't available.
+    """
+    reg = regions.normalize(region) or region
+    host = str(c["project_id"])
+    out: list[str] = [host] if _PROJECT_RE.match(host) else []
+    if c.get("target_dataset"):
+        return out
+    scope = str(c.get("asset_scope") or "")
+    multi = (scope.startswith(("organizations/", "folders/"))
+             or str(c.get("jobs_view") or "").upper() == "JOBS_BY_ORGANIZATION")
+    if not multi:
+        return out
+    by_reg = (route_info or {}).get("projects_by_region") or {}
+    discovered = by_reg.get(reg)
+    if discovered is not None:
+        for p in discovered:
+            if _PROJECT_RE.match(p) and p not in out:
+                out.append(p)
+        return out
+    # Fallback when Cloud Asset Inventory failed or regions came from a static config list:
+    # find other projects that ran queries or owned referenced tables in this region.
+    try:
+        rows = bq.query(c, f"""
+            SELECT DISTINCT pid FROM (
+              SELECT project_id AS pid FROM `{c.ops}.jobs_events` WHERE region = @r
+              UNION DISTINCT
+              SELECT rt.project_id AS pid FROM `{c.ops}.jobs_events`, UNNEST(referenced_tables) rt
+              WHERE region = @r
+            ) WHERE pid IS NOT NULL""", {"r": reg})
+        for r in rows:
+            p = str(r.get("pid") or "")
+            if _PROJECT_RE.match(p) and p not in out:
+                out.append(p)
+    except Exception:
+        pass
+    return out
+
+
+def _fetch_org_storage_map(c: Config, region: str) -> dict[tuple[str, str, str], dict] | None:
+    """Try reading TABLE_STORAGE_BY_ORGANIZATION once for `region`; None if not enabled/permitted."""
+    try:
+        rows = _q(c, org_storage_sql(region), None, region)
+    except Exception:  # noqa: BLE001
+        return None
+    return {(r["project_id"], r["table_schema"], r["table_name"]): r for r in rows}
+
+
+def _overlay_storage(rows: list[dict], org_map: dict[tuple[str, str, str], dict]) -> None:
+    storage_keys = [n for n, _ in _STORAGE_COLS] + ["storage_last_modified"]
+    for r in rows:
+        hit = org_map.get((r.get("project_id"), r.get("dataset_id"), r.get("table_id")))
+        if hit:
+            for k in storage_keys:
+                r[k] = hit.get(k)
+
+
+def _proj_arg_for(c: Config, proj: str, projs: list[str], force_qualify: bool = False) -> str | None:
+    if not force_qualify and len(projs) == 1 and proj == c["project_id"]:
+        return None
+    return proj
 
 
 # ----------------------------------------------------------------------------- steps
@@ -375,54 +467,165 @@ def collect_hourly_slots(c: Config, region: str, run_id: str, now: dt.datetime |
     return n, None
 
 
-def collect_table_state(c: Config, region: str, run_id: str) -> tuple:
+def collect_table_state(c: Config, region: str, run_id: str,
+                        projects: list[str] | None = None,
+                        exclude_project: str | None = None) -> tuple:
+    projs = list(projects) if projects is not None else [c["project_id"]]
+    if not projs:
+        return 0, "0 projects to scan"
     params = {"run": run_id, "ops_ds": c["ops_dataset"]}
+    force_qualify = exclude_project is not None or any(p != c["project_id"] for p in projs)
+    org_storage = _fetch_org_storage_map(c, region) if force_qualify else None
+    rows: list[dict] = []
+    ok_projs, skipped_projs, no_storage = 0, [], []
+    for proj in projs:
+        p_arg = _proj_arg_for(c, proj, projs, force_qualify)
+        try:
+            if org_storage is not None:
+                p_rows = _q(c, table_state_sql(region, False, p_arg), params, region)
+                _overlay_storage(p_rows, org_storage)
+            else:
+                try:
+                    p_rows = _q(c, table_state_sql(region, True, p_arg), params, region)
+                except Exception as se:  # noqa: BLE001 — TABLE_STORAGE off/denied: keep tables, drop sizes
+                    p_rows = _q(c, table_state_sql(region, False, p_arg), params, region)
+                    no_storage.append((proj, se))
+            rows.extend(p_rows)
+            ok_projs += 1
+        except Exception as pe:  # noqa: BLE001 — one locked-down project never aborts the rest
+            skipped_projs.append((proj, pe))
+    if ok_projs == 0 and skipped_projs:
+        raise skipped_projs[0][1]
+    if not force_qualify:
+        note = (f"sizes unavailable (TABLE_STORAGE not enabled or not permitted here): "
+                f"{str(no_storage[0][1])[:200]}") if no_storage else None
+    else:
+        parts = [f"{ok_projs}/{len(projs)} project(s) scanned"]
+        if org_storage is not None:
+            parts.append("org TABLE_STORAGE")
+        elif no_storage:
+            parts.append(f"sizes off in {len(no_storage)} project(s)")
+        if skipped_projs:
+            parts.append(f"skipped {len(skipped_projs)}: {', '.join(p for p, _ in skipped_projs[:5])}")
+        note = "; ".join(parts)
+    n = _replace_today(c, region, "table_state_daily", rows, exclude_project=exclude_project)
+    return n, note
+
+
+def collect_columns(c: Config, region: str, run_id: str,
+                    projects: list[str] | None = None,
+                    exclude_project: str | None = None) -> tuple:
+    projs = list(projects) if projects is not None else [c["project_id"]]
+    if not projs:
+        return 0, "0 projects to scan"
+    params = {"run": run_id, "ops_ds": c["ops_dataset"]}
+    force_qualify = exclude_project is not None or any(p != c["project_id"] for p in projs)
+    rows, ok_projs, skipped_projs = [], 0, []
+    for proj in projs:
+        p_arg = _proj_arg_for(c, proj, projs, force_qualify)
+        try:
+            rows.extend(_q(c, columns_sql(region, p_arg), params, region))
+            ok_projs += 1
+        except Exception as pe:  # noqa: BLE001
+            skipped_projs.append((proj, pe))
+    if ok_projs == 0 and skipped_projs:
+        raise skipped_projs[0][1]
     note = None
-    try:
-        rows = _q(c, table_state_sql(region, True), params, region)
-    except Exception as e:  # noqa: BLE001 — TABLE_STORAGE off/not permitted: keep tables, drop sizes
-        rows = _q(c, table_state_sql(region, False), params, region)
-        note = f"sizes unavailable (TABLE_STORAGE not enabled or not permitted here): {str(e)[:200]}"
-    return _replace_today(c, region, "table_state_daily", rows), note
+    if force_qualify:
+        note = f"{ok_projs}/{len(projs)} project(s) scanned" + (
+            f"; skipped {len(skipped_projs)}: {', '.join(p for p, _ in skipped_projs[:5])}"
+            if skipped_projs else "")
+    return _replace_today(c, region, "columns_daily", rows, exclude_project=exclude_project), note
 
 
-def collect_columns(c: Config, region: str, run_id: str) -> tuple:
-    rows = _q(c, columns_sql(region), {"run": run_id, "ops_ds": c["ops_dataset"]}, region)
-    return _replace_today(c, region, "columns_daily", rows), None
-
-
-def collect_partitions(c: Config, region: str, run_id: str) -> tuple:
-    project = c["project_id"]
-    datasets = [r["schema_name"] for r in _q(c, f"SELECT schema_name FROM {_src(region)}.SCHEMATA "
-           f"WHERE schema_name NOT IN ('INFORMATION_SCHEMA', @ops_ds)",
-        {"ops_ds": c["ops_dataset"]}, region) if _IDENT_RE.match(r["schema_name"] or "")]
-    rows, skipped = [], 0
-    for ds in datasets:
+def collect_partitions(c: Config, region: str, run_id: str,
+                       projects: list[str] | None = None,
+                       exclude_project: str | None = None) -> tuple:
+    projs = list(projects) if projects is not None else [c["project_id"]]
+    if not projs:
+        return 0, "0 projects to scan"
+    force_qualify = exclude_project is not None or any(p != c["project_id"] for p in projs)
+    rows, total_ds, skipped_ds, ok_projs, skipped_projs = [], 0, 0, 0, []
+    for proj in projs:
+        p_arg = _proj_arg_for(c, proj, projs, force_qualify)
         try:
-            rows += _q(c, partitions_sql(region, project, ds), {"run": run_id}, region)
-        except Exception:  # noqa: BLE001 — one unreadable dataset never fails the step
-            skipped += 1
-    n = _replace_today(c, region, "table_partitions_daily", rows)
-    return n, f"{len(datasets)} datasets scanned" + (f", {skipped} skipped" if skipped else "")
+            datasets = [
+                r["schema_name"] for r in _q(
+                    c, f"SELECT schema_name FROM {_src(region, p_arg)}.SCHEMATA "
+                       f"WHERE schema_name NOT IN ('INFORMATION_SCHEMA', @ops_ds, 'optimizer_ops')",
+                    {"ops_ds": c["ops_dataset"]}, region)
+                if _IDENT_RE.match(r["schema_name"] or "")
+            ]
+            ok_projs += 1
+        except Exception as pe:  # noqa: BLE001
+            skipped_projs.append((proj, pe))
+            continue
+        total_ds += len(datasets)
+        for ds in datasets:
+            try:
+                rows += _q(c, partitions_sql(region, proj, ds), {"run": run_id}, region)
+            except Exception:  # noqa: BLE001 — one unreadable dataset never fails the step
+                skipped_ds += 1
+    if ok_projs == 0 and skipped_projs:
+        raise skipped_projs[0][1]
+    n = _replace_today(c, region, "table_partitions_daily", rows, exclude_project=exclude_project)
+    msg = f"{total_ds} datasets scanned" + (f", {skipped_ds} skipped" if skipped_ds else "")
+    if force_qualify:
+        msg += f" across {ok_projs}/{len(projs)} project(s)"
+        if skipped_projs:
+            msg += f" (skipped projects: {', '.join(p for p, _ in skipped_projs[:5])})"
+    return n, msg
 
 
-def collect_dataset_state(c: Config, region: str, run_id: str) -> tuple:
-    rows = _q(c, datasets_sql(region), {"run": run_id, "ops_ds": c["ops_dataset"]}, region)
-    return _replace_today(c, region, "dataset_state_daily", rows), None
-
-
-def collect_objects(c: Config, region: str, run_id: str) -> tuple:
-    rows, kinds, skipped = [], [], []
-    for kind in ("MATERIALIZED_VIEW", "VIEW", "TABLE_CONSTRAINT"):
+def collect_dataset_state(c: Config, region: str, run_id: str,
+                          projects: list[str] | None = None,
+                          exclude_project: str | None = None) -> tuple:
+    projs = list(projects) if projects is not None else [c["project_id"]]
+    if not projs:
+        return 0, "0 projects to scan"
+    params = {"run": run_id, "ops_ds": c["ops_dataset"]}
+    force_qualify = exclude_project is not None or any(p != c["project_id"] for p in projs)
+    rows, ok_projs, skipped_projs = [], 0, []
+    for proj in projs:
+        p_arg = _proj_arg_for(c, proj, projs, force_qualify)
         try:
-            rows += _q(c, objects_sql(region, kind), {"run": run_id, "ops_ds": c["ops_dataset"]}, region)
-            kinds.append(kind)
-        except Exception:  # noqa: BLE001
-            skipped.append(kind)
+            rows.extend(_q(c, datasets_sql(region, p_arg), params, region))
+            ok_projs += 1
+        except Exception as pe:  # noqa: BLE001
+            skipped_projs.append((proj, pe))
+    if ok_projs == 0 and skipped_projs:
+        raise skipped_projs[0][1]
+    note = None
+    if force_qualify:
+        note = f"{ok_projs}/{len(projs)} project(s) scanned" + (
+            f"; skipped {len(skipped_projs)}: {', '.join(p for p, _ in skipped_projs[:5])}"
+            if skipped_projs else "")
+    return _replace_today(c, region, "dataset_state_daily", rows, exclude_project=exclude_project), note
+
+
+def collect_objects(c: Config, region: str, run_id: str,
+                    projects: list[str] | None = None,
+                    exclude_project: str | None = None) -> tuple:
+    projs = list(projects) if projects is not None else [c["project_id"]]
+    if not projs:
+        return 0, "0 projects to scan"
+    params = {"run": run_id, "ops_ds": c["ops_dataset"]}
+    force_qualify = exclude_project is not None or any(p != c["project_id"] for p in projs)
+    rows, kinds_seen, skipped_kinds = [], set(), set()
+    for proj in projs:
+        p_arg = _proj_arg_for(c, proj, projs, force_qualify)
+        for kind in ("MATERIALIZED_VIEW", "VIEW", "TABLE_CONSTRAINT"):
+            try:
+                rows += _q(c, objects_sql(region, kind, p_arg), params, region)
+                kinds_seen.add(kind)
+            except Exception:  # noqa: BLE001
+                skipped_kinds.add(kind)
+    kinds = [k for k in ("MATERIALIZED_VIEW", "VIEW", "TABLE_CONSTRAINT") if k in kinds_seen]
     if not kinds:
         raise RuntimeError("no object views readable in this region")
-    n = _replace_today(c, region, "object_state_raw_daily", rows, kinds)
-    return n, ("skipped " + ", ".join(skipped)) if skipped else None
+    n = _replace_today(c, region, "object_state_raw_daily", rows, kinds, exclude_project=exclude_project)
+    missed = [k for k in ("MATERIALIZED_VIEW", "VIEW", "TABLE_CONSTRAINT") if k not in kinds_seen and k in skipped_kinds]
+    return n, ("skipped " + ", ".join(missed)) if missed else None
 
 
 def collect_reservations(c: Config, region: str, run_id: str) -> tuple:
@@ -459,12 +662,25 @@ def _merge_by_id(c: Config, region: str, table: str, id_col: str, rows: list[dic
 
 
 def collect_recommendations(c: Config, region: str, run_id: str) -> tuple:
-    view = str(c.get("recs_view") or "RECOMMENDATIONS").upper()
-    if view not in ("RECOMMENDATIONS", "RECOMMENDATIONS_BY_ORGANIZATION"):
-        raise ValueError(f"unsupported recs_view {view!r}")
-    rows = _q(c, recommendations_sql(region, view), None, region)
+    explicit = c.get("recs_view")
+    if explicit:
+        view = str(explicit).upper()
+        if view not in ("RECOMMENDATIONS", "RECOMMENDATIONS_BY_ORGANIZATION"):
+            raise ValueError(f"unsupported recs_view {view!r}")
+        rows = _q(c, recommendations_sql(region, view), None, region)
+        note = None
+    elif str(c.get("jobs_view") or "").upper() == "JOBS_BY_ORGANIZATION":
+        try:
+            rows = _q(c, recommendations_sql(region, "RECOMMENDATIONS_BY_ORGANIZATION"), None, region)
+            note = "RECOMMENDATIONS_BY_ORGANIZATION"
+        except Exception:  # noqa: BLE001 — fall back to project-level recommendations
+            rows = _q(c, recommendations_sql(region, "RECOMMENDATIONS"), None, region)
+            note = "fallback to project RECOMMENDATIONS"
+    else:
+        rows = _q(c, recommendations_sql(region, "RECOMMENDATIONS"), None, region)
+        note = None
     return _merge_by_id(c, region, "recommender_recommendations", "recommendation_id", rows,
-                        ["state", "last_updated_time", "additional_details_json", "raw_json"], run_id), None
+                        ["state", "last_updated_time", "additional_details_json", "raw_json"], run_id), note
 
 
 def collect_insights(c: Config, region: str, run_id: str) -> tuple:
@@ -491,7 +707,42 @@ def _write_audit(c: Config, run_id: str, region: str, entries: list[tuple]) -> N
         print(f"  ! could not write collector_audit for {region}: {e}")
 
 
-def collect_region(c: Config, region: str, run_id: str) -> dict:
+def collect_extra_projects_home(c: Config, home: str, extra_projects: list[str], run_id: str) -> dict:
+    """Collect table/column/partition/dataset/object metadata for non-host projects in the HOME
+    region (after sql/02_collector_run.sql has collected the host project).
+
+    Replaces only rows with `project_id != c['project_id']` for today in `home`, so re-runs are
+    100% idempotent and the host project's snapshot is never touched.
+    """
+    reg = regions.normalize(home)
+    if not reg:
+        raise ValueError(f"invalid region {home!r}")
+    projs = [p for p in extra_projects if _PROJECT_RE.match(p) and p != c["project_id"]]
+    if not projs:
+        return {}
+    host = str(c["project_id"])
+    steps: list[tuple[str, Callable[[], tuple]]] = [
+        ("3_table_state_xproj", lambda: collect_table_state(c, reg, run_id, projs, exclude_project=host)),
+        ("4_columns_xproj", lambda: collect_columns(c, reg, run_id, projs, exclude_project=host)),
+        ("5_partitions_xproj", lambda: collect_partitions(c, reg, run_id, projs, exclude_project=host)),
+        ("6_dataset_state_xproj", lambda: collect_dataset_state(c, reg, run_id, projs, exclude_project=host)),
+        ("7_objects_xproj", lambda: collect_objects(c, reg, run_id, projs, exclude_project=host)),
+    ]
+    results, audit = {}, []
+    for name, fn in steps:
+        try:
+            n, note = fn()
+            results[name] = n
+            audit.append((name, "OK", n, note))
+        except Exception as e:  # noqa: BLE001
+            results[name] = f"SKIPPED: {str(e)[:160]}"
+            audit.append((name, "SKIPPED", 0, str(e)[:1000]))
+    _write_audit(c, run_id, reg, audit)
+    return results
+
+
+def collect_region(c: Config, region: str, run_id: str,
+                   projects: list[str] | None = None) -> dict:
     """Run every collector step for one non-home region. Each step is isolated: a failure is
     recorded as SKIPPED in collector_audit and the remaining steps still run."""
     reg = regions.normalize(region)
@@ -499,14 +750,15 @@ def collect_region(c: Config, region: str, run_id: str) -> dict:
         raise ValueError(f"invalid region {region!r}")
     if reg == regions.home_region(c):
         raise ValueError(f"{reg} is the home location; the collector SQL handles it directly")
+    projs = list(projects) if projects is not None else [c["project_id"]]
     steps: list[tuple[str, Callable[[], tuple]]] = [
         ("1_jobs_events", lambda: collect_jobs(c, reg, run_id)),
         ("2_hourly_slots", lambda: collect_hourly_slots(c, reg, run_id)),
-        ("3_table_state", lambda: collect_table_state(c, reg, run_id)),
-        ("4_columns", lambda: collect_columns(c, reg, run_id)),
-        ("5_partitions", lambda: collect_partitions(c, reg, run_id)),
-        ("6_dataset_state", lambda: collect_dataset_state(c, reg, run_id)),
-        ("7_objects", lambda: collect_objects(c, reg, run_id)),
+        ("3_table_state", lambda: collect_table_state(c, reg, run_id, projs)),
+        ("4_columns", lambda: collect_columns(c, reg, run_id, projs)),
+        ("5_partitions", lambda: collect_partitions(c, reg, run_id, projs)),
+        ("6_dataset_state", lambda: collect_dataset_state(c, reg, run_id, projs)),
+        ("7_objects", lambda: collect_objects(c, reg, run_id, projs)),
         ("8_recommendations", lambda: collect_recommendations(c, reg, run_id)),
         ("8_insights", lambda: collect_insights(c, reg, run_id)),
     ]

@@ -674,7 +674,7 @@ def _map_unused(row: dict, prices: dict, c: Config) -> Finding:
 
 def _sql_time_travel(c: Config) -> str:
     return f"""
-      SELECT t.project_id, t.dataset_id, t.table_id,
+      SELECT t.project_id, t.dataset_id, t.table_id, t.region,
              t.total_physical_bytes, t.time_travel_physical_bytes, t.total_logical_bytes,
              d.storage_billing_model
       FROM `{c.ops}.table_state_daily` t
@@ -721,7 +721,7 @@ def _map_time_travel(row: dict, prices: dict, c: Config) -> Finding | None:
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row.get("table_id"),
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": f"High-churn table accumulates {tt_gib:.1f} GiB in time travel. Reduce window to 48 hours.",
         "evidence": {
             "time_travel_physical_bytes": tt_bytes,
@@ -1402,6 +1402,7 @@ _SHARE_1N = "SAFE_DIVIDE(1, ARRAY_LENGTH(j.referenced_tables))"
 def _sql_mv_rollup(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id,
+             ANY_VALUE(j.region) AS region,
              COUNT(DISTINCT j.job_id) AS agg_queries_30d,
              SUM(j.total_bytes_billed) AS bytes_billed_30d,
              SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0) * {_SHARE_1N}) AS od_cost_usd_30d,
@@ -1449,7 +1450,7 @@ def _map_mv_rollup(row: dict, prices: dict, c: Config) -> Finding:
         "target_project": proj,
         "target_dataset": ds,
         "target_table": tbl,
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": (
             f"Table `{ds}.{tbl}` executes {row['agg_queries_30d']} repeated GROUP BY rollups "
             f"(~${od + rv:,.2f}/mo attributed to this table, {sv['billing_mix']}). "
@@ -1497,6 +1498,7 @@ def _sql_zombie_dts(c: Config) -> str:
     return f"""
       SELECT COALESCE(j.destination_table.project_id, j.project_id) AS project_id,
              j.destination_table.dataset_id, j.destination_table.table_id,
+             ANY_VALUE(j.region) AS region,
              COUNT(*) as write_jobs,
              SUM(j.total_bytes_billed) as bytes_billed,
              SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0)) AS od_cost_usd_30d,
@@ -1532,7 +1534,7 @@ def _map_zombie_dts(row: dict, prices: dict, c: Config) -> Finding:
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": (f"Table `{row['dataset_id']}.{row['table_id']}` is populated by scheduled ETL "
                             f"(~${od + rv:,.2f}/mo, {sv['billing_mix']}) but has 0 downstream readers."),
         "evidence": {
@@ -1562,6 +1564,7 @@ def _map_zombie_dts(row: dict, prices: dict, c: Config) -> Finding:
 def _sql_pk_fk(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id,
+             ANY_VALUE(t.region) AS region,
              COUNT(DISTINCT j.job_id) AS join_queries,
              SUM(j.total_slot_ms)     AS slot_ms_30d,
              SUM(IF(j.billing_mode = 'RESERVATION', j.total_slot_ms, 0)) AS resv_slot_ms_30d,
@@ -1595,7 +1598,7 @@ def _map_pk_fk(row: dict, prices: dict, c: Config) -> Finding:
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": f"Table `{row['table_id']}` is frequently joined ({row['join_queries']} queries) but lacks primary key constraints.",
         "evidence": {
             "join_queries_30d": row["join_queries"],
@@ -1622,6 +1625,7 @@ def _map_pk_fk(row: dict, prices: dict, c: Config) -> Finding:
 def _sql_search_index(c: Config) -> str:
     return f"""
       SELECT rt.project_id, rt.dataset_id, rt.table_id, t.total_logical_bytes,
+             ANY_VALUE(t.region) AS region,
              COUNT(DISTINCT j.job_id) AS lookup_queries,
              SUM(j.total_bytes_billed) AS bytes_billed,
              SUM(IF(j.billing_mode = 'ON_DEMAND',   j.est_cost_usd, 0) * {_SHARE_1N}) AS od_cost_usd_30d,
@@ -1654,7 +1658,7 @@ def _map_search_index(row: dict, prices: dict, c: Config) -> Finding:
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": (f"Table `{row['table_id']}` has {row['lookup_queries']} needle-in-haystack lookups "
                             f"scanning {float(row['total_logical_bytes'])/_GIB:.0f} GiB "
                             f"(~${od + rv:,.2f}/mo attributed, {sv['billing_mix']})."),
@@ -1682,6 +1686,7 @@ def _map_search_index(row: dict, prices: dict, c: Config) -> Finding:
 def _sql_partition_granularity(c: Config) -> str:
     return f"""
       SELECT p.project_id, p.dataset_id, p.table_id,
+             ANY_VALUE(p.region) AS region,
              COUNT(*) AS partition_count,
              AVG(p.total_logical_bytes) AS avg_partition_bytes,
              COALESCE(
@@ -1714,7 +1719,7 @@ def _map_partition_granularity(row: dict, prices: dict, c: Config) -> Finding:
         "target_project": row["project_id"],
         "target_dataset": row["dataset_id"],
         "target_table": row["table_id"],
-        "target_region": c.get("location", "US"),
+        "target_region": row.get("region") or c.get("location", "US"),
         "finding_summary": f"Table `{row['table_id']}` has {row['partition_count']} tiny partitions (avg {float(row['avg_partition_bytes'])/1024/1024:.1f} MB). Rebuild to MONTH granularity.",
         "evidence": {
             "current_partitions": row["partition_count"],
@@ -2104,7 +2109,7 @@ def _dry_run_sql(c: Config, sql: str) -> tuple[bool, int]:
 
 def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
     """Extracts referenced dataset.table identifiers from SQL and fetches their BigQuery DDLs."""
-    proj = c.get("project_id", "temi-project-408005")
+    proj = c.get("project_id", "unknown_project")
     matches = set(re.findall(r"(?:`?([A-Za-z0-9_-]+)\.)?([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)`?", sql))
     ddls: list[str] = []
     seen_tables: set[str] = set()
@@ -2136,7 +2141,7 @@ def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding],
         return []
 
     model_name = ai_cfg.get("model", "gemini-3-flash-preview")
-    proj = c.get("project_id", "temi-project-408005")
+    proj = c.get("project_id", "")
 
     try:
         from google import genai

@@ -3,7 +3,7 @@ import { Users } from "lucide-react";
 import type { ChangeSet, RegionsInfo } from "@/lib/api";
 import { Badge, Meter } from "./ui";
 import { RegionBadge } from "./RegionBadge";
-import { cn, CLASS_META, needsTwo, targetLabel, usd } from "@/lib/utils";
+import { cn, CLASS_META, fullPath, needsTwo, targetLabel, usd } from "@/lib/utils";
 
 export function CardRow({
   c,
@@ -70,8 +70,12 @@ export function CardRow({
               </Badge>
             )}
           </div>
-          <div className="truncate font-mono text-[13px] font-medium text-zinc-800 dark:text-zinc-100" title={targetLabel(c)}>
-            {targetLabel(c)}
+          <div className="truncate font-mono text-[13px] font-medium text-zinc-800 dark:text-zinc-100" title={fullPath(c)}>
+            {c.target_project && c.target_dataset && c.target_dataset !== "None"
+              && c.target_dataset !== "PROJECT_WIDE_BILLING" && c.target_dataset !== "HUMAN_ADHOC_GOVERNANCE"
+              && !(c.rule_ids || []).includes("W-02") ? (
+              <><span className="text-zinc-400 dark:text-zinc-500">{c.target_project}.</span>{targetLabel(c)}</>
+            ) : targetLabel(c)}
           </div>
           {!compact && (
             <div className="mt-1 line-clamp-2 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">{c.finding_summary}</div>

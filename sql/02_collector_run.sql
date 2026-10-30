@@ -267,9 +267,45 @@ BEGIN
     INSERT INTO optimizer_ops.collector_audit
     VALUES (run_id, CURRENT_TIMESTAMP(), '3_table_state', r.region, 'OK', @@row_count, NULL);
   EXCEPTION WHEN ERROR THEN
-    INSERT INTO optimizer_ops.collector_audit
-    VALUES (run_id, CURRENT_TIMESTAMP(), '3_table_state', r.region, 'SKIPPED', 0,
-            CONCAT('TABLE_STORAGE not ready or enabled yet: ', @@error.message));
+    -- Fallback when TABLE_STORAGE is not yet enabled: still snapshot TABLES + TABLE_OPTIONS with NULL sizes.
+    BEGIN
+      EXECUTE IMMEDIATE FORMAT("""
+        INSERT INTO optimizer_ops.table_state_daily
+        SELECT
+          CURRENT_DATE(), '%s',
+          t.table_catalog, t.table_schema, t.table_name, t.table_type, t.creation_time,
+          t.ddl,
+          opt.require_partition_filter, opt.partition_expiration_days, opt.expiration_timestamp,
+          CAST(NULL AS INT64), CAST(NULL AS INT64),
+          CAST(NULL AS INT64), CAST(NULL AS INT64), CAST(NULL AS INT64),
+          CAST(NULL AS INT64), CAST(NULL AS INT64), CAST(NULL AS INT64),
+          CAST(NULL AS INT64), CAST(NULL AS INT64),
+          CAST(NULL AS TIMESTAMP),
+          '%s'
+        FROM %s.TABLES t
+        LEFT JOIN (
+          SELECT table_catalog, table_schema, table_name,
+                 MAX(IF(option_name = 'require_partition_filter',  option_value, NULL)) AS require_partition_filter,
+                 MAX(IF(option_name = 'partition_expiration_days', option_value, NULL)) AS partition_expiration_days,
+                 MAX(IF(option_name = 'expiration_timestamp',      option_value, NULL)) AS expiration_timestamp
+          FROM %s.TABLE_OPTIONS
+          GROUP BY 1, 2, 3
+        ) opt
+          ON  opt.table_catalog = t.table_catalog
+          AND opt.table_schema  = t.table_schema
+          AND opt.table_name    = t.table_name
+        WHERE t.table_schema != 'optimizer_ops'
+          AND INSTR(t.table_name, '__bqopt_') = 0
+      """, r.region, run_id, src, src);
+
+      INSERT INTO optimizer_ops.collector_audit
+      VALUES (run_id, CURRENT_TIMESTAMP(), '3_table_state', r.region, 'OK', @@row_count,
+              'sizes unavailable (TABLE_STORAGE not enabled or not active yet)');
+    EXCEPTION WHEN ERROR THEN
+      INSERT INTO optimizer_ops.collector_audit
+      VALUES (run_id, CURRENT_TIMESTAMP(), '3_table_state', r.region, 'SKIPPED', 0,
+              CONCAT('TABLE_STORAGE not ready or enabled yet: ', @@error.message));
+    END;
   END;
 
   -- ==========================================================================
@@ -438,8 +474,47 @@ BEGIN
     INSERT INTO optimizer_ops.collector_audit
     VALUES (run_id, CURRENT_TIMESTAMP(), '8_recommendations', r.region, 'OK', @@row_count, NULL);
   EXCEPTION WHEN ERROR THEN
-    INSERT INTO optimizer_ops.collector_audit
-    VALUES (run_id, CURRENT_TIMESTAMP(), '8_recommendations', r.region, 'SKIPPED', 0, @@error.message);
+    IF recs_view = 'RECOMMENDATIONS_BY_ORGANIZATION' THEN
+      BEGIN
+        EXECUTE IMMEDIATE FORMAT("""
+          MERGE optimizer_ops.recommender_recommendations T
+          USING (
+            SELECT
+              recommendation_id,
+              '%s' AS region,
+              recommender, subtype, project_id, description, state, last_updated_time,
+              TO_JSON_STRING(target_resources)   AS target_resources_json,
+              TO_JSON_STRING(additional_details) AS additional_details_json,
+              TO_JSON_STRING(t)                  AS raw_json
+            FROM %s.RECOMMENDATIONS t
+          ) S
+          ON T.recommendation_id = S.recommendation_id
+          WHEN MATCHED THEN UPDATE SET
+            state = S.state, last_updated_time = S.last_updated_time,
+            additional_details_json = S.additional_details_json, raw_json = S.raw_json,
+            last_seen_at = CURRENT_TIMESTAMP(), run_id = '%s'
+          WHEN NOT MATCHED THEN INSERT (
+            recommendation_id, region, recommender, subtype, project_id, description,
+            state, last_updated_time, target_resources_json, additional_details_json,
+            raw_json, first_seen_at, last_seen_at, run_id
+          ) VALUES (
+            S.recommendation_id, S.region, S.recommender, S.subtype, S.project_id, S.description,
+            S.state, S.last_updated_time, S.target_resources_json, S.additional_details_json,
+            S.raw_json, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), '%s'
+          )
+        """, r.region, src, run_id, run_id);
+
+        INSERT INTO optimizer_ops.collector_audit
+        VALUES (run_id, CURRENT_TIMESTAMP(), '8_recommendations', r.region, 'OK', @@row_count,
+                'fallback to project RECOMMENDATIONS');
+      EXCEPTION WHEN ERROR THEN
+        INSERT INTO optimizer_ops.collector_audit
+        VALUES (run_id, CURRENT_TIMESTAMP(), '8_recommendations', r.region, 'SKIPPED', 0, @@error.message);
+      END;
+    ELSE
+      INSERT INTO optimizer_ops.collector_audit
+      VALUES (run_id, CURRENT_TIMESTAMP(), '8_recommendations', r.region, 'SKIPPED', 0, @@error.message);
+    END IF;
   END;
 
   BEGIN

@@ -97,6 +97,13 @@ def cmd_collect(c) -> None:
     if c.get("jobs_view"):
         sql = re.sub(r"DECLARE jobs_view\s+STRING\s+DEFAULT\s+'[^']*';",
                      f"DECLARE jobs_view             STRING DEFAULT '{c['jobs_view']}';", sql)
+    recs_view = c.get("recs_view") or (
+        "RECOMMENDATIONS_BY_ORGANIZATION"
+        if str(c.get("jobs_view") or "").upper() == "JOBS_BY_ORGANIZATION" else None
+    )
+    if recs_view:
+        sql = re.sub(r"DECLARE recs_view\s+STRING\s+DEFAULT\s+'[^']*';",
+                     f"DECLARE recs_view             STRING DEFAULT '{recs_view}';", sql)
     if c.get("reservation_admin_project"):
         sql = re.sub(r"DECLARE admin_project\s+STRING\s+DEFAULT\s+NULL;",
                      f"DECLARE admin_project         STRING DEFAULT '{c['reservation_admin_project']}';", sql)
@@ -120,9 +127,21 @@ def cmd_collect(c) -> None:
     bq.client(c).query(sql).result()
     print(f"  + Executed SQL collector: sql/02_collector_run.sql for {', '.join(local) or 'no home region'} "
           f"(lookback={effective_days}d)")
+    if local and not c.get("target_dataset"):
+        extra_home = [p for p in remote_collector.projects_for_region(c, home, route_info)
+                      if p != c["project_id"]]
+        if extra_home:
+            print(f"[*] Collecting cross-project table metadata in {home} across {len(extra_home)} "
+                  f"additional project(s): {', '.join(extra_home[:8])}"
+                  + ("..." if len(extra_home) > 8 else ""))
+            xres = remote_collector.collect_extra_projects_home(c, home, extra_home, run_id)
+            for step, n in xres.items():
+                print(f"    {step:<22} {n}")
     for reg in remote:
-        print(f"[*] Collecting remote region {reg} (query there -> load + MERGE into {c.ops})...")
-        res = remote_collector.collect_region(c, reg, run_id)
+        reg_projs = remote_collector.projects_for_region(c, reg, route_info)
+        print(f"[*] Collecting remote region {reg} across {len(reg_projs)} project(s) "
+              f"(query there -> load + MERGE into {c.ops})...")
+        res = remote_collector.collect_region(c, reg, run_id, projects=reg_projs)
         for step, n in res.items():
             print(f"    {step:<18} {n}")
     target_ds = c.get("target_dataset")

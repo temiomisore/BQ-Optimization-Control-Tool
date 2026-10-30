@@ -314,11 +314,13 @@ def check_transfers(c: Config, ctx: dict) -> dict:
 def check_cross_project(c: Config, ctx: dict) -> dict:
     home = regions.home_region(c)
     title = "Table details across all projects (org)"
-    why = "Coming next: table-level cards for every project, not just the tool's own (optional today)."
+    why = ("Reads table sizes across every project in the organization in one query "
+           "(optional: falls back to per-project table views automatically).")
     err = _probe(c, f"SELECT 1 AS ok FROM `region-{home}`.INFORMATION_SCHEMA.TABLE_STORAGE_BY_ORGANIZATION LIMIT 1",
                  location=home)
     if err is None:
-        return result("cross_project", title, why, OK, "Ready: can read table sizes for the whole organization.",
+        return result("cross_project", title, why, OK,
+                      "Can read table sizes across the whole organization (TABLE_STORAGE_BY_ORGANIZATION).",
                       optional=True)
     if classify(err) == "not_enabled":
         fix = bq_sql(c["project_id"], f"ALTER ORGANIZATION SET OPTIONS (`region-{home}.enable_info_schema_storage` = TRUE);",

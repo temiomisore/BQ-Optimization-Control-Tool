@@ -159,5 +159,196 @@ class TestConform(unittest.TestCase):
         self.assertEqual(out["destination_table"], {"project_id": "p", "table_id": "t"})
 
 
+class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
+    def test_extract_project_id_ignores_numeric_project_number(self):
+        # Cloud Asset Inventory's `project` field is numeric ("projects/377289738115");
+        # the string project ID must come from `name` or `parentFullResourceName`.
+        res_name = {
+            "location": "US",
+            "name": "//bigquery.googleapis.com/projects/analytics-prod-01/datasets/orders",
+            "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/analytics-prod-01",
+            "project": "projects/377289738115",
+        }
+        self.assertEqual(regions.extract_project_id(res_name), "analytics-prod-01")
+        res_parent = {
+            "location": "us-east4",
+            "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/altostrat.com:fin-mart",
+            "project": "projects/999888777",
+        }
+        self.assertEqual(regions.extract_project_id(res_parent), "altostrat.com:fin-mart")
+        self.assertIsNone(regions.extract_project_id({"location": "US", "project": "projects/377289738115"}))
+
+    def test_projects_by_region(self):
+        results = [
+            {"location": "US", "name": "//bigquery.googleapis.com/projects/proj-b/datasets/d1",
+             "project": "projects/222"},
+            {"location": "us", "name": "//bigquery.googleapis.com/projects/proj-a/datasets/d2",
+             "project": "projects/111"},
+            {"location": "US", "name": "//bigquery.googleapis.com/projects/proj-b/datasets/d3",
+             "project": "projects/222"},
+            {"location": "us-east4", "name": "//bigquery.googleapis.com/projects/proj-c/datasets/d4",
+             "project": "projects/333"},
+        ]
+        self.assertEqual(regions.projects_by_region(results),
+                         {"us": ["proj-a", "proj-b"], "us-east4": ["proj-c"]})
+
+    def test_project_qualified_sql_builders(self):
+        ts = rc.table_state_sql("us-east4", True, project="proj-b")
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.TABLES", ts)
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.TABLE_OPTIONS", ts)
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.TABLE_STORAGE", ts)
+        self.assertIn("'optimizer_ops'", ts)
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.COLUMNS",
+                      rc.columns_sql("us-east4", project="proj-b"))
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.SCHEMATA",
+                      rc.datasets_sql("us-east4", project="proj-b"))
+        self.assertIn("`proj-b.region-us-east4`.INFORMATION_SCHEMA.VIEWS",
+                      rc.objects_sql("us-east4", "VIEW", project="proj-b"))
+        self.assertIn("`region-us-east4`.INFORMATION_SCHEMA.TABLE_STORAGE_BY_ORGANIZATION",
+                      rc.org_storage_sql("us-east4"))
+        with self.assertRaises(ValueError):
+            rc.table_state_sql("us-east4", True, project="377289738115")  # numeric project number rejected
+
+    def test_projects_for_region_modes_and_fallback(self):
+        from unittest import mock
+        # Single-project scope -> host project only
+        c_single = cfg(project_id="host-proj", asset_scope="projects/host-proj")
+        self.assertEqual(rc.projects_for_region(c_single, "us",
+                                                {"projects_by_region": {"us": ["host-proj", "other-proj"]}}),
+                         ["host-proj"])
+        # Dataset-scoped -> host project only
+        c_ds = cfg(project_id="host-proj", asset_scope="organizations/42", target_dataset="only_ds")
+        self.assertEqual(rc.projects_for_region(c_ds, "us",
+                                                {"projects_by_region": {"us": ["host-proj", "other-proj"]}}),
+                         ["host-proj"])
+        # Org scope with Cloud Asset Inventory discovery -> host first, then discovered projects
+        c_org = cfg(project_id="host-proj", asset_scope="organizations/42")
+        self.assertEqual(rc.projects_for_region(c_org, "us-east4",
+                                                {"projects_by_region": {"us-east4": ["proj-b", "host-proj", "proj-c"]}}),
+                         ["host-proj", "proj-b", "proj-c"])
+        # Org scope fallback to jobs_events when Cloud Asset Inventory wasn't available
+        with mock.patch.object(rc.bq, "query", return_value=[{"pid": "proj-x"}, {"pid": "12345"}, {"pid": "host-proj"}]):
+            self.assertEqual(rc.projects_for_region(c_org, "us-east4", {"projects_by_region": {}}),
+                             ["host-proj", "proj-x"])
+
+    def test_multi_project_table_state_org_storage_and_fault_isolation(self):
+        from unittest import mock
+        c = cfg(project_id="p1", asset_scope="organizations/42")
+        captured = {}
+
+        def fake_q(_c, sql, params=None, region=None):
+            if "TABLE_STORAGE_BY_ORGANIZATION" in sql:
+                return [
+                    {"project_id": "p1", "table_schema": "ds1", "table_name": "t1",
+                     "total_rows": 100, "total_logical_bytes": 4096},
+                    {"project_id": "p2", "table_schema": "ds2", "table_name": "t2",
+                     "total_rows": 500, "total_logical_bytes": 65536},
+                ]
+            if "`p3.region-us-east4`" in sql:
+                raise RuntimeError("403 Access Denied: Project p3 lacks metadataViewer")
+            if "`p1.region-us-east4`" in sql:
+                return [{"project_id": "p1", "dataset_id": "ds1", "table_id": "t1", "total_logical_bytes": None}]
+            if "`p2.region-us-east4`" in sql:
+                return [{"project_id": "p2", "dataset_id": "ds2", "table_id": "t2", "total_logical_bytes": None}]
+            return []
+
+        def fake_replace(_c, region, table, rows, kinds=None, exclude_project=None):
+            captured["rows"] = rows
+            captured["exclude_project"] = exclude_project
+            return len(rows)
+
+        with mock.patch.object(rc, "_q", fake_q), mock.patch.object(rc, "_replace_today", fake_replace):
+            n, note = rc.collect_table_state(c, "us-east4", "r1", projects=["p1", "p2", "p3"])
+
+        self.assertEqual(n, 2)
+        self.assertIsNone(captured["exclude_project"])
+        by_proj = {r["project_id"]: r for r in captured["rows"]}
+        self.assertEqual(by_proj["p1"]["total_logical_bytes"], 4096)
+        self.assertEqual(by_proj["p2"]["total_logical_bytes"], 65536)
+        self.assertIn("2/3 project(s) scanned", note)
+        self.assertIn("org TABLE_STORAGE", note)
+        self.assertIn("skipped 1: p3", note)
+
+    def test_collect_extra_projects_home_preserves_host_project(self):
+        from unittest import mock
+        from google.cloud.bigquery import SchemaField
+        c = cfg(project_id="p1", asset_scope="organizations/42")
+        executed_sql = []
+
+        def fake_q(_c, sql, params=None, region=None):
+            if "TABLE_STORAGE_BY_ORGANIZATION" in sql:
+                raise RuntimeError("403 org storage disabled")
+            if "`p2.region-us`.INFORMATION_SCHEMA.TABLE_STORAGE" in sql:
+                raise RuntimeError("TABLE_STORAGE view hasn't been enabled")
+            if "`p2.region-us`.INFORMATION_SCHEMA.TABLES" in sql:
+                return [{"project_id": "p2", "dataset_id": "sales", "table_id": "orders", "total_logical_bytes": None}]
+            if "`p2.region-us`.INFORMATION_SCHEMA.COLUMNS" in sql:
+                return [{"project_id": "p2", "dataset_id": "sales", "table_id": "orders", "column_name": "dt"}]
+            if "`p2.region-us`.INFORMATION_SCHEMA.SCHEMATA" in sql and "SCHEMATA_OPTIONS" not in sql:
+                return [{"schema_name": "sales"}]
+            if "`p2.sales.INFORMATION_SCHEMA.PARTITIONS`" in sql:
+                return [{"project_id": "p2", "dataset_id": "sales", "table_id": "orders", "partition_id": "20261030"}]
+            if "`p2.region-us`.INFORMATION_SCHEMA.SCHEMATA" in sql:
+                return [{"project_id": "p2", "dataset_id": "sales", "location": "US"}]
+            if "`p2.region-us`.INFORMATION_SCHEMA.VIEWS" in sql:
+                return [{"project_id": "p2", "dataset_id": "sales", "object_id": "v_orders"}]
+            return []
+
+        def fake_execute(_c, sql, params=None, location=None):
+            executed_sql.append((sql, params))
+            return 1
+
+        with mock.patch.object(rc, "_q", fake_q), \
+                mock.patch.object(rc, "_schema", lambda *_a, **_k: [SchemaField("project_id", "STRING")]), \
+                mock.patch.object(rc.bq, "load_rows", lambda *_a, **_k: None), \
+                mock.patch.object(rc, "_drop", lambda *_a, **_k: None), \
+                mock.patch.object(rc.bq, "execute", fake_execute):
+            res = rc.collect_extra_projects_home(c, "us", ["p2"], "run-123")
+
+        self.assertEqual(res["3_table_state_xproj"], 1)
+        self.assertEqual(res["4_columns_xproj"], 1)
+        self.assertEqual(res["5_partitions_xproj"], 1)
+        self.assertEqual(res["6_dataset_state_xproj"], 1)
+        self.assertEqual(res["7_objects_xproj"], 1)
+        tx_calls = [(s, p) for s, p in executed_sql if "DELETE FROM" in s]
+        self.assertEqual(len(tx_calls), 5)
+        for sql, params in tx_calls:
+            self.assertIn("project_id != @excl_proj", sql)
+            self.assertEqual(params["excl_proj"], "p1")
+
+    def test_driver_backfills_storage_billing_model_across_projects(self):
+        from unittest import mock
+        from optimizer import collector_driver
+        c = cfg(project_id="p1")
+        updates = []
+
+        class FakeDs:
+            def __init__(self, model):
+                self.storage_billing_model = model
+
+        class FakeCli:
+            def get_dataset(self, ref):
+                if ref == "p3.locked":
+                    raise RuntimeError("403 Access Denied")
+                return FakeDs("PHYSICAL" if ref == "p2.mart" else "LOGICAL")
+
+        def fake_exec(_c, sql, params=None):
+            updates.append((sql, params))
+            return len(params["fqns"])
+
+        with mock.patch.object(collector_driver.bq, "client", return_value=FakeCli()), \
+                mock.patch.object(collector_driver.bq, "query", return_value=[
+                    {"project_id": "p1", "dataset_id": "core"},
+                    {"project_id": "p2", "dataset_id": "mart"},
+                    {"project_id": "p3", "dataset_id": "locked"},
+                ]), \
+                mock.patch.object(collector_driver.bq, "execute", fake_exec):
+            n = collector_driver.backfill_storage_billing_model(c)
+
+        self.assertEqual(n, 2)
+        by_model = {p["m"]: p["fqns"] for _, p in updates}
+        self.assertEqual(by_model, {"LOGICAL": ["p1.core"], "PHYSICAL": ["p2.mart"]})
+
+
 if __name__ == "__main__":
     unittest.main()

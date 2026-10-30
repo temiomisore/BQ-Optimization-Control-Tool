@@ -26,6 +26,9 @@ AUTO = "auto"
 ASSET_TYPE = "bigquery.googleapis.com/Dataset"
 _ASSET_URL = "https://cloudasset.googleapis.com/v1/{scope}:searchAllResources"
 _REGION_RE = re.compile(r"^[a-z][a-z0-9-]{1,39}$")
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
+_BQ_DS_NAME_RE = re.compile(r"^//bigquery\.googleapis\.com/projects/([^/]+)/datasets/[^/]+$")
+_CRM_PARENT_RE = re.compile(r"^//cloudresourcemanager\.googleapis\.com/projects/([^/]+)$")
 
 REGIONS_SEEN_DDL = """
 CREATE TABLE IF NOT EXISTS `{ops}.regions_seen` (
@@ -101,6 +104,37 @@ def resolve(c: Config, discovered: Iterable[str] | None = None,
     return sorted(route, key=lambda r: (r != home, r))
 
 
+def extract_project_id(res: dict) -> str | None:
+    """Extract the string GCP project_id (not numeric project number) from a Cloud Asset row.
+
+    Cloud Asset Inventory's `res["project"]` is numeric (`projects/377289738115`), which BigQuery
+    INFORMATION_SCHEMA rejects; the real string project ID lives in `name` or `parentFullResourceName`.
+    """
+    m = _BQ_DS_NAME_RE.match(str(res.get("name") or ""))
+    if m and _PROJECT_ID_RE.match(m.group(1)):
+        return m.group(1)
+    m = _CRM_PARENT_RE.match(str(res.get("parentFullResourceName") or ""))
+    if m and _PROJECT_ID_RE.match(m.group(1)):
+        return m.group(1)
+    raw = str(res.get("project") or "")
+    if raw.startswith("projects/"):
+        cand = raw.split("/", 1)[1]
+        if _PROJECT_ID_RE.match(cand):
+            return cand
+    return None
+
+
+def projects_by_region(results: Iterable[dict]) -> dict[str, list[str]]:
+    """Cloud Asset Inventory results -> {region: sorted unique string project_ids} (pure)."""
+    by_reg: dict[str, set[str]] = {}
+    for res in results:
+        reg = normalize(res.get("location"))
+        pid = extract_project_id(res)
+        if reg and pid:
+            by_reg.setdefault(reg, set()).add(pid)
+    return {r: sorted(pids) for r, pids in sorted(by_reg.items())}
+
+
 def aggregate_assets(results: Iterable[dict]) -> dict[str, dict]:
     """Cloud Asset Inventory results -> {region: {"datasets": n, "projects": n}} (pure)."""
     counts: dict[str, int] = {}
@@ -110,7 +144,7 @@ def aggregate_assets(results: Iterable[dict]) -> dict[str, dict]:
         if not reg:
             continue
         counts[reg] = counts.get(reg, 0) + 1
-        projects.setdefault(reg, set()).add(res.get("project") or "?")
+        projects.setdefault(reg, set()).add(extract_project_id(res) or res.get("project") or "?")
     return {r: {"datasets": counts[r], "projects": len(projects[r])} for r in sorted(counts)}
 
 
@@ -130,9 +164,8 @@ def _credentials(c: Config):
     return creds
 
 
-def discover(c: Config) -> dict[str, dict]:
-    """Every BigQuery dataset in `asset_scope`, grouped by location (Cloud Asset Inventory
-    searchAllResources). Raises on API / permission errors so the caller can fall back."""
+def _fetch_asset_results(c: Config) -> list[dict]:
+    """Raw Cloud Asset Inventory searchAllResources rows for every BigQuery dataset in `asset_scope`."""
     from google.auth.transport.requests import AuthorizedSession
     scope = c.get("asset_scope") or f"projects/{c['project_id']}"
     creds = _credentials(c)
@@ -157,7 +190,19 @@ def discover(c: Config) -> dict[str, dict]:
         if not token:
             break
         params["pageToken"] = token
-    return aggregate_assets(results)
+    return results
+
+
+def discover(c: Config) -> dict[str, dict]:
+    """Every BigQuery dataset in `asset_scope`, grouped by location (Cloud Asset Inventory
+    searchAllResources). Raises on API / permission errors so the caller can fall back."""
+    return aggregate_assets(_fetch_asset_results(c))
+
+
+def discover_with_projects(c: Config) -> tuple[dict[str, dict], dict[str, list[str]]]:
+    """Single Cloud Asset Inventory call returning both region counts and string project IDs per region."""
+    results = _fetch_asset_results(c)
+    return aggregate_assets(results), projects_by_region(results)
 
 
 def last_known(c: Config) -> list[str]:
@@ -203,16 +248,18 @@ def record(c: Config, discovered: dict[str, dict], route: list[str], source: str
 
 
 def plan_route(c: Config, run_id: str = "", record_result: bool = True) -> tuple[list[str], dict]:
-    """Decide which regions to collect this run. Never raises for discovery problems:
-    falls back to the last known regions (auto mode) and reports the error in `info`."""
+    """Decide which regions (and projects per region) to collect this run. Never raises for
+    discovery problems: falls back to the last known regions (auto mode) and reports the error."""
     info: dict = {"mode": AUTO if is_auto(c) else "list", "source": "config",
-                  "discovered": {}, "new_regions": [], "error": None,
+                  "discovered": {}, "projects_by_region": {}, "new_regions": [], "error": None,
                   "scope": c.get("asset_scope") or f"projects/{c['project_id']}"}
     discovered = None
     if is_auto(c):
         try:
-            discovered = discover(c)
-            info["source"], info["discovered"] = "asset_inventory", discovered
+            discovered, proj_map = discover_with_projects(c)
+            info["source"] = "asset_inventory"
+            info["discovered"] = discovered
+            info["projects_by_region"] = proj_map
         except Exception as e:  # noqa: BLE001
             info["source"], info["error"] = "last_known", str(e)[:500]
     route = resolve(c, list(discovered) if discovered is not None else None,

@@ -17,22 +17,38 @@ def backfill_storage_billing_model(c: Config) -> int:
     n = 0
     target_ds = c.get("target_dataset")
     if target_ds:
-        try:
-            datasets = [cli.get_dataset(f"{c['project_id']}.{target_ds}")]
-        except Exception:
-            datasets = []
+        refs = [(c["project_id"], target_ds)]
     else:
-        datasets = [cli.get_dataset(item.reference) for item in cli.list_datasets(project=c["project_id"])]
-        
-    for ds in datasets:
-        model = getattr(ds, "storage_billing_model", None)
-        if not model:
+        try:
+            rows = bq.query(c, f"""
+                SELECT DISTINCT project_id, dataset_id
+                FROM `{c.ops}.dataset_state_daily`
+                WHERE snapshot_date = CURRENT_DATE()
+                  AND project_id IS NOT NULL AND dataset_id IS NOT NULL""")
+            refs = [(r["project_id"], r["dataset_id"]) for r in rows]
+        except Exception:
+            refs = []
+        if not refs:
+            refs = [(c["project_id"], item.dataset_id)
+                    for item in cli.list_datasets(project=c["project_id"])]
+
+    by_model: dict[str, list[str]] = {}
+    for proj, ds_id in refs:
+        try:
+            ds = cli.get_dataset(f"{proj}.{ds_id}")
+            model = getattr(ds, "storage_billing_model", None)
+            if model:
+                by_model.setdefault(str(model), []).append(f"{proj}.{ds_id}")
+        except Exception:
             continue
+
+    for model, fqns in by_model.items():
         n += bq.execute(c, f"""
             UPDATE `{c.ops}.dataset_state_daily`
             SET storage_billing_model = @m
-            WHERE snapshot_date = CURRENT_DATE() AND project_id = @p AND dataset_id = @d""",
-            {"m": str(model), "p": c["project_id"], "d": ds.dataset_id})
+            WHERE snapshot_date = CURRENT_DATE()
+              AND CONCAT(project_id, '.', dataset_id) IN UNNEST(@fqns)""",
+            {"m": model, "fqns": fqns})
     return n
 
 
