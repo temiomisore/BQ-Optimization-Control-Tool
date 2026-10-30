@@ -253,7 +253,20 @@ export async function fetchDashboard(principal?: string): Promise<Dashboard> {
   return asJson<Dashboard>(await fetch(`/api/dashboard${qs}`, { headers: { Accept: "application/json" } }));
 }
 
-/* ------------------------------------------------------- settings + setup check (read-only) */
+/* ------------------------------------------------------- settings + setup check */
+export interface SettingPreset {
+  value: unknown;
+  label: string;
+}
+
+export interface SettingFieldSpec {
+  key: string;
+  label: string;
+  default_col?: string | null;
+  required?: boolean;
+  hint?: string;
+}
+
 export interface SettingItem {
   key: string;
   label: string;
@@ -273,11 +286,58 @@ export interface SettingItem {
   min?: number | null;
   max?: number | null;
   choices?: string[] | null;
+  presets?: SettingPreset[] | null;
+  fields?: SettingFieldSpec[] | null;
+  table_key?: string | null;
   applies?: string;
   applies_text?: string;
   editable_by_you?: boolean;
   locked_reason?: string | null;
   saved?: { by?: string | null; at?: string | null; note?: string | null };
+}
+
+export interface RegionOption {
+  value: string;
+  label: string;
+  group: string;
+  home?: boolean;
+  discovered?: boolean;
+  dataset_count?: number | null;
+  project_count?: number | null;
+}
+
+export interface LabeledOption {
+  value: string;
+  label: string;
+}
+
+export interface TableOption {
+  value: string;
+  project: string;
+  dataset: string;
+  table: string;
+  region?: string;
+}
+
+export interface SettingsOptions {
+  restricted?: boolean;
+  home_region: string;
+  project_id: string;
+  regions: RegionOption[];
+  scopes: LabeledOption[];
+  projects: LabeledOption[];
+  datasets: LabeledOption[];
+  tables: TableOption[];
+  emails: LabeledOption[];
+}
+
+export interface TableColumnsResponse {
+  ok: boolean;
+  table?: string | null;
+  is_default?: boolean;
+  columns: { name: string; type: string }[];
+  error?: string;
+  restricted?: boolean;
 }
 
 export interface SettingsAccess {
@@ -345,6 +405,20 @@ export interface SetupCheckResponse {
 export async function fetchSettings(principal?: string): Promise<SettingsResponse> {
   const qs = principal ? `?principal=${encodeURIComponent(principal)}` : "";
   return asJson<SettingsResponse>(await fetch(`/api/settings${qs}`, { headers: { Accept: "application/json" } }));
+}
+
+export async function fetchSettingsOptions(principal?: string): Promise<SettingsOptions> {
+  const qs = principal ? `?principal=${encodeURIComponent(principal)}` : "";
+  return asJson<SettingsOptions>(await fetch(`/api/settings/options${qs}`, { headers: { Accept: "application/json" } }));
+}
+
+export async function fetchTableColumns(params: { table?: string | null; key?: string; principal?: string }): Promise<TableColumnsResponse> {
+  const sp = new URLSearchParams();
+  if (params.table) sp.set("table", params.table);
+  if (params.key) sp.set("key", params.key);
+  if (params.principal) sp.set("principal", params.principal);
+  const qs = sp.toString();
+  return asJson<TableColumnsResponse>(await fetch(`/api/settings/table-columns${qs ? `?${qs}` : ""}`, { headers: { Accept: "application/json" } }));
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {

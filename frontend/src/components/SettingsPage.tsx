@@ -2,15 +2,17 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  AlertTriangle, ArrowLeft, CheckCircle2, ChevronDown, Download, History, Info, Lock, MinusCircle, Pencil, Plus,
-  RefreshCw, RotateCcw, Search, ShieldCheck, Undo2, UserCog, Users, X, XCircle,
+  AlertTriangle, ArrowLeft, CheckCircle2, ChevronDown, Code2, Download, History, Info, ListFilter, Lock,
+  MinusCircle, Pencil, Plus, RefreshCw, RotateCcw, Search, ShieldCheck, Undo2, UserCog, Users, X, XCircle,
 } from "lucide-react";
 import {
-  fetchSettings, fetchSettingsHistory, fetchSetupCheck, revertSettingChange, saveSetting, updateSettingsEditors,
-  type CheckStatus, type SettingChange, type SettingItem, type SettingsAccess, type SetupCheck,
+  fetchSettings, fetchSettingsHistory, fetchSettingsOptions, fetchSetupCheck, fetchTableColumns,
+  revertSettingChange, saveSetting, updateSettingsEditors,
+  type CheckStatus, type LabeledOption, type RegionOption, type SettingChange, type SettingItem,
+  type SettingsAccess, type SettingsOptions, type SetupCheck, type TableOption,
 } from "@/lib/api";
 import { useReviewer } from "@/lib/store";
-import { ago, cn } from "@/lib/utils";
+import { ago, cn, regionName } from "@/lib/utils";
 import { Badge, Button, Skeleton } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
 
@@ -145,6 +147,19 @@ function SetupCheckPanel() {
 
 const BUCKET_ICON: Record<string, string> = { startup: "🧱", everyday: "🎛️", safety: "🔒" };
 
+const FALLBACK_REGIONS: RegionOption[] = [
+  { value: "us", label: "US multi-region", group: "Multi-regions" },
+  { value: "eu", label: "EU multi-region", group: "Multi-regions" },
+  { value: "us-central1", label: "Iowa", group: "Americas" },
+  { value: "us-east1", label: "South Carolina", group: "Americas" },
+  { value: "us-east4", label: "Northern Virginia", group: "Americas" },
+  { value: "us-west1", label: "Oregon", group: "Americas" },
+  { value: "europe-west1", label: "Belgium", group: "Europe" },
+  { value: "europe-west2", label: "London", group: "Europe" },
+  { value: "asia-northeast1", label: "Tokyo", group: "Asia Pacific, Middle East & Africa" },
+  { value: "australia-southeast1", label: "Sydney", group: "Asia Pacific, Middle East & Africa" },
+];
+
 function fmtValue(v: unknown): { text: string; empty: boolean } {
   if (v === null || v === undefined || v === "") return { text: "not set", empty: true };
   if (typeof v === "boolean") return { text: v ? "On" : "Off", empty: false };
@@ -173,6 +188,8 @@ function useSettingsMutations() {
   const { email } = useReviewer();
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ["settings"] });
+    qc.invalidateQueries({ queryKey: ["settings-options"] });
+    qc.invalidateQueries({ queryKey: ["table-columns"] });
     qc.invalidateQueries({ queryKey: ["settings-history"] });
     qc.invalidateQueries({ queryKey: ["dashboard"] });
   };
@@ -202,10 +219,15 @@ function useSettingsMutations() {
 
 /* --------------------------------------------------------------------- who can edit */
 
-function AccessPanel({ access }: { access: SettingsAccess }) {
+function AccessPanel({ access, knownEmails }: { access: SettingsAccess; knownEmails?: LabeledOption[] }) {
   const { editors } = useSettingsMutations();
   const [newEmail, setNewEmail] = useState("");
   const role = access.is_admin ? "Settings admin" : access.is_editor ? "Settings editor" : "View only";
+  const candidateEmails = useMemo(() => {
+    const taken = new Set([...access.admins, ...access.editors].map((x) => x.toLowerCase()));
+    return (knownEmails || []).filter((x) => !taken.has(x.value.toLowerCase()));
+  }, [knownEmails, access.admins, access.editors]);
+
   return (
     <section className="panel space-y-3 p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -274,7 +296,18 @@ function AccessPanel({ access }: { access: SettingsAccess }) {
                 if (newEmail.trim()) editors.mutate({ action: "add", email: newEmail.trim() }, { onSuccess: () => setNewEmail("") });
               }}
             >
-              <input className="input py-1.5 text-xs" placeholder="name@company.com" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} />
+              <input
+                className="input py-1.5 text-xs"
+                list="settings-known-emails"
+                placeholder={candidateEmails.length ? "Pick a teammate or type name@company.com" : "name@company.com"}
+                value={newEmail}
+                onChange={(e) => setNewEmail(e.target.value)}
+              />
+              {candidateEmails.length > 0 && (
+                <datalist id="settings-known-emails">
+                  {candidateEmails.map((x) => <option key={x.value} value={x.value}>{x.label}</option>)}
+                </datalist>
+              )}
               <Button size="sm" variant="secondary" type="submit" loading={editors.isPending} className="shrink-0 whitespace-nowrap">
                 <Plus className="h-3.5 w-3.5" /> Add editor
               </Button>
@@ -284,6 +317,516 @@ function AccessPanel({ access }: { access: SettingsAccess }) {
       </div>
     </section>
   );
+}
+
+/* ----------------------------------------------------------- specialized dropdown editors */
+
+const CUSTOM = "__custom__";
+
+interface GroupedChoice {
+  value: string;
+  label: string;
+  group?: string;
+}
+
+/** Dropdown of known presets / discovered values, with a "Custom…" option that reveals an input. */
+function ChoiceWithCustomEditor({
+  s, draft, setDraft, options, emptyLabel, customLabel, customPlaceholder, inputType = "text",
+}: {
+  s: SettingItem;
+  draft: string;
+  setDraft: (v: string) => void;
+  options: GroupedChoice[];
+  emptyLabel?: string;
+  customLabel: string;
+  customPlaceholder: string;
+  inputType?: "text" | "number";
+}) {
+  const matched = useMemo(() => {
+    const trimmed = draft.trim();
+    if (s.nullable && trimmed === "") return "";
+    if (inputType === "number") {
+      if (trimmed === "" || Number.isNaN(Number(trimmed))) return null;
+      const hit = options.find((o) => Number(o.value) === Number(trimmed));
+      return hit ? hit.value : null;
+    }
+    if (s.kind === "email") {
+      const hit = options.find((o) => o.value.toLowerCase() === trimmed.toLowerCase());
+      return hit ? hit.value : null;
+    }
+    const hit = options.find((o) => o.value === trimmed);
+    return hit ? hit.value : null;
+  }, [draft, options, s.nullable, s.kind, inputType]);
+
+  const [forceCustom, setForceCustom] = useState(false);
+  const isCustom = forceCustom || matched === null;
+  const selectValue = isCustom ? CUSTOM : (matched ?? "");
+
+  const ungrouped = options.filter((o) => !o.group);
+  const groupNames = [...new Set(options.map((o) => o.group).filter(Boolean))] as string[];
+
+  return (
+    <div className="flex flex-col gap-2 sm:flex-row">
+      <select
+        className="input cursor-pointer py-1.5 text-xs sm:max-w-md"
+        value={selectValue}
+        onChange={(e) => {
+          const val = e.target.value;
+          if (val === CUSTOM) {
+            setForceCustom(true);
+          } else {
+            setForceCustom(false);
+            setDraft(val);
+          }
+        }}
+      >
+        {s.nullable && <option value="">{emptyLabel || "Not set (use default)"}</option>}
+        {ungrouped.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        {groupNames.map((g) => (
+          <optgroup key={g} label={g}>
+            {options.filter((o) => o.group === g).map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </optgroup>
+        ))}
+        <option value={CUSTOM}>{customLabel}</option>
+      </select>
+      {isCustom && (
+        <input
+          className="input py-1.5 font-mono text-xs sm:max-w-xs"
+          type={inputType}
+          step={s.kind === "int" ? 1 : "any"}
+          min={s.min ?? undefined}
+          max={s.max ?? undefined}
+          value={draft}
+          onChange={(e) => {
+            setForceCustom(true);
+            setDraft(e.target.value);
+          }}
+          placeholder={customPlaceholder}
+          autoFocus={forceCustom}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Multi-select chip + dropdown picker for BigQuery locations (regions, include, exclude). */
+function RegionListEditor({
+  draft, setDraft, regions, homeRegion, excludeHome,
+}: {
+  draft: string;
+  setDraft: (v: string) => void;
+  regions: RegionOption[];
+  homeRegion?: string;
+  excludeHome?: boolean;
+}) {
+  const selected = useMemo(
+    () => [...new Set(draft.split(/[,\s]+/).map((x) => x.trim().toLowerCase().replace(/^region-/, "")).filter(Boolean))],
+    [draft],
+  );
+  const [showCustom, setShowCustom] = useState(false);
+  const [customVal, setCustomVal] = useState("");
+
+  const catalog = regions.length ? regions : FALLBACK_REGIONS;
+  const labelMap = useMemo(() => Object.fromEntries(catalog.map((r) => [r.value, r.label])), [catalog]);
+  const home = (homeRegion || catalog.find((r) => r.home)?.value || "us").toLowerCase();
+
+  const update = (next: string[]) => setDraft(next.join(", "));
+  const add = (raw: string) => {
+    const clean = raw.trim().toLowerCase().replace(/^region-/, "");
+    if (!clean || (excludeHome && clean === home)) return;
+    if (!selected.includes(clean)) update([...selected, clean]);
+  };
+  const remove = (code: string) => update(selected.filter((x) => x !== code));
+
+  const available = catalog.filter((r) => !selected.includes(r.value) && !(excludeHome && (r.home || r.value === home)));
+  const discovered = available.filter((r) => r.discovered);
+  const rest = available.filter((r) => !r.discovered);
+  const restGroups = [...new Set(rest.map((r) => r.group))];
+
+  const fmtRegionOption = (r: RegionOption) => {
+    const extra: string[] = [];
+    if (r.dataset_count != null && r.dataset_count > 0) extra.push(`${r.dataset_count} dataset${r.dataset_count === 1 ? "" : "s"}`);
+    if (r.home) extra.push("home");
+    return `${r.value} · ${r.label}${extra.length ? ` (${extra.join(" · ")})` : ""}`;
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {selected.length > 0 ? selected.map((code) => {
+          const human = labelMap[code] || regionName(code);
+          return (
+            <Badge key={code} className="bg-sky-500/10 font-mono text-sky-700 ring-sky-500/30 dark:text-sky-300">
+              <span>{code}</span>
+              {human && human !== code && <span className="font-sans text-[10px] text-zinc-500 dark:text-zinc-400">· {human}</span>}
+              <button
+                type="button"
+                title={`Remove ${code}`}
+                className="ml-0.5 rounded hover:text-rose-400"
+                onClick={() => remove(code)}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </Badge>
+          );
+        }) : <span className="text-xs italic text-zinc-400">No regions selected</span>}
+      </div>
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <select
+          className="input cursor-pointer py-1.5 text-xs sm:max-w-sm"
+          value={showCustom ? CUSTOM : ""}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (v === CUSTOM) {
+              setShowCustom(true);
+            } else if (v) {
+              setShowCustom(false);
+              add(v);
+            }
+          }}
+        >
+          <option value="">+ Add a BigQuery location…</option>
+          {discovered.length > 0 && (
+            <optgroup label="Found in your warehouse">
+              {discovered.map((r) => <option key={r.value} value={r.value}>{fmtRegionOption(r)}</option>)}
+            </optgroup>
+          )}
+          {restGroups.map((g) => (
+            <optgroup key={g} label={g}>
+              {rest.filter((r) => r.group === g).map((r) => (
+                <option key={r.value} value={r.value}>{fmtRegionOption(r)}</option>
+              ))}
+            </optgroup>
+          ))}
+          <option value={CUSTOM}>Other location (enter code)…</option>
+        </select>
+
+        {showCustom && (
+          <div className="flex items-center gap-1.5">
+            <input
+              className="input py-1.5 font-mono text-xs sm:w-44"
+              placeholder="e.g. europe-west10"
+              value={customVal}
+              onChange={(e) => setCustomVal(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  add(customVal);
+                  setCustomVal("");
+                  setShowCustom(false);
+                }
+              }}
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              type="button"
+              onClick={() => {
+                add(customVal);
+                setCustomVal("");
+                setShowCustom(false);
+              }}
+            >
+              Add
+            </Button>
+          </div>
+        )}
+        {excludeHome && <span className="text-[11px] text-zinc-400">Home location ({home}) is always collected.</span>}
+      </div>
+    </div>
+  );
+}
+
+/** Per-column dropdown editor for HR hierarchy & service-account owner column mappings. */
+function ColumnMapEditor({
+  s, mapDraft, setMapDraft, yamlMode, setYamlMode, yamlDraft, setYamlDraft, allSettings,
+}: {
+  s: SettingItem;
+  mapDraft: Record<string, string | null>;
+  setMapDraft: React.Dispatch<React.SetStateAction<Record<string, string | null>>>;
+  yamlMode: boolean;
+  setYamlMode: (v: boolean) => void;
+  yamlDraft: string;
+  setYamlDraft: (v: string) => void;
+  allSettings: Record<string, SettingItem>;
+}) {
+  const { email } = useReviewer();
+  const tableSetting = s.table_key ? allSettings[s.table_key] : undefined;
+  const configuredTable = String(tableSetting?.value || "").trim();
+  const colsQ = useQuery({
+    queryKey: ["table-columns", configuredTable, s.key, email],
+    queryFn: () => fetchTableColumns({ table: configuredTable || undefined, key: s.key, principal: email }),
+    staleTime: 60 * 1000,
+  });
+  const liveCols = colsQ.data?.columns || [];
+  const colNames = useMemo(() => new Set(liveCols.map((c) => c.name)), [liveCols]);
+  const [customFields, setCustomFields] = useState<Record<string, boolean>>({});
+
+  const fields = s.fields || [];
+  const shortTable = (colsQ.data?.table || configuredTable).split(".").slice(-2).join(".");
+
+  const setField = (k: string, mode: string, val?: string) => {
+    setMapDraft((prev) => {
+      const next = { ...prev };
+      if (mode === "__default__") {
+        delete next[k];
+      } else if (mode === "__null__") {
+        if (s.key === "service_account_owner_columns") delete next[k];
+        else next[k] = null;
+      } else if (mode === "") {
+        delete next[k];
+      } else {
+        next[k] = val ?? "";
+      }
+      return next;
+    });
+  };
+
+  return (
+    <div className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500">
+        <div>
+          {colsQ.isLoading ? (
+            <span>Reading table columns…</span>
+          ) : configuredTable && colsQ.data?.ok ? (
+            <span className="text-emerald-600 dark:text-emerald-400">
+              ✓ Showing {liveCols.length} live columns from <span className="font-mono">{configuredTable}</span>
+            </span>
+          ) : configuredTable && colsQ.data?.error ? (
+            <span className="text-amber-500">Couldn't read {configuredTable}: {colsQ.data.error}</span>
+          ) : colsQ.data?.is_default && liveCols.length > 0 ? (
+            <span>
+              No external <span className="font-mono">{s.table_key}</span> set above — showing built-in{" "}
+              <span className="font-mono">{shortTable}</span> columns as reference.
+            </span>
+          ) : (
+            <span>Pick each column from your table, or choose "Not in our table" to skip optional columns.</span>
+          )}
+        </div>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 text-[11px] font-medium text-sky-500 hover:text-sky-400"
+          onClick={() => {
+            if (!yamlMode) {
+              setYamlDraft(
+                Object.entries(mapDraft).map(([k, x]) => `${k}: ${x === null ? "null" : x}`).join("\n"),
+              );
+            }
+            setYamlMode(!yamlMode);
+          }}
+        >
+          {yamlMode ? <><ListFilter className="h-3 w-3" /> Use dropdowns</> : <><Code2 className="h-3 w-3" /> Raw YAML</>}
+        </button>
+      </div>
+
+      {yamlMode ? (
+        <textarea
+          className="input min-h-[84px] py-1.5 font-mono text-xs"
+          value={yamlDraft}
+          onChange={(e) => setYamlDraft(e.target.value)}
+          placeholder="user_email: email"
+        />
+      ) : (
+        <div className="grid gap-2.5 sm:grid-cols-2">
+          {fields.map((f) => {
+            const hasKey = Object.prototype.hasOwnProperty.call(mapDraft, f.key);
+            const rawVal = mapDraft[f.key];
+            const forced = !!customFields[f.key];
+
+            let selectVal: string;
+            if (forced) {
+              selectVal = CUSTOM;
+            } else if (!hasKey) {
+              selectVal = f.default_col ? "__default__" : (f.required ? "" : "__null__");
+            } else if (rawVal === null) {
+              selectVal = "__null__";
+            } else if (f.default_col && rawVal === f.default_col) {
+              selectVal = "__default__";
+            } else if (rawVal && colNames.has(rawVal)) {
+              selectVal = `col:${rawVal}`;
+            } else {
+              selectVal = CUSTOM;
+            }
+
+            return (
+              <div key={f.key} className="rounded-md border border-zinc-200/80 bg-white/60 p-2 dark:border-ink-800 dark:bg-ink-950/50">
+                <div className="mb-1 flex items-center justify-between gap-1 text-xs">
+                  <span className="font-medium text-zinc-700 dark:text-zinc-200">
+                    {f.label} <span className="font-mono text-[10px] text-zinc-400">({f.key})</span>
+                  </span>
+                  {f.required && <Badge className="text-[9px] text-amber-600 ring-amber-500/30 dark:text-amber-300">required</Badge>}
+                </div>
+                <select
+                  className="input cursor-pointer py-1 text-xs"
+                  value={selectVal}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === CUSTOM) {
+                      setCustomFields((p) => ({ ...p, [f.key]: true }));
+                      if (!hasKey || rawVal === null) setField(f.key, "val", f.hint || f.default_col || "");
+                    } else if (v.startsWith("col:")) {
+                      setCustomFields((p) => ({ ...p, [f.key]: false }));
+                      setField(f.key, "val", v.slice(4));
+                    } else {
+                      setCustomFields((p) => ({ ...p, [f.key]: false }));
+                      setField(f.key, v);
+                    }
+                  }}
+                >
+                  {f.default_col && <option value="__default__">Same column name ({f.default_col})</option>}
+                  {!f.default_col && f.required && <option value="">Choose column in your table…</option>}
+                  {!f.required && <option value="__null__">Not in our table (skip)</option>}
+                  {liveCols.length > 0 && (
+                    <optgroup label={configuredTable ? `Columns in ${shortTable}` : `Columns in ${shortTable} (default)`}>
+                      {liveCols.map((c) => (
+                        <option key={c.name} value={`col:${c.name}`}>{c.name} · {c.type}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  <option value={CUSTOM}>Enter column name manually…</option>
+                </select>
+                {selectVal === CUSTOM && (
+                  <input
+                    className="input mt-1.5 py-1 font-mono text-xs"
+                    value={typeof rawVal === "string" ? rawVal : ""}
+                    onChange={(e) => {
+                      setCustomFields((p) => ({ ...p, [f.key]: true }));
+                      setField(f.key, "val", e.target.value);
+                    }}
+                    placeholder={f.hint || f.default_col || "your_column_name"}
+                  />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CLASS_WEIGHT_LABELS: Record<string, string> = {
+  "1": "Class 1 · Clustering & config",
+  "2": "Class 2 · Materialized views",
+  "3": "Class 3 · Rebuilds & Editions",
+  "4": "Class 4 · SQL PRs",
+};
+
+const WEIGHT_CHOICES = [
+  { v: 0.5, label: "0.5× (rank higher)" },
+  { v: 1.0, label: "1.0× (baseline)" },
+  { v: 1.3, label: "1.3× (slight penalty)" },
+  { v: 1.5, label: "1.5× (moderate penalty)" },
+  { v: 2.0, label: "2.0× (half score)" },
+  { v: 2.5, label: "2.5×" },
+  { v: 3.0, label: "3.0× (strict penalty)" },
+  { v: 4.0, label: "4.0×" },
+];
+
+/** Preset + per-class dropdown editor for risk_weights. */
+function WeightsEditor({
+  s, weights, setWeights,
+}: {
+  s: SettingItem;
+  weights: Record<string, string>;
+  setWeights: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+}) {
+  const presets = s.presets || [];
+  const matchedIdx = useMemo(() => {
+    return presets.findIndex((p) => {
+      const pv = p.value as Record<string, number>;
+      return ["1", "2", "3", "4"].every((k) => Number(weights[k]) === Number(pv[k]));
+    });
+  }, [presets, weights]);
+  const [customCls, setCustomCls] = useState<Record<string, boolean>>({});
+
+  return (
+    <div className="space-y-2.5">
+      <select
+        className="input cursor-pointer py-1.5 text-xs sm:max-w-lg"
+        value={matchedIdx >= 0 ? String(matchedIdx) : CUSTOM}
+        onChange={(e) => {
+          const idx = Number(e.target.value);
+          if (!Number.isNaN(idx) && presets[idx]) {
+            const pv = presets[idx].value as Record<string, number>;
+            setCustomCls({});
+            setWeights({ "1": String(pv["1"]), "2": String(pv["2"]), "3": String(pv["3"]), "4": String(pv["4"]) });
+          }
+        }}
+      >
+        {presets.map((p, i) => <option key={i} value={String(i)}>{p.label}</option>)}
+        <option value={CUSTOM}>Custom weights per class…</option>
+      </select>
+
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {(["1", "2", "3", "4"] as const).map((cls) => {
+          const cur = weights[cls] ?? "1.0";
+          const hit = WEIGHT_CHOICES.find((w) => w.v === Number(cur) && cur.trim() !== "");
+          const isCustom = !!customCls[cls] || !hit;
+          return (
+            <div key={cls} className="rounded-md border border-zinc-200/80 bg-white/60 p-2 dark:border-ink-800 dark:bg-ink-950/50">
+              <div className="mb-1 text-[11px] font-medium text-zinc-700 dark:text-zinc-200">{CLASS_WEIGHT_LABELS[cls]}</div>
+              <select
+                className="input cursor-pointer py-1 text-xs"
+                value={isCustom ? CUSTOM : String(hit.v)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === CUSTOM) {
+                    setCustomCls((p) => ({ ...p, [cls]: true }));
+                  } else {
+                    setCustomCls((p) => ({ ...p, [cls]: false }));
+                    setWeights((prev) => ({ ...prev, [cls]: v }));
+                  }
+                }}
+              >
+                {WEIGHT_CHOICES.map((w) => <option key={w.v} value={String(w.v)}>{w.label}</option>)}
+                <option value={CUSTOM}>Custom weight…</option>
+              </select>
+              {isCustom && (
+                <input
+                  className="input mt-1.5 py-1 font-mono text-xs"
+                  type="number"
+                  step="0.1"
+                  min={0.1}
+                  value={cur}
+                  onChange={(e) => {
+                    setCustomCls((p) => ({ ...p, [cls]: true }));
+                    setWeights((prev) => ({ ...prev, [cls]: e.target.value }));
+                  }}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+const TABLE_SUGGEST_RE: Record<string, RegExp> = {
+  employee_hierarchy_table: /hierarch|employ|people|person|staff|\bhr\b|user|org|dir/i,
+  service_account_owner_table: /service_account|\bsa_|owner|principal|identit/i,
+  billing_export_table: /billing|gcp_billing_export|invoice|cost/i,
+};
+
+function buildTableChoices(key: string, tables: TableOption[], opsDataset = "optimizer_ops"): GroupedChoice[] {
+  const rx = TABLE_SUGGEST_RE[key];
+  const skipBuiltIn = key === "employee_hierarchy_table" || key === "service_account_owner_table";
+  const suggested: GroupedChoice[] = [];
+  const other: GroupedChoice[] = [];
+  for (const t of tables) {
+    if (skipBuiltIn && t.dataset === opsDataset) continue;
+    const label = t.region ? `${t.value} (${t.region})` : t.value;
+    if (rx && rx.test(`${t.dataset}.${t.table}`)) {
+      suggested.push({ value: t.value, label, group: "Suggested tables" });
+    } else {
+      other.push({ value: t.value, label, group: suggested.length ? "Other tables in warehouse" : "Tables in warehouse" });
+    }
+  }
+  return [...suggested, ...other];
 }
 
 /* --------------------------------------------------------------------- one setting */
@@ -311,56 +854,246 @@ function SourceBadge({ source }: { source: string }) {
 
 const EDIT_TAG: Record<string, string> = { finops: "FinOps only", admin: "Admin only" };
 
-function Editor({ s, onDone }: { s: SettingItem; onDone: () => void }) {
+const EMPTY_LABELS: Record<string, string> = {
+  asset_scope: "Not set — this project only (default)",
+  target_dataset: "Not set — collect every dataset (default)",
+  reservation_admin_project: "Not set — use Enterprise list price",
+  employee_hierarchy_table: "Not set — use built-in optimizer_ops.employee_hierarchy (default)",
+  service_account_owner_table: "Not set — use built-in optimizer_ops.service_account_owners (default)",
+  billing_export_table: "Not set",
+  default_owner: "Not set — data-platform-admin@<project> (default)",
+  max_bytes_billed_per_query: "Not set — no byte cap (default)",
+};
+
+function Editor({
+  s, onDone, options, allSettings,
+}: {
+  s: SettingItem;
+  onDone: () => void;
+  options?: SettingsOptions;
+  allSettings: Record<string, SettingItem>;
+}) {
   const { save } = useSettingsMutations();
   const [draft, setDraft] = useState(toDraft(s));
   const [mode, setMode] = useState(s.kind === "regions_mode" && s.value === "auto" ? "auto" : "list");
+  const [mapDraft, setMapDraft] = useState<Record<string, string | null>>(() => {
+    if (s.kind !== "map" || !s.value || typeof s.value !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(s.value as Record<string, unknown>).map(([k, v]) => [k, v === null ? null : String(v)]),
+    );
+  });
+  const [yamlMode, setYamlMode] = useState(false);
+  const [weightsDraft, setWeightsDraft] = useState<Record<string, string>>(() => {
+    const base = (s.value && typeof s.value === "object" ? s.value : {}) as Record<string, unknown>;
+    return {
+      "1": String(base["1"] ?? 1.0),
+      "2": String(base["2"] ?? 1.3),
+      "3": String(base["3"] ?? 2.0),
+      "4": String(base["4"] ?? 1.5),
+    };
+  });
   const [note, setNote] = useState("");
+
   const submit = () => {
-    const value = s.kind === "regions_mode" && mode === "auto" ? "auto" : draft;
+    let value: unknown = draft;
+    if (s.kind === "regions_mode") {
+      value = mode === "auto" ? "auto" : draft;
+    } else if (s.kind === "map") {
+      value = yamlMode ? draft : mapDraft;
+    } else if (s.kind === "weights") {
+      value = weightsDraft;
+    }
     save.mutate({ key: s.key, value, note: note || undefined }, { onSuccess: onDone });
   };
+
+  const presetChoices: GroupedChoice[] = useMemo(
+    () => (s.presets || []).map((p) => ({ value: String(p.value), label: p.label })),
+    [s.presets],
+  );
+  const opsDataset = String(allSettings["ops_dataset"]?.value || "optimizer_ops");
+
   let field: React.ReactNode;
   if (s.kind === "bool") {
     field = (
-      <select className="input py-1.5 text-xs" value={draft} onChange={(e) => setDraft(e.target.value)}>
-        <option value="on">On</option>
-        <option value="off">Off</option>
+      <select className="input cursor-pointer py-1.5 text-xs sm:max-w-xs" value={draft} onChange={(e) => setDraft(e.target.value)}>
+        <option value="on">On — Enabled</option>
+        <option value="off">Off — Disabled</option>
       </select>
     );
   } else if (s.kind === "enum") {
+    const enumChoices = presetChoices.length
+      ? presetChoices
+      : (s.choices || []).map((c) => ({ value: c, label: c }));
     field = (
-      <select className="input py-1.5 text-xs" value={draft} onChange={(e) => setDraft(e.target.value)}>
-        {(s.choices || []).map((c) => <option key={c} value={c}>{c}</option>)}
+      <select className="input cursor-pointer py-1.5 text-xs sm:max-w-lg" value={draft} onChange={(e) => setDraft(e.target.value)}>
+        {enumChoices.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
       </select>
     );
-  } else if (s.kind === "map" || s.kind === "weights") {
+  } else if (s.kind === "region_list" || s.kind === "regions_mode") {
     field = (
-      <textarea className="input min-h-[84px] py-1.5 font-mono text-xs" value={draft} onChange={(e) => setDraft(e.target.value)}
-        placeholder={s.kind === "weights" ? "1: 1.0\n2: 1.3\n3: 2.0\n4: 1.5" : "user_email: email"} />
+      <RegionListEditor
+        draft={draft}
+        setDraft={setDraft}
+        regions={options?.regions || []}
+        homeRegion={options?.home_region}
+        excludeHome={s.key === "regions_exclude"}
+      />
+    );
+  } else if (s.kind === "map") {
+    field = (
+      <ColumnMapEditor
+        s={s}
+        mapDraft={mapDraft}
+        setMapDraft={setMapDraft}
+        yamlMode={yamlMode}
+        setYamlMode={setYamlMode}
+        yamlDraft={draft}
+        setYamlDraft={setDraft}
+        allSettings={allSettings}
+      />
+    );
+  } else if (s.kind === "weights") {
+    field = <WeightsEditor s={s} weights={weightsDraft} setWeights={setWeightsDraft} />;
+  } else if (s.kind === "scope") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={options?.scopes || []}
+        emptyLabel={EMPTY_LABELS[s.key]}
+        customLabel="Enter another scope (organizations/ID or folders/ID)…"
+        customPlaceholder="organizations/123456789"
+      />
+    );
+  } else if (s.kind === "dataset") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={options?.datasets || []}
+        emptyLabel={EMPTY_LABELS[s.key]}
+        customLabel="Enter another dataset name…"
+        customPlaceholder="my_dataset"
+      />
+    );
+  } else if (s.kind === "project") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={options?.projects || []}
+        emptyLabel={EMPTY_LABELS[s.key]}
+        customLabel="Enter another project ID…"
+        customPlaceholder="my-reservation-admin-project"
+      />
+    );
+  } else if (s.kind === "table") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={buildTableChoices(s.key, options?.tables || [], opsDataset)}
+        emptyLabel={EMPTY_LABELS[s.key]}
+        customLabel="Enter another project.dataset.table…"
+        customPlaceholder="project.dataset.table"
+      />
+    );
+  } else if (s.kind === "email") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={options?.emails || []}
+        emptyLabel={EMPTY_LABELS[s.key]}
+        customLabel="Enter another email address…"
+        customPlaceholder="owner@company.com"
+      />
+    );
+  } else if (s.kind === "model") {
+    field = (
+      <ChoiceWithCustomEditor
+        s={s}
+        draft={draft}
+        setDraft={setDraft}
+        options={presetChoices}
+        customLabel="Enter another Gemini model…"
+        customPlaceholder="gemini-3-flash-preview"
+      />
     );
   } else if (s.kind === "int" || s.kind === "float") {
-    field = (
-      <input className="input py-1.5 font-mono text-xs" type="number" value={draft} step={s.kind === "int" ? 1 : "any"}
-        min={s.min ?? undefined} max={s.max ?? undefined} onChange={(e) => setDraft(e.target.value)}
-        placeholder={s.nullable ? "empty = not set" : ""} />
-    );
+    if (presetChoices.length > 0) {
+      field = (
+        <ChoiceWithCustomEditor
+          s={s}
+          draft={draft}
+          setDraft={setDraft}
+          options={presetChoices}
+          emptyLabel={EMPTY_LABELS[s.key]}
+          customLabel="Custom value…"
+          customPlaceholder={s.min != null && s.max != null ? `${s.min} – ${s.max}` : "Enter number"}
+          inputType="number"
+        />
+      );
+    } else {
+      field = (
+        <input
+          className="input py-1.5 font-mono text-xs sm:max-w-xs"
+          type="number"
+          value={draft}
+          step={s.kind === "int" ? 1 : "any"}
+          min={s.min ?? undefined}
+          max={s.max ?? undefined}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={s.nullable ? "empty = not set" : ""}
+        />
+      );
+    }
   } else {
     field = (
-      <input className="input py-1.5 font-mono text-xs" value={draft} onChange={(e) => setDraft(e.target.value)}
-        placeholder={s.kind === "region_list" || s.kind === "regions_mode" ? "us, us-east4" : s.nullable ? "empty = not set" : ""} />
+      <input
+        className="input py-1.5 font-mono text-xs"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder={s.nullable ? "empty = not set" : ""}
+      />
     );
   }
+
   return (
     <div className="mt-2 space-y-2 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
       {s.kind === "regions_mode" && (
-        <div className="flex gap-3 text-xs">
-          <label className="flex items-center gap-1"><input type="radio" checked={mode === "auto"} onChange={() => setMode("auto")} /> Find automatically</label>
-          <label className="flex items-center gap-1"><input type="radio" checked={mode === "list"} onChange={() => setMode("list")} /> Fixed list</label>
+        <div className="flex flex-wrap gap-4 text-xs">
+          <label className="flex cursor-pointer items-center gap-1.5">
+            <input type="radio" checked={mode === "auto"} onChange={() => setMode("auto")} />
+            <span>Find automatically (Cloud Asset Inventory)</span>
+          </label>
+          <label className="flex cursor-pointer items-center gap-1.5">
+            <input
+              type="radio"
+              checked={mode === "list"}
+              onChange={() => {
+                setMode("list");
+                if (draft.trim().toLowerCase() === "auto") {
+                  setDraft(options?.home_region || "us");
+                }
+              }}
+            />
+            <span>Fixed list of regions</span>
+          </label>
         </div>
       )}
       {!(s.kind === "regions_mode" && mode === "auto") && field}
-      <input className="input py-1.5 text-xs" value={note} onChange={(e) => setNote(e.target.value)} placeholder="Why are you changing this? (optional, shown in history)" />
+      <input
+        className="input py-1.5 text-xs"
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder="Why are you changing this? (optional, shown in history)"
+      />
       <div className="flex flex-wrap items-center gap-2">
         <Button size="sm" variant="primary" onClick={submit} loading={save.isPending}>Save</Button>
         <Button size="sm" variant="ghost" onClick={onDone}>Cancel</Button>
@@ -370,7 +1103,13 @@ function Editor({ s, onDone }: { s: SettingItem; onDone: () => void }) {
   );
 }
 
-function SettingRow({ s }: { s: SettingItem }) {
+function SettingRow({
+  s, options, allSettings,
+}: {
+  s: SettingItem;
+  options?: SettingsOptions;
+  allSettings: Record<string, SettingItem>;
+}) {
   const v = fmtValue(s.value);
   const [editing, setEditing] = useState(false);
   const { save } = useSettingsMutations();
@@ -414,7 +1153,7 @@ function SettingRow({ s }: { s: SettingItem }) {
           )}
         </div>
       </div>
-      {editing && <Editor s={s} onDone={() => setEditing(false)} />}
+      {editing && <Editor s={s} onDone={() => setEditing(false)} options={options} allSettings={allSettings} />}
     </div>
   );
 }
@@ -475,6 +1214,13 @@ function HistoryPanel({ labels, canUndo }: { labels: Record<string, SettingItem>
 function SettingsPanel() {
   const { email } = useReviewer();
   const q = useQuery({ queryKey: ["settings", email], queryFn: () => fetchSettings(email), staleTime: 30 * 1000 });
+  const isEditor = !!q.data?.access?.is_editor;
+  const optQ = useQuery({
+    queryKey: ["settings-options", email],
+    queryFn: () => fetchSettingsOptions(email),
+    enabled: isEditor,
+    staleTime: 2 * 60 * 1000,
+  });
   const [filter, setFilter] = useState("");
   const data = q.data;
   const needle = filter.trim().toLowerCase();
@@ -497,7 +1243,7 @@ function SettingsPanel() {
 
   return (
     <>
-      {data?.access && <AccessPanel access={data.access} />}
+      {data?.access && <AccessPanel access={data.access} knownEmails={optQ.data?.emails} />}
       <section className="panel space-y-4 p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -505,7 +1251,7 @@ function SettingsPanel() {
             <p className="mt-0.5 max-w-3xl text-xs text-zinc-500">
               Every setting the tool reads, what it's set to now, and where that value comes from.{" "}
               {editableCount > 0
-                ? <>You can change <b>{editableCount}</b> of them: click the ✏️ next to a value. Changes are checked before saving and logged below.</>
+                ? <>You can change <b>{editableCount}</b> of them: click the ✏️ next to a value to pick from known options or enter a custom value. Changes are checked before saving and logged below.</>
                 : <>You can't change any of them with your current identity.</>}{" "}
               Values pinned by an environment variable, startup settings and safety switches are changed at deploy time.
             </p>
@@ -546,7 +1292,9 @@ function SettingsPanel() {
                   {groups.map((g) => (
                     <div key={g}>
                       <div className="label pt-3 !text-[10px]">{g}</div>
-                      {rows.filter((s) => s.group === g).map((s) => <SettingRow key={s.key} s={s} />)}
+                      {rows.filter((s) => s.group === g).map((s) => (
+                        <SettingRow key={s.key} s={s} options={optQ.data} allSettings={labels} />
+                      ))}
                     </div>
                   ))}
                 </div>

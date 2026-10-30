@@ -23,7 +23,8 @@ class TestCatalogComplete(unittest.TestCase):
                 self.assertIn(k, keys, f"{k} missing from settings_catalog")
 
     def test_every_env_var_is_listed(self):
-        src = open(config.__file__).read()
+        with open(config.__file__) as f:
+            src = f.read()
         for var in set(re.findall(r'"(BQOPT_[A-Z_]+)"', src)) - {"BQOPT_CONFIG", "BQOPT_LOOKBACK_DAYS"}:
             self.assertIn(var, sc.ENV_VARS, f"{var} missing from settings_catalog")
 

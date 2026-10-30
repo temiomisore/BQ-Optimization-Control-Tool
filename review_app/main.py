@@ -691,6 +691,10 @@ _SETUP_LOCK = threading.Lock()
 _SETUP_CACHE: dict = {"ts": 0.0, "data": None}
 _SETUP_TTL_SEC = 300.0
 
+_OPTIONS_LOCK = threading.Lock()
+_OPTIONS_CACHE: dict = {"ts": 0.0, "data": None}
+_OPTIONS_TTL_SEC = 120.0
+
 
 def _check_command() -> str:
     """How to run the same checks as another account (e.g. the nightly job's)."""
@@ -719,6 +723,36 @@ def api_settings():
     data["check_command"] = _check_command()
     data["access"] = access
     return jsonify(_jsonable(data))
+
+
+@app.get("/api/settings/options")
+def api_settings_options():
+    """Known & live choices for Settings dropdowns (regions, scopes, datasets, projects, tables, emails)."""
+    from flask import jsonify
+    from optimizer import settings_options
+    c, _saved, access = _settings_context(request.args.get("principal"))
+    if not access["is_editor"]:
+        return jsonify(settings_options.empty_options(c))
+    refresh = request.args.get("refresh") in ("1", "true")
+    with _OPTIONS_LOCK:
+        fresh = _OPTIONS_CACHE["data"] is not None and time.time() - _OPTIONS_CACHE["ts"] < _OPTIONS_TTL_SEC
+        if refresh or not fresh:
+            _OPTIONS_CACHE["data"] = settings_options.discover_options(c, access["editors"])
+            _OPTIONS_CACHE["ts"] = time.time()
+        data = copy.deepcopy(_OPTIONS_CACHE["data"])
+    return jsonify(_jsonable(data))
+
+
+@app.get("/api/settings/table-columns")
+def api_settings_table_columns():
+    """Live schema columns for an HR / SA-owner lookup table so column mappings use dropdowns."""
+    from flask import jsonify
+    from optimizer import settings_options
+    c, _saved, access = _settings_context(request.args.get("principal"))
+    if not access["is_editor"]:
+        return jsonify({"ok": False, "table": None, "is_default": False, "columns": [], "restricted": True})
+    return jsonify(_jsonable(settings_options.table_columns(
+        c, request.args.get("table"), request.args.get("key"))))
 
 
 def _settings_denied(msg: str):
@@ -759,6 +793,8 @@ def _after_settings_change(key: str) -> str | None:
     invalidate_dashboard_cache()
     with _SETUP_LOCK:
         _SETUP_CACHE["data"] = None
+    with _OPTIONS_LOCK:
+        _OPTIONS_CACHE["data"] = None
     if key in settings_catalog.OWNER_KEYS:
         from optimizer import attribution
         try:
