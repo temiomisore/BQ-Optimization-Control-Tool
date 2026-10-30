@@ -982,7 +982,11 @@ def api_setup_check():
     from optimizer import setup_check
     refresh = request.args.get("refresh") in ("1", "true")
     with _SETUP_LOCK:
-        fresh = _SETUP_CACHE["data"] is not None and time.time() - _SETUP_CACHE["ts"] < _SETUP_TTL_SEC
+        cached = _SETUP_CACHE["data"]
+        has_issues = bool(cached and ((cached.get("summary") or {}).get("fail", 0) > 0
+                                      or (cached.get("summary") or {}).get("warn", 0) > 0))
+        ttl = 15.0 if has_issues else _SETUP_TTL_SEC
+        fresh = cached is not None and time.time() - _SETUP_CACHE["ts"] < ttl
         if refresh or not fresh:
             _SETUP_CACHE["data"] = setup_check.run_checks(cfg())
             _SETUP_CACHE["ts"] = time.time()

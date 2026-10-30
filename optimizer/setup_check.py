@@ -237,7 +237,7 @@ def check_table_storage(c: Config, ctx: dict, region: str) -> dict:
         )
         return result(f"table_storage:{region}", title, why, WARN,
                       f"Table size views are turned off in {region}. A BigQuery admin turns them on once "
-                      "(data appears right away; full history takes about a day).",
+                      "(BigQuery takes ~2–3 minutes to activate after running the command; full history takes about a day).",
                       f"{proj_cmd}\n# Or for every project in your organization at once:\n# {org_cmd}",
                       region=region)
     return result(f"table_storage:{region}", title, why, WARN, short(err),
