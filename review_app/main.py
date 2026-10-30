@@ -1037,7 +1037,7 @@ _COPILOT_REFERENCE = {
         "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
         "1. **Engine 1 — Fast Regex Pattern Scanner (`C4-01`..`C4-09`)**: Instantly catches obvious anti-patterns (`SELECT *`, `ORDER BY` without `LIMIT`, `WHERE DATE(col) = ...`).\n"
         "2. **Engine 2 — Google Official ZetaSQL AST Compiler (`bigquery-antipattern-recognition.jar`)**: Parses queries into an Abstract Syntax Tree (AST) to catch deep structural issues like CTEs evaluated multiple times and `ROW_NUMBER() = 1` sorts.\n"
-        "3. **Engine 3 — Vertex AI Gemini 3 Flash (`gemini-3-flash-preview`) + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
+        "3. **Engine 3 — Vertex AI Gemini Flash (`gemini-3.8-flash`) + `dry_run=True` Verifier**: Reads live table partitioning/clustering metadata, rewrites complex SQL, and runs a `$0` BigQuery `dry_run` to mathematically verify byte reduction before creating a card."
     ),
     "APPLY_CLASSES": (
         "Apply classes: Class 1 = in-place metadata DDL (clustering, require_partition_filter, expirations, "
@@ -1048,7 +1048,11 @@ _COPILOT_REFERENCE = {
     ),
 }
 
-_COPILOT_MODELS = [("gemini-3-flash-preview", "global"), ("gemini-2.5-flash", "us-central1")]
+_COPILOT_MODELS = [
+    ("gemini-3.8-flash", "global"),
+    ("gemini-3.5-flash", "global"),
+    ("gemini-3.5-flash-lite", "global"),
+]
 
 
 def _as_float(v) -> float:
@@ -1196,7 +1200,12 @@ def finops_chat():
         from google.genai import types
 
         gen_cfg = types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2)
-        for model, loc in _COPILOT_MODELS:
+        cfg_model = str((c.get("ai_judge") or {}).get("model") or "").strip()
+        copilot_candidates = list(_COPILOT_MODELS)
+        if cfg_model:
+            pref = (cfg_model, "global" if cfg_model.startswith(("gemini-3", "gemini-4")) else "us-central1")
+            copilot_candidates = [pref] + [m for m in copilot_candidates if m != pref]
+        for model, loc in copilot_candidates:
             try:
                 gclient = genai.Client(vertexai=True, project=c.project_id, location=loc,
                                        http_options=types.HttpOptions(timeout=30_000))

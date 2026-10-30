@@ -2269,7 +2269,7 @@ def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding],
     if not ai_cfg.get("enabled", True):
         return []
 
-    model_name = ai_cfg.get("model", "gemini-3-flash-preview")
+    model_name = ai_cfg.get("model", "gemini-3.8-flash")
     proj = c.get("project_id", "")
 
     try:
@@ -2350,12 +2350,20 @@ Respond strictly in JSON format with keys:
             )
             resp = None
             active_model = model_name
-            for cand_model, cand_client in [
-                (model_name, client_global if model_name.startswith("gemini-3") else client_regional),
-                ("gemini-3-flash-preview", client_global),
+            raw_candidates = [
+                (model_name, client_global),
+                *([] if model_name.startswith(("gemini-3", "gemini-4")) else [(model_name, client_regional)]),
+                ("gemini-3.8-flash", client_global),
+                ("gemini-3.5-flash", client_global),
                 ("gemini-3.1-pro-preview", client_global),
-                ("gemini-2.5-flash", client_regional),
-            ]:
+                ("gemini-3.5-flash-lite", client_global),
+            ]
+            seen_candidates: set[tuple[str, int]] = set()
+            for cand_model, cand_client in raw_candidates:
+                cand_key = (cand_model, id(cand_client))
+                if cand_key in seen_candidates:
+                    continue
+                seen_candidates.add(cand_key)
                 try:
                     resp = cand_client.models.generate_content(
                         model=cand_model,

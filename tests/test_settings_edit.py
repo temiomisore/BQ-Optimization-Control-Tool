@@ -354,6 +354,22 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
         self.assertEqual(empty["tables"], [])
         self.assertEqual(empty["emails"], [])
 
+    def test_ai_judge_model_defaults_to_latest_ga_flash(self):
+        from optimizer import settings_catalog as sc
+        from review_app import main as app_main
+
+        spec = sc.BY_KEY["ai_judge.model"]
+        self.assertEqual(spec["default"], "gemini-3.8-flash")
+        preset_vals = [p["value"] for p in spec["presets"]]
+        self.assertIn("gemini-3.8-flash", preset_vals)
+        self.assertIn("gemini-3.5-flash", preset_vals)
+        self.assertIn("gemini-3.5-flash-lite", preset_vals)
+        self.assertTrue(all(not v.startswith("gemini-2.5") for v in preset_vals))
+        for val in preset_vals:
+            self.assertEqual(sc.validate("ai_judge.model", val, _cfg()), val)
+        self.assertEqual(app_main._COPILOT_MODELS[0], ("gemini-3.8-flash", "global"))
+        self.assertTrue(all(not m.startswith("gemini-2.5") for m, _ in app_main._COPILOT_MODELS))
+
 
 if __name__ == "__main__":
     unittest.main()

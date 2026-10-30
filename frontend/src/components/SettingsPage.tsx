@@ -1031,7 +1031,7 @@ function Editor({
         setDraft={setDraft}
         options={presetChoices}
         customLabel="Enter another Gemini model…"
-        customPlaceholder="gemini-3-flash-preview"
+        customPlaceholder="gemini-3.8-flash"
       />
     );
   } else if (s.kind === "int" || s.kind === "float") {
