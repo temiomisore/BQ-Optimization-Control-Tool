@@ -310,7 +310,11 @@ function AccessPanel({ access, knownEmails }: { access: SettingsAccess; knownEma
               />
               {candidateEmails.length > 0 && (
                 <datalist id="settings-known-emails">
-                  {candidateEmails.map((x) => <option key={x.value} value={x.value}>{x.label}</option>)}
+                  {candidateEmails.map((x) => {
+                    const prefix = `${x.value} — `;
+                    const hint = x.label.startsWith(prefix) ? x.label.slice(prefix.length) : "";
+                    return <option key={x.value} value={x.value}>{hint}</option>;
+                  })}
                 </datalist>
               )}
               <Button size="sm" variant="secondary" type="submit" loading={editors.isPending} className="shrink-0 whitespace-nowrap">

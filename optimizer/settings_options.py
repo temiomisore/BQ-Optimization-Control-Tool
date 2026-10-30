@@ -262,6 +262,14 @@ def _probe_people(c: Any, editors: Iterable[str]) -> list[dict[str, str]]:
         if tag and tag not in tags:
             tags.append(tag)
 
+    def _query_first(*sqls: str) -> list[dict[str, Any]]:
+        for sql in sqls:
+            try:
+                return bq.query(c, sql) or []
+            except Exception:
+                continue
+        return []
+
     for e in sorted(sc.settings_admins(c)):
         add(e, "Settings admin")
     for e in sorted(editors or []):
@@ -271,28 +279,57 @@ def _probe_people(c: Any, editors: Iterable[str]) -> list[dict[str, str]]:
     if c.get("default_owner"):
         add(c.get("default_owner"), "Current fallback owner")
 
-    try:
-        rows = bq.query(c, f"""
-            SELECT user_email, user_name, department, director_email, director_name
+    # Read through the attribution _src shim views first so custom external HR / SA tables
+    # (and mapped column names) populate the dropdown automatically; fall back to raw tables.
+    hr_rows = _query_first(
+        f"""SELECT user_email, user_name, department, manager_email, director_email, director_name
+            FROM `{c.ops}.v_employee_hierarchy_src`
+            LIMIT 300""",
+        f"""SELECT user_email, user_name, department, director_email, director_name
             FROM `{c.ops}.employee_hierarchy`
-            LIMIT 200""")
-        for r in rows or []:
-            parts = [str(x).strip() for x in (r.get("user_name"), r.get("department")) if x]
-            add(r.get("user_email"), " · ".join(parts) if parts else None)
-            d_name = str(r.get("director_name") or "").strip()
-            add(r.get("director_email"), d_name or "Director")
-    except Exception:
-        pass
+            LIMIT 200""",
+    )
+    for r in hr_rows:
+        parts = [str(x).strip() for x in (r.get("user_name"), r.get("department")) if x]
+        add(r.get("user_email"), " · ".join(parts) if parts else None)
+        d_name = str(r.get("director_name") or "").strip()
+        add(r.get("director_email"), d_name or "Director")
+        if r.get("manager_email"):
+            add(r.get("manager_email"), "Manager")
 
-    try:
-        rows = bq.query(c, f"""
-            SELECT DISTINCT owner_email, owner_team
+    sa_rows = _query_first(
+        f"""SELECT DISTINCT owner_email, owner_team, director_email, director_name
+            FROM `{c.ops}.v_service_account_owners_src`
+            WHERE owner_email IS NOT NULL OR director_email IS NOT NULL
+            LIMIT 150""",
+        f"""SELECT DISTINCT owner_email, owner_team
             FROM `{c.ops}.service_account_owners`
             WHERE owner_email IS NOT NULL
-            LIMIT 100""")
-        for r in rows or []:
-            team = str(r.get("owner_team") or "").strip()
-            add(r.get("owner_email"), f"SA owner · {team}" if team else "SA owner")
+            LIMIT 100""",
+    )
+    for r in sa_rows:
+        team = str(r.get("owner_team") or "").strip()
+        add(r.get("owner_email"), f"SA owner · {team}" if team else "SA owner")
+        if r.get("director_email"):
+            d_name = str(r.get("director_name") or "").strip()
+            add(r.get("director_email"), d_name or "Director")
+
+    # Day-1 auto-discovery before any HR table is connected: surface real human teammates
+    # who ran BigQuery queries in the last 30 days (zero extra APIs or IAM permissions).
+    try:
+        job_rows = bq.query(c, f"""
+            SELECT LOWER(TRIM(user_email)) AS user_email, COUNT(*) AS job_count
+            FROM `{c.ops}.jobs_events`
+            WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+              AND user_email IS NOT NULL
+              AND NOT ENDS_WITH(LOWER(TRIM(user_email)), '.gserviceaccount.com')
+            GROUP BY 1
+            ORDER BY job_count DESC
+            LIMIT 150""")
+        for r in job_rows or []:
+            cnt = int(r.get("job_count") or 0)
+            tag = f"Active BQ user ({cnt} {'query' if cnt == 1 else 'queries'}/30d)" if cnt > 0 else "Active BQ user"
+            add(r.get("user_email"), tag)
     except Exception:
         pass
 

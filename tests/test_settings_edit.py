@@ -239,15 +239,21 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
             if "table_state_daily" in sql:
                 return [{"project_id": "other-proj", "dataset_id": "hr", "table_id": "employee_dir",
                          "region": "us-east4"}]
+            if "jobs_events" in sql and "user_email" in sql:
+                return [{"user_email": "sayali@x.com", "job_count": 42},
+                        {"user_email": "Alice@x.com", "job_count": 10},
+                        {"user_email": "sa-runner@p.iam.gserviceaccount.com", "job_count": 99}]
             if "jobs_events" in sql:
                 return [{"project_id": "jobs-proj"}]
-            if "employee_hierarchy" in sql:
+            if "v_employee_hierarchy_src" in sql:
                 return [{"user_email": "Alice@x.com", "user_name": "Alice", "department": "Eng",
+                         "manager_email": "mgr@x.com",
                          "director_email": "vp@x.com", "director_name": "VP"},
                         {"user_email": "etl@p.iam.gserviceaccount.com", "user_name": "ETL", "department": "Ops",
-                         "director_email": None, "director_name": None}]
-            if "service_account_owners" in sql:
-                return [{"owner_email": "bob@x.com", "owner_team": "BI"}]
+                         "manager_email": None, "director_email": None, "director_name": None}]
+            if "v_service_account_owners_src" in sql:
+                return [{"owner_email": "bob@x.com", "owner_team": "BI",
+                         "director_email": "bi-vp@x.com", "director_name": "BI VP"}]
             return []
 
         c = config.Config({
@@ -277,9 +283,36 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
         self.assertEqual(opts["tables"][0]["value"], "other-proj.hr.employee_dir")
 
         emails = [e["value"] for e in opts["emails"]]
-        for expected in ("admin@x.com", "ed@x.com", "fin@x.com", "alice@x.com", "vp@x.com", "bob@x.com"):
+        labels_by_email = {e["value"]: e["label"] for e in opts["emails"]}
+        for expected in ("admin@x.com", "ed@x.com", "fin@x.com", "alice@x.com",
+                         "mgr@x.com", "vp@x.com", "bob@x.com", "bi-vp@x.com", "sayali@x.com"):
             self.assertIn(expected, emails)
+        self.assertIn("Active BQ user (42 queries/30d)", labels_by_email["sayali@x.com"])
+        self.assertTrue(labels_by_email["alice@x.com"].startswith("alice@x.com — Alice · Eng"))
         self.assertTrue(all(not e.endswith(".gserviceaccount.com") for e in emails))
+
+    def test_probe_people_falls_back_when_src_views_missing(self):
+        from optimizer import settings_options as so
+
+        def fake_query(_c, sql, params=None, location=None):
+            if "v_employee_hierarchy_src" in sql or "v_service_account_owners_src" in sql:
+                raise RuntimeError("Not found: View v_employee_hierarchy_src")
+            if "employee_hierarchy" in sql:
+                return [{"user_email": "legacy@x.com", "user_name": "Legacy", "department": "Data",
+                         "director_email": None, "director_name": None}]
+            if "service_account_owners" in sql:
+                return [{"owner_email": "sa-human@x.com", "owner_team": "ETL"}]
+            if "jobs_events" in sql and "user_email" in sql:
+                return [{"user_email": "day1@x.com", "job_count": 1}]
+            return []
+
+        c = _cfg()
+        with mock.patch.object(so.bq, "query", fake_query):
+            ppl = so._probe_people(c, editors=[])
+        by_email = {p["value"]: p["label"] for p in ppl}
+        self.assertIn("legacy@x.com", by_email)
+        self.assertIn("sa-human@x.com", by_email)
+        self.assertEqual(by_email["day1@x.com"], "day1@x.com — Active BQ user (1 query/30d)")
 
     def test_table_columns_default_and_custom(self):
         from optimizer import settings_options as so
