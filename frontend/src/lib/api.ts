@@ -448,6 +448,42 @@ export async function fetchSetupCheck(refresh = false): Promise<SetupCheckRespon
   );
 }
 
+export interface ScanStatus {
+  state: "idle" | "running" | "succeeded" | "failed";
+  run_id: string | null;
+  mode: "cloud_run_job" | "in_process" | "starting" | null;
+  step: "starting" | "init" | "collect" | "rules" | "done" | null;
+  step_label: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  triggered_by: string | null;
+  execution_name: string | null;
+  log_uri: string | null;
+  log_tail: string[];
+  error: string | null;
+  seq: number;
+  can_trigger: boolean;
+  viewer_email?: string | null;
+  telemetry?: {
+    has_telemetry: boolean;
+    jobs_count: number;
+    last_job_at: string | null;
+  };
+}
+
+export async function fetchScanStatus(params?: { principal?: string; wait?: boolean; seq?: number }): Promise<ScanStatus> {
+  const sp = new URLSearchParams();
+  if (params?.principal) sp.set("principal", params.principal);
+  if (params?.wait) sp.set("wait", "1");
+  if (params?.seq !== undefined) sp.set("seq", String(params.seq));
+  const qs = sp.toString();
+  return asJson<ScanStatus>(await fetch(`/api/scan/status${qs ? `?${qs}` : ""}`, { headers: { Accept: "application/json" } }));
+}
+
+export async function triggerScan(principal?: string): Promise<{ ok: true; already_running: boolean; scan: ScanStatus }> {
+  return postJson("/api/scan/run", { principal });
+}
+
 export async function postDecision(req: DecisionRequest): Promise<{ ok: true; status: string; action: string }> {
   return asJson(
     await fetch("/api/decisions", {

@@ -698,6 +698,11 @@ _OPTIONS_TTL_SEC = 120.0
 
 def _check_command() -> str:
     """How to run the same checks as another account (e.g. the nightly job's)."""
+    job = (os.environ.get("BQOPT_PIPELINE_JOB") or os.environ.get("BQOPT_SCAN_JOB") or "").strip()
+    reg = (os.environ.get("BQOPT_JOB_REGION") or os.environ.get("CLOUD_RUN_REGION") or "").strip()
+    if job:
+        reg_flag = f" --region={reg}" if reg else ""
+        return f"gcloud run jobs execute {job}{reg_flag} --args=-m,optimizer.cli,check --wait"
     return "gcloud run jobs execute <your-nightly-job> --args=-m,optimizer.cli,check --wait"
 
 
@@ -923,6 +928,51 @@ def api_settings_editors():
                                       had_override=key in saved)
     _after_settings_change(key)
     return jsonify({"ok": True, "change_id": change_id, "editors": new})
+
+
+def _on_scan_finished() -> None:
+    """Clear cached dashboard, setup-check and dropdown options once a scan completes."""
+    invalidate_dashboard_cache()
+    with _SETUP_LOCK:
+        _SETUP_CACHE["data"] = None
+    with _OPTIONS_LOCK:
+        _OPTIONS_CACHE["data"] = None
+
+
+@app.get("/api/scan/status")
+def api_scan_status():
+    """Current BigQuery scan status; optional ?wait=1&seq=N holds open up to 12s while running."""
+    from flask import jsonify
+    from optimizer import scan_runner
+    c, _saved, access = _settings_context(request.args.get("principal"))
+    wait = request.args.get("wait") in ("1", "true")
+    try:
+        seq = int(request.args.get("seq")) if request.args.get("seq") is not None else None
+    except ValueError:
+        seq = None
+    snap = scan_runner.get_status(c, wait_since_seq=seq, wait_sec=12.0 if wait else 0.0)
+    snap["can_trigger"] = bool(access["is_editor"])
+    snap["viewer_email"] = access["email"]
+    return jsonify(_jsonable(snap))
+
+
+@app.post("/api/scan/run")
+def api_scan_run():
+    """Kick off an on-demand read-only BigQuery telemetry + rules scan (Settings editors/admins)."""
+    from flask import jsonify
+    from optimizer import scan_runner
+    body = request.get_json(silent=True) or {}
+    c, _saved, access = _settings_context(body.get("principal"))
+    if not access["is_editor"]:
+        return _settings_denied(
+            "Only settings admins and editors can trigger an on-demand BigQuery scan."
+        )
+    snap, already = scan_runner.start_scan(
+        c, triggered_by=access["email"] or "settings-editor", on_finish=_on_scan_finished
+    )
+    snap["can_trigger"] = True
+    snap["viewer_email"] = access["email"]
+    return jsonify(_jsonable({"ok": True, "already_running": already, "scan": snap}))
 
 
 @app.get("/api/setup-check")

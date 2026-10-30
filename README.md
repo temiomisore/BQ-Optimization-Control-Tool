@@ -17,6 +17,19 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
                                   └──── d_history ◀────────┘
 ```
 
+## 1-Click Setup in Google Cloud (No Local Install or YAML Editing)
+
+Click below to open an interactive setup walkthrough in **Google Cloud Shell** (runs entirely in your browser):
+
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_tutorial=docs/INSTALL.md)
+
+What `scripts/install.sh` sets up automatically (~4 minutes):
+1. **Auto-detects** your signed-in Google account (makes you **Settings Admin**), your GCP Project, and your GCP Organization ID.
+2. **Enables required APIs** and creates a dedicated least-privilege service account (`bqopt-sa`).
+3. **Deploys the Web UI** on Cloud Run behind **Direct Identity-Aware Proxy (`--iap`)** — no Load Balancer, SSL certificate, or DNS setup needed.
+4. **Initializes `optimizer_ops`** in BigQuery and schedules automatic nightly refreshes (`02:00 UTC`) via Cloud Run Jobs + Cloud Scheduler.
+5. **Configure & scan in the browser:** Open `<your-app-url>/#settings` to verify permissions, pick tables/columns from dropdowns, add teammates, and click **Run scan now** right in the UI.
+
 ## Repo map
 
 | Path | What it is |
@@ -45,6 +58,8 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 | `notebooks/BigQuery_Optimization_Notebook.ipynb` | Interactive Jupyter Notebook for Customer Demo 1 in BigQuery Studio |
 | `notebooks/BigQuery_Optimization_Notebook_2.ipynb` | Interactive Jupyter Notebook for Customer Demo 2 in BigQuery Studio |
 | `scripts/demo_git_pr.py` | Renders the Class-4 CI pull-request (simulated PR output for demos) |
+| `scripts/install.sh`, `docs/INSTALL.md` | **1-click Cloud Shell installer** & interactive walkthrough (APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
+| `optimizer/scan_runner.py` | On-demand **Run scan now** engine triggered from the Review UI (Cloud Run Job execution with automatic in-process fallback) |
 | `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, bundled OpenJDK + ZetaSQL `.jar`, multi-worker Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
 | `tests/` | Pure-logic unit tests (no GCP needed): `python -m unittest discover -s tests` |
 

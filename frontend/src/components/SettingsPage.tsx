@@ -1,14 +1,15 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  AlertTriangle, ArrowLeft, CheckCircle2, ChevronDown, Code2, Download, History, Info, ListFilter, Lock,
-  MinusCircle, Pencil, Plus, RefreshCw, RotateCcw, Search, ShieldCheck, Undo2, UserCog, Users, X, XCircle,
+  AlertTriangle, ArrowLeft, ArrowRight, CheckCircle2, ChevronDown, Code2, Download, ExternalLink, History, Info,
+  ListFilter, Lock, MinusCircle, Pencil, Play, Plus, RefreshCw, RotateCcw, Search, ShieldCheck, Sparkles, Terminal,
+  Undo2, UserCog, Users, X, XCircle,
 } from "lucide-react";
 import {
-  fetchSettings, fetchSettingsHistory, fetchSettingsOptions, fetchSetupCheck, fetchTableColumns,
-  revertSettingChange, saveSetting, updateSettingsEditors,
-  type CheckStatus, type LabeledOption, type RegionOption, type SettingChange, type SettingItem,
+  fetchScanStatus, fetchSettings, fetchSettingsHistory, fetchSettingsOptions, fetchSetupCheck, fetchTableColumns,
+  revertSettingChange, saveSetting, triggerScan, updateSettingsEditors,
+  type CheckStatus, type LabeledOption, type RegionOption, type ScanStatus, type SettingChange, type SettingItem,
   type SettingsAccess, type SettingsOptions, type SetupCheck, type TableOption,
 } from "@/lib/api";
 import { useReviewer } from "@/lib/store";
@@ -1310,6 +1311,257 @@ function SettingsPanel() {
   );
 }
 
+/* -------------------------------------------------------------------- on-demand scan */
+
+const SCAN_STEPS: { id: "init" | "collect" | "rules"; label: string }[] = [
+  { id: "init", label: "1. Schema check" },
+  { id: "collect", label: "2. Collect regions & queries" },
+  { id: "rules", label: "3. Score 14 rules" },
+];
+
+function stepRank(step: ScanStatus["step"]): number {
+  if (step === "init" || step === "starting") return 0;
+  if (step === "collect") return 1;
+  if (step === "rules") return 2;
+  if (step === "done") return 3;
+  return -1;
+}
+
+export function ScanNowPanel({
+  onViewRecommendations,
+  onOpenSettings,
+  compact = false,
+}: {
+  onViewRecommendations?: () => void;
+  onOpenSettings?: () => void;
+  compact?: boolean;
+}) {
+  const { email } = useReviewer();
+  const qc = useQueryClient();
+  const [logsOpen, setLogsOpen] = useState(false);
+
+  const q = useQuery({
+    queryKey: ["scan-status", email],
+    queryFn: () => fetchScanStatus({ principal: email }),
+    refetchInterval: (query) => (query.state.data?.state === "running" ? 1800 : false),
+    staleTime: 10 * 1000,
+  });
+
+  const scan = q.data;
+  const isRunning = scan?.state === "running";
+  const prevStateRef = useRef<ScanStatus["state"] | undefined>(undefined);
+
+  // Refresh dashboard, setup-check and dropdown options automatically when a scan finishes.
+  useEffect(() => {
+    const prev = prevStateRef.current;
+    const cur = scan?.state;
+    prevStateRef.current = cur;
+    if (prev === "running" && cur === "succeeded") {
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+      qc.invalidateQueries({ queryKey: ["settings-options"] });
+      qc.invalidateQueries({ queryKey: ["setup-check"] });
+      toast.success("BigQuery scan complete — recommendations updated!");
+    } else if (prev === "running" && cur === "failed") {
+      toast.error(scan?.error || "BigQuery scan failed.");
+      setLogsOpen(true);
+    }
+  }, [scan?.state, scan?.error, qc]);
+
+  // Keep an active HTTP connection open while an in-process scan runs on Cloud Run so CPU isn't throttled.
+  useEffect(() => {
+    if (!isRunning || scan?.mode !== "in_process") return;
+    let cancelled = false;
+    let curSeq = scan?.seq ?? 0;
+    const loop = async () => {
+      while (!cancelled) {
+        try {
+          const next = await fetchScanStatus({ principal: email, wait: true, seq: curSeq });
+          if (cancelled) break;
+          curSeq = next.seq;
+          qc.setQueryData(["scan-status", email], next);
+          if (next.state !== "running" || next.mode !== "in_process") break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+      }
+    };
+    void loop();
+    return () => {
+      cancelled = true;
+    };
+  }, [isRunning, scan?.mode, email, qc]);
+
+  const start = useMutation({
+    mutationFn: () => triggerScan(email),
+    onSuccess: (res) => {
+      qc.setQueryData(["scan-status", email], res.scan);
+      if (res.already_running) {
+        toast.info("A BigQuery scan is already running.");
+      } else {
+        toast.success("Started BigQuery scan — watching progress live.");
+      }
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const rank = stepRank(scan?.step ?? null);
+  const canTrigger = scan ? scan.can_trigger : true;
+  const telem = scan?.telemetry;
+  const logLines = scan?.log_tail || [];
+
+  return (
+    <section className={cn("panel space-y-3.5 p-5", isRunning && "border-sky-500/40 ring-1 ring-sky-500/20")}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <h2 className="flex flex-wrap items-center gap-2 text-base font-semibold">
+            <Sparkles className="h-5 w-5 text-sky-400" />
+            {compact ? "Ready for your first BigQuery scan" : "BigQuery scan & recommendations"}
+            {isRunning && (
+              <Badge className="bg-sky-500/15 text-sky-600 ring-sky-500/30 dark:text-sky-300">
+                <RefreshCw className="h-3 w-3 animate-spin" /> Running
+              </Badge>
+            )}
+            {!isRunning && scan?.state === "succeeded" && (
+              <Badge className="bg-emerald-500/10 text-emerald-600 ring-emerald-500/30 dark:text-emerald-300">
+                <CheckCircle2 className="h-3 w-3" /> Up to date
+              </Badge>
+            )}
+          </h2>
+          <p className="mt-0.5 max-w-3xl text-xs leading-relaxed text-zinc-500">
+            {compact
+              ? "Review your permissions and optional owner tables in Settings, or click Run scan now to pull BigQuery query history and generate savings cards."
+              : "Discovers your BigQuery regions, pulls query & table history, and runs all 14 optimization rules using the settings saved on this page. Read-only on your tables — nothing is changed until you approve a card."}
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {onOpenSettings && (
+            <Button variant="secondary" size="sm" onClick={onOpenSettings}>
+              Open Settings
+            </Button>
+          )}
+          {!isRunning && scan?.state === "succeeded" && onViewRecommendations && (
+            <Button variant="secondary" size="sm" onClick={onViewRecommendations}>
+              View recommendations <ArrowRight className="h-3.5 w-3.5" />
+            </Button>
+          )}
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!canTrigger || isRunning}
+            loading={start.isPending || isRunning}
+            onClick={() => start.mutate()}
+            title={!canTrigger ? "Settings admins and editors can trigger scans" : "Collect BigQuery telemetry and refresh recommendations"}
+          >
+            <Play className="h-3.5 w-3.5" />
+            {isRunning ? "Scanning…" : "Run scan now"}
+          </Button>
+        </div>
+      </div>
+
+      {/* Idle telemetry summary or permission note */}
+      {!isRunning && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
+          {telem?.has_telemetry ? (
+            <>
+              <span className="text-emerald-600 dark:text-emerald-400">
+                ✓ {telem.jobs_count.toLocaleString()} queries indexed
+              </span>
+              {telem.last_job_at && <span>· latest query {ago(telem.last_job_at)}</span>}
+              <span>· runs automatically every night (02:00 UTC)</span>
+            </>
+          ) : (
+            <span className="text-amber-600 dark:text-amber-300">
+              ⓘ First scan hasn&apos;t run yet — check Setup check &amp; settings, then click <b>Run scan now</b> (first run backfills up to 180 days).
+            </span>
+          )}
+          {scan && !canTrigger && (
+            <span className="inline-flex items-center gap-1 text-zinc-400">
+              <Lock className="h-3 w-3" /> Ask a settings admin or editor to run an on-demand scan.
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Active progress stepper */}
+      {isRunning && (
+        <div className="space-y-2.5 rounded-lg border border-sky-500/25 bg-sky-500/5 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {SCAN_STEPS.map((st, idx) => {
+              const done = scan?.mode === "cloud_run_job" ? false : rank > idx;
+              const active = scan?.mode === "cloud_run_job" ? idx >= 1 : rank === idx;
+              return (
+                <span
+                  key={st.id}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ring-1 ring-inset",
+                    done
+                      ? "bg-emerald-500/15 text-emerald-700 ring-emerald-500/30 dark:text-emerald-300"
+                      : active
+                        ? "bg-sky-500/15 text-sky-700 ring-sky-500/40 dark:text-sky-200"
+                        : "bg-zinc-500/5 text-zinc-400 ring-zinc-400/20",
+                  )}
+                >
+                  {done ? <CheckCircle2 className="h-3 w-3" /> : active ? <RefreshCw className="h-3 w-3 animate-spin" /> : null}
+                  {st.label}
+                </span>
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+            <span>{scan?.step_label || "Scanning BigQuery…"}</span>
+            <span className="text-[11px] text-zinc-400">
+              {scan?.triggered_by ? `Started by ${scan.triggered_by}` : ""}{scan?.started_at ? ` · ${ago(scan.started_at)}` : ""}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Error banner */}
+      {!isRunning && scan?.state === "failed" && scan.error && (
+        <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-xs text-rose-600 dark:text-rose-300">
+          <div className="font-medium">Last scan failed</div>
+          <div className="mt-0.5 font-mono text-[11px]">{scan.error}</div>
+        </div>
+      )}
+
+      {/* Optional live log output / Cloud Run link */}
+      {(logLines.length > 0 || scan?.log_uri) && (
+        <div>
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            {logLines.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setLogsOpen(!logsOpen)}
+                className="inline-flex items-center gap-1 font-medium text-sky-500 hover:text-sky-400"
+              >
+                <Terminal className="h-3.5 w-3.5" />
+                {logsOpen ? "Hide scan log" : `Show scan log (${logLines.length})`}
+                <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", logsOpen && "rotate-180")} />
+              </button>
+            )}
+            {scan?.log_uri && (
+              <a
+                href={scan.log_uri}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 font-medium text-sky-500 hover:text-sky-400"
+              >
+                Open Cloud Run job logs <ExternalLink className="h-3 w-3" />
+              </a>
+            )}
+          </div>
+          {logsOpen && logLines.length > 0 && (
+            <pre className="mt-2 max-h-48 overflow-auto rounded-lg border border-zinc-200 bg-zinc-950 p-3 font-mono text-[11px] leading-relaxed text-zinc-200 dark:border-ink-800">
+              {logLines.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 /* ------------------------------------------------------------------------------- page */
 
 export function SettingsPage({ onBack }: { onBack: () => void }) {
@@ -1321,9 +1573,10 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
         </Button>
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Settings &amp; setup</h1>
-          <p className="text-xs text-zinc-500">Check permissions, change everyday settings, and export a ready-to-use config.yaml.</p>
+          <p className="text-xs text-zinc-500">Check permissions, change everyday settings, and run a BigQuery scan right from the browser.</p>
         </div>
       </div>
+      <ScanNowPanel onViewRecommendations={onBack} />
       <SetupCheckPanel />
       <SettingsPanel />
     </div>

@@ -17,7 +17,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PrModal } from "@/components/PrModal";
 import { HandoffList } from "@/components/HandoffList";
 import { RegionsBar } from "@/components/RegionsBar";
-import { SettingsPage } from "@/components/SettingsPage";
+import { ScanNowPanel, SettingsPage } from "@/components/SettingsPage";
 import { Button, Empty, Skeleton } from "@/components/ui";
 
 /** "#settings" opens the Settings & setup page, so it can be linked directly. */
@@ -214,7 +214,9 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
             <Toolbar data={data} cards={cards} f={f} setF={setF} shown={shown.length} total={cards.length} />
             <div className="flex items-start gap-6">
               <div className={cn("min-w-0 transition-all duration-300", selected ? "hidden lg:block lg:flex-[2] xl:flex-[5]" : "w-full")}>
-                {shown.length === 0 ? (
+                {allCards.length === 0 && hiddenFinops === 0 ? (
+                  <ScanNowPanel compact onOpenSettings={() => go("settings")} />
+                ) : shown.length === 0 ? (
                   <Empty icon={<Inbox className="h-5 w-5" />} title="No recommendations match" hint="Try clearing filters or lowering the minimum savings." />
                 ) : (
                   <div className={cn("grid gap-3", selected ? "grid-cols-1" : "md:grid-cols-2")}>

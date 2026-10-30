@@ -313,6 +313,37 @@ def cmd_sync(c) -> None:
             print(note)
 
 
+def cmd_scan(c) -> None:
+    """Read-only on-demand scan: ensure ops schema, collect telemetry, and refresh rules/cards.
+
+    Unlike `pipeline`, `scan` never invokes `execute` or `verify`, so triggering it from
+    the Review UI is safe at any hour and never alters customer tables or reservations.
+    """
+    from . import schema_guard
+    client = bq.client(c)
+    ds_id = f"{c['project_id']}.{c['ops_dataset']}"
+    try:
+        client.get_dataset(ds_id)
+        schema_guard.ensure_current(c, max_age_sec=0)
+    except Exception:
+        print(f"[*] Control plane dataset '{ds_id}' not found. Auto-initializing schema...")
+        cmd_init(c)
+
+    print("=" * 60)
+    print("▶ STEP 1/2: COLLECTOR (Ingesting metadata & telemetry)")
+    print("=" * 60)
+    cmd_collect(c)
+
+    print("\n" + "=" * 60)
+    print("▶ STEP 2/2: RULES ENGINE (Analyzing patterns & generating findings)")
+    print("=" * 60)
+    cmd_rules(c)
+
+    print("\n" + "=" * 60)
+    print("✅ ON-DEMAND SCAN COMPLETED SUCCESSFULLY!")
+    print("=" * 60)
+
+
 def cmd_pipeline(c) -> None:
     # Auto-initialize control plane dataset and tables if they do not exist
     from google.cloud import bigquery
@@ -394,7 +425,7 @@ def cmd_rollback(c, change_set_id: str, reason: str = "Manual 1-Click Rollback v
 def main() -> None:
     p = argparse.ArgumentParser(prog="bq-optimizer", description="BigQuery Optimization Control Plane CLI")
     p.add_argument("command", choices=["init", "collect", "collector", "collect-backfill", "rules", "execute",
-                                       "verify", "sync-recommender", "rollback", "pipeline", "regions", "check"],
+                                       "verify", "sync-recommender", "rollback", "pipeline", "scan", "regions", "check"],
                    help="Command to run")
     p.add_argument("--id", help="change_set_id (for rollback)")
     p.add_argument("--reason", default="Manual 1-Click Rollback via CLI", help="Rollback audit reason note")
@@ -475,6 +506,8 @@ def main() -> None:
                          snooze_days=getattr(a, "snooze_days", 90))
         elif a.command == "pipeline":
             cmd_pipeline(c)
+        elif a.command == "scan":
+            cmd_scan(c)
         elif a.command == "regions":
             cmd_regions(c, record_result=not a.no_record)
         elif a.command == "check":
