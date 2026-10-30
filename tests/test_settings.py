@@ -95,6 +95,12 @@ class TestSetupCheckHelpers(unittest.TestCase):
                          "--role=roles/cloudasset.viewer")
         self.assertEqual(chk.grant_sql("SCHEMA", "p.optimizer_ops", "me@x.com", "roles/bigquery.dataEditor"),
                          'GRANT `roles/bigquery.dataEditor` ON SCHEMA `p.optimizer_ops` TO "user:me@x.com";')
+        self.assertEqual(
+            chk.bq_sql("p", "ALTER PROJECT `p` SET OPTIONS (`region-us-central1.enable_info_schema_storage` = TRUE);",
+                       location="us-central1"),
+            "bq --project_id=p --location=us-central1 query --use_legacy_sql=false "
+            "'ALTER PROJECT `p` SET OPTIONS (`region-us-central1.enable_info_schema_storage` = TRUE);'",
+        )
 
     def test_summary_ignores_optional_failures(self):
         rows = [chk.result("a", "A", "", chk.OK, ""), chk.result("b", "B", "", chk.FAIL, "", optional=True)]
@@ -151,7 +157,11 @@ class TestRunChecks(unittest.TestCase):
         self.assertEqual(by["run_queries"]["status"], chk.OK)
         self.assertEqual(by["region_discovery"]["status"], chk.OK)
         self.assertEqual(by["table_storage:us-central1"]["status"], chk.WARN)
-        self.assertIn("ALTER PROJECT `p`", by["table_storage:us-central1"]["fix"])
+        fix_storage = by["table_storage:us-central1"]["fix"]
+        self.assertTrue(fix_storage.startswith("bq --project_id=p --location=us-central1 query --use_legacy_sql=false '"))
+        self.assertIn("ALTER PROJECT `p`", fix_storage)
+        self.assertIn("# Or for every project", fix_storage)
+        self.assertNotIn("\n-- ", fix_storage)
         self.assertEqual(by["query_history:us"]["status"], chk.OK)          # jobs_view JOBS (default)
         self.assertEqual(by["query_history:us-central1"]["status"], chk.FAIL)
         self.assertIn("--role=roles/bigquery.resourceViewer", by["query_history:us-central1"]["fix"])

@@ -598,6 +598,43 @@ gcloud run jobs execute "$JOB_NAME" \
   --quiet
 ok "Initialized BigQuery dataset ${PROJECT_ID}.${OPS_DATASET} (tables + views ready)."
 
+# Enable BigQuery INFORMATION_SCHEMA.TABLE_STORAGE views across active regions so Setup Check is green out of the box.
+DISCOVERED_LOCS="$(gcloud asset search-all-resources \
+  --scope="$ASSET_SCOPE" \
+  --asset-types="bigquery.googleapis.com/Dataset" \
+  --read-mask="location" \
+  --limit=500 \
+  --format="value(location)" \
+  --quiet 2>/dev/null || true)"
+if [[ -z "$DISCOVERED_LOCS" && "$ASSET_SCOPE" != "projects/${PROJECT_ID}" ]]; then
+  DISCOVERED_LOCS="$(gcloud asset search-all-resources \
+    --scope="projects/${PROJECT_ID}" \
+    --asset-types="bigquery.googleapis.com/Dataset" \
+    --read-mask="location" \
+    --limit=500 \
+    --format="value(location)" \
+    --quiet 2>/dev/null || true)"
+fi
+STORAGE_REGIONS="$(printf '%s\n%s\n%s\n' "$BQ_LOCATION" "$RUN_REGION" "$DISCOVERED_LOCS" \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+  | awk 'NF && !seen[$0]++')"
+ENABLED_STORAGE_REGIONS=()
+while IFS= read -r _R; do
+  [[ -z "$_R" ]] && continue
+  if [[ -n "$ORG_ID" && "$ORG_IAM_READY" == "true" ]]; then
+    bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
+      "ALTER ORGANIZATION SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1 || true
+  fi
+  if bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
+       "ALTER PROJECT \`${PROJECT_ID}\` SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1; then
+    ENABLED_STORAGE_REGIONS+=("$_R")
+  fi
+done <<< "$STORAGE_REGIONS"
+if [[ "${#ENABLED_STORAGE_REGIONS[@]}" -gt 0 ]]; then
+  ok "Enabled BigQuery TABLE_STORAGE size views in: ${ENABLED_STORAGE_REGIONS[*]}"
+fi
+
 # ---- Step 7: Nightly Cloud Scheduler (02:00 UTC) -----------------------------
 step "[7/7] Scheduling automatic nightly scans (02:00 UTC)..."
 

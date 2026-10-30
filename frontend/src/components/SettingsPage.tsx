@@ -54,7 +54,11 @@ function CheckRow({ x }: { x: SetupCheck }) {
           )}
           {needsFix && open && (
             <div className="mt-2">
-              <CodeBlock code={String(x.fix)} title="Run this (as an admin)" tone="sky" />
+              <CodeBlock
+                code={String(x.fix)}
+                title={/^(gcloud|bq|python)\b/.test(String(x.fix).trim()) ? "Paste in Cloud Shell (as an admin)" : "How to fix"}
+                tone="sky"
+              />
             </div>
           )}
         </div>

@@ -78,6 +78,14 @@ def grant_sql(kind: str, fqn: str, who: str | None, role: str) -> str:
     return f'GRANT `{role}` ON {kind} `{fqn}` TO "{member(who)}";'
 
 
+def bq_sql(project_id: str, sql: str, location: str | None = None) -> str:
+    """Cloud Shell `bq query` command wrapping GoogleSQL in single quotes so Bash
+    never evaluates backticks (`project`) or parentheses."""
+    loc = f" --location={location}" if location else ""
+    escaped = sql.replace("'", "'\"'\"'")
+    return f"bq --project_id={project_id}{loc} query --use_legacy_sql=false '{escaped}'"
+
+
 def result(id: str, title: str, why: str, status: str, detail: str, fix: str | None = None,
            region: str | None = None, optional: bool = False) -> dict:
     return {"id": id, "title": title, "why": why, "status": status, "detail": detail,
@@ -125,7 +133,8 @@ def check_ops_dataset(c: Config, ctx: dict) -> dict:
                       "python -m optimizer.cli init")
     except Exception as e:  # noqa: BLE001
         return result("ops_dataset", title, why, FAIL, short(e),
-                      grant_sql("SCHEMA", c.ops, ctx.get("who"), "roles/bigquery.dataEditor"))
+                      bq_sql(c["project_id"], grant_sql("SCHEMA", c.ops, ctx.get("who"), "roles/bigquery.dataEditor"),
+                             location=regions.home_region(c)))
     home, actual = regions.home_region(c), regions.normalize(ds.location) or ""
     if actual != home:
         return result("ops_dataset", title, why, WARN,
@@ -139,18 +148,18 @@ def check_ops_write(c: Config, ctx: dict) -> dict:
     title = f"Read and write {c['ops_dataset']}"
     why = "The collector, rules engine and approvals all write to the tool's tables."
     need = ["bigquery.tables.getData", "bigquery.tables.updateData", "bigquery.tables.update"]
+    fix_grant = bq_sql(c["project_id"], grant_sql("SCHEMA", c.ops, ctx.get("who"), "roles/bigquery.dataEditor"),
+                       location=regions.home_region(c))
     try:
         got = set((bq.client(c).test_iam_permissions(f"{c.ops}.change_sets", need) or {}).get("permissions", []))
     except NotFound:
         return result("ops_write", title, why, SKIP, "The tool's tables aren't created yet.",
                       "python -m optimizer.cli init")
     except Exception as e:  # noqa: BLE001
-        return result("ops_write", title, why, FAIL, short(e),
-                      grant_sql("SCHEMA", c.ops, ctx.get("who"), "roles/bigquery.dataEditor"))
+        return result("ops_write", title, why, FAIL, short(e), fix_grant)
     missing = [p for p in need if p not in got]
     if missing:
-        return result("ops_write", title, why, FAIL, "Missing " + ", ".join(missing) + ".",
-                      grant_sql("SCHEMA", c.ops, ctx.get("who"), "roles/bigquery.dataEditor"))
+        return result("ops_write", title, why, FAIL, "Missing " + ", ".join(missing) + ".", fix_grant)
     return result("ops_write", title, why, OK, "Can read and write the tool's tables.")
 
 
@@ -216,12 +225,20 @@ def check_table_storage(c: Config, ctx: dict, region: str) -> dict:
     if err is None:
         return result(f"table_storage:{region}", title, why, OK, f"TABLE_STORAGE is on in {region}.", region=region)
     if classify(err) == "not_enabled":
+        proj_cmd = bq_sql(
+            c["project_id"],
+            f"ALTER PROJECT `{c['project_id']}` SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
+            location=region,
+        )
+        org_cmd = bq_sql(
+            c["project_id"],
+            f"ALTER ORGANIZATION SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
+            location=region,
+        )
         return result(f"table_storage:{region}", title, why, WARN,
                       f"Table size views are turned off in {region}. A BigQuery admin turns them on once "
                       "(data appears right away; full history takes about a day).",
-                      f"ALTER PROJECT `{c['project_id']}` SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);\n"
-                      f"-- or for every project at once:\n"
-                      f"-- ALTER ORGANIZATION SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
+                      f"{proj_cmd}\n# Or for every project in your organization at once:\n# {org_cmd}",
                       region=region)
     return result(f"table_storage:{region}", title, why, WARN, short(err),
                   grant("projects", c["project_id"], ctx.get("who"), "roles/bigquery.metadataViewer"), region=region)
@@ -269,11 +286,11 @@ def check_lookup_table(c: Config, ctx: dict, key: str, label: str) -> dict:
                       f"Check {key} in config.yaml.")
     except Exception as e:  # noqa: BLE001
         return result(f"table:{key}", title, why, FAIL, short(e),
-                      grant_sql("TABLE", fqn, ctx.get("who"), "roles/bigquery.dataViewer"))
+                      bq_sql(c["project_id"], grant_sql("TABLE", fqn, ctx.get("who"), "roles/bigquery.dataViewer")))
     if "bigquery.tables.getData" not in got:
         return result(f"table:{key}", title, why, FAIL, "Can see the table but can't read its rows.",
-                      grant_sql("TABLE", f"{t.project}.{t.dataset_id}.{t.table_id}", ctx.get("who"),
-                                "roles/bigquery.dataViewer"))
+                      bq_sql(c["project_id"], grant_sql("TABLE", f"{t.project}.{t.dataset_id}.{t.table_id}",
+                                                        ctx.get("who"), "roles/bigquery.dataViewer")))
     return result(f"table:{key}", title, why, OK, f"Can read {t.project}.{t.dataset_id}.{t.table_id}.")
 
 
@@ -304,7 +321,8 @@ def check_cross_project(c: Config, ctx: dict) -> dict:
         return result("cross_project", title, why, OK, "Ready: can read table sizes for the whole organization.",
                       optional=True)
     if classify(err) == "not_enabled":
-        fix = f"ALTER ORGANIZATION SET OPTIONS (`region-{home}.enable_info_schema_storage` = TRUE);"
+        fix = bq_sql(c["project_id"], f"ALTER ORGANIZATION SET OPTIONS (`region-{home}.enable_info_schema_storage` = TRUE);",
+                     location=home)
     else:
         fix = grant("organizations", org_id(c), ctx.get("who"), "roles/bigquery.metadataViewer")
     return result("cross_project", title, why, INFO, short(err), fix, optional=True)
