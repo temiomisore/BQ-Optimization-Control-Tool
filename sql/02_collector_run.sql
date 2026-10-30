@@ -195,11 +195,8 @@ BEGIN
           TIMESTAMP_TRUNC(period_start, HOUR) AS hour_ts,
           project_id,
           COALESCE(reservation_id, '(on-demand)') AS reservation_id,
-          GREATEST(
-            SUM(period_slot_ms),
-            CAST((265.4 + MOD(ABS(FARM_FINGERPRINT(CAST(TIMESTAMP_TRUNC(period_start, HOUR) AS STRING))), 3400) / 10.0) * 3600 * 1000 AS INT64)
-          ) AS total_slot_ms,
-          GREATEST(COUNT(DISTINCT job_id), 45) AS jobs
+          SUM(period_slot_ms) AS total_slot_ms,
+          COUNT(DISTINCT job_id) AS jobs
         FROM %s.%s
         WHERE job_creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL %d DAY)
           AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL %d DAY)
@@ -214,7 +211,7 @@ BEGIN
         collected_at = CURRENT_TIMESTAMP(), run_id = '%s'
       WHEN NOT MATCHED THEN INSERT (region, hour_ts, project_id, reservation_id, total_slot_ms, jobs, collected_at, run_id)
       VALUES (S.region, S.hour_ts, S.project_id, S.reservation_id, S.total_slot_ms, S.jobs, CURRENT_TIMESTAMP(), '%s')
-    """, r.region, src, timeline_view, lookback_days, lookback_days, lookback_days + 1, run_id, run_id);
+    """, r.region, src, timeline_view, lookback_days + 1, lookback_days, lookback_days + 1, run_id, run_id);
 
     INSERT INTO optimizer_ops.collector_audit
     VALUES (run_id, CURRENT_TIMESTAMP(), '2_hourly_slots', r.region, 'OK', @@row_count, NULL);

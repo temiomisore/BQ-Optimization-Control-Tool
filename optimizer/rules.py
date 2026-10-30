@@ -1752,12 +1752,22 @@ def _sql_c4_antipatterns(c: Config) -> str:
     limit = int(c.get("antipattern_tool", {}).get("top_expensive_queries_limit", 100))
     min_cost = float(c.get("antipattern_tool", {}).get("expensive_query_cost_usd", 5.0))
     return f"""
-      SELECT query_hash, sample_preview, total_bytes_billed, est_on_demand_usd, executions,
-             est_cost_usd, est_od_usd, est_resv_usd, reservation_executions,
-             billing_project, sample_user_email, sample_referenced_tables
-      FROM `{c.ops}.v_query_families_28d`
-      WHERE est_cost_usd >= {min_cost}
-      ORDER BY est_cost_usd DESC
+      WITH reg AS (
+        SELECT query_hash,
+               APPROX_TOP_COUNT(region, 1)[SAFE_OFFSET(0)].value AS sample_region
+        FROM `{c.ops}.jobs_events`
+        WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 28 DAY)
+          AND query_hash IS NOT NULL
+        GROUP BY 1
+      )
+      SELECT f.query_hash, f.sample_preview, f.total_bytes_billed, f.est_on_demand_usd, f.executions,
+             f.est_cost_usd, f.est_od_usd, f.est_resv_usd, f.reservation_executions,
+             f.billing_project, f.sample_user_email, f.sample_referenced_tables,
+             reg.sample_region
+      FROM `{c.ops}.v_query_families_28d` f
+      LEFT JOIN reg USING (query_hash)
+      WHERE f.est_cost_usd >= {min_cost}
+      ORDER BY f.est_cost_usd DESC
       LIMIT {limit}
     """
 
@@ -2044,7 +2054,7 @@ def _run_google_antipattern_cli(c: Config, prices: dict | None = None) -> list[F
                             "target_project": money["target_project"],
                             "target_dataset": "queries",
                             "target_table": q_hash,
-                            "target_region": c.get("location", "US"),
+                            "target_region": row.get("sample_region") or c.get("location", "US"),
                             "finding_summary": f"[{rule_id}] {meta['summary']}",
                             "evidence": {
                                 "pattern_matched": f"Google ZetaSQL AST: {pat_name}",
@@ -2094,27 +2104,146 @@ def _run_google_antipattern_cli(c: Config, prices: dict | None = None) -> list[F
     return findings
 
 
-def _dry_run_sql(c: Config, sql: str) -> tuple[bool, int]:
-    """Runs a BigQuery Dry-Run to validate syntax/schema and return exact bytes processed."""
+_TABLE_CLAUSE_RE = re.compile(
+    r"\b(FROM|JOIN)\s+"
+    r"(?:`?([A-Za-z0-9_:-]+)`?\.)?"
+    r"`?([A-Za-z0-9_]+)`?\."
+    r"`?([A-Za-z0-9_]+)`?",
+    re.IGNORECASE,
+)
+
+_SQL_KEYWORDS_AFTER_TABLE = {
+    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "QUALIFY", "WINDOW",
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "ON", "USING",
+    "UNION", "INTERSECT", "EXCEPT", "TABLESAMPLE", "FOR", "PIVOT", "UNPIVOT",
+    "OFFSET", "FETCH", "INTO", "SET", "VALUES", "SELECT", "WITH",
+}
+
+
+def _cte_names(sql: str) -> set[str]:
+    return {m.lower() for m in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", sql, re.IGNORECASE)}
+
+
+def _qualify_default_project(sql: str, default_project: str | None) -> str:
+    """Qualify 2-part `FROM ds.tbl` / `JOIN ds.tbl` references with `default_project` so
+    cross-project queries resolve against the query's billing project instead of the host project."""
+    if not default_project:
+        return sql
+    ctes = _cte_names(sql)
+
+    def _repl(m: re.Match) -> str:
+        kw, p_match, ds, tbl = m.group(1), m.group(2), m.group(3), m.group(4)
+        if p_match or ds.lower() in ctes or ds.upper() in ("INFORMATION_SCHEMA", "UNNEST"):
+            return m.group(0)
+        return f"{kw} `{default_project}.{ds}.{tbl}`"
+
+    return _TABLE_CLAUSE_RE.sub(_repl, sql)
+
+
+def _is_data_permission_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "syntax error" in msg or "unrecognized name" in msg or "400 " in msg:
+        return False
+    return ("403" in msg or "access denied" in msg or "forbidden" in msg
+            or "permission to query table" in msg or "bigquery.tables.getdata" in msg)
+
+
+def _dry_run_sql_with_schema_stubs(c: Config, sql: str, default_project: str | None = None) -> bool:
+    """Metadata-only dry-run fallback when the control plane holds `roles/bigquery.metadataViewer`
+    (can read `INFORMATION_SCHEMA.COLUMNS`) without `roles/bigquery.dataViewer` (`tables.getData`)
+    on sibling projects. Replaces each referenced table/view with a typed empty relation built
+    from its real `INFORMATION_SCHEMA.COLUMNS` schema and runs BigQuery's compiler dry-run."""
+    from google.cloud import bigquery
+    proj = default_project or c.get("project_id", "unknown_project")
+    ctes = _cte_names(sql)
+    stubs: dict[tuple[str, str, str], str] = {}
+    for m in _TABLE_CLAUSE_RE.finditer(sql):
+        _, p_match, ds, tbl = m.group(1), m.group(2), m.group(3), m.group(4)
+        if ds.lower() in ctes or ds.upper() in ("INFORMATION_SCHEMA", "UNNEST"):
+            continue
+        key = (p_match or proj, ds, tbl)
+        if key in stubs:
+            continue
+        cols = bq.query(c, f"""
+            SELECT column_name, data_type
+            FROM `{key[0]}.{key[1]}.INFORMATION_SCHEMA.COLUMNS`
+            WHERE table_name = @tbl
+            ORDER BY ordinal_position
+        """, {"tbl": key[2]}, location=bq.AUTO)
+        if not cols:
+            return False
+        exprs = ", ".join(f"CAST(NULL AS {col['data_type']}) AS `{col['column_name']}`" for col in cols)
+        stubs[key] = f"(SELECT {exprs} FROM UNNEST(ARRAY<INT64>[]))"
+
+    if not stubs:
+        return False
+
+    out_parts: list[str] = []
+    pos = 0
+    for m in _TABLE_CLAUSE_RE.finditer(sql):
+        out_parts.append(sql[pos:m.start()])
+        kw, p_match, ds, tbl = m.group(1), m.group(2), m.group(3), m.group(4)
+        key = (p_match or proj, ds, tbl)
+        stub = stubs.get(key)
+        if not stub:
+            out_parts.append(m.group(0))
+        else:
+            after = sql[m.end():]
+            la = re.match(r"^\s+(AS\s+[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*)\b", after, re.IGNORECASE)
+            has_alias = False
+            if la:
+                tok = la.group(1)
+                has_alias = tok.upper().startswith("AS ") or (tok.upper() not in _SQL_KEYWORDS_AFTER_TABLE)
+            alias_sql = "" if has_alias else f" AS `{tbl}`"
+            out_parts.append(f"{kw} {stub}{alias_sql}")
+        pos = m.end()
+    out_parts.append(sql[pos:])
+    stubbed_sql = "".join(out_parts)
+
+    job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    bq.client(c, bq.AUTO).query(stubbed_sql, job_config=job_config)
+    return True
+
+
+def _dry_run_sql(c: Config, sql: str, default_project: str | None = None) -> tuple[bool, int]:
+    """Runs a BigQuery Dry-Run to validate syntax/schema and return exact bytes processed.
+
+    When cross-project tables block direct dry-run with 403 (least-privilege metadataViewer
+    without dataViewer), falls back to BigQuery dry-run over real INFORMATION_SCHEMA.COLUMNS
+    typed stubs so syntax, column names, joins, and types are still compiler-verified."""
     try:
         from google.cloud import bigquery
         clean_sql = re.sub(r"@([A-Za-z0-9_]+)", "'1'", sql)
+        qualified_sql = _qualify_default_project(clean_sql, default_project)
         job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-        # AUTO: BigQuery infers the location from the referenced tables (any region).
-        job = bq.client(c, bq.AUTO).query(clean_sql, job_config=job_config)
-        return True, int(job.total_bytes_processed or 0)
+        try:
+            # AUTO: BigQuery infers the location from the referenced tables (any region).
+            job = bq.client(c, bq.AUTO).query(qualified_sql, job_config=job_config)
+            return True, int(job.total_bytes_processed or 0)
+        except Exception as e:
+            if _is_data_permission_error(e):
+                if _dry_run_sql_with_schema_stubs(c, qualified_sql, default_project=default_project):
+                    return True, 0
+            return False, 0
     except Exception:
         return False, 0
 
 
-def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
+def _fetch_schema_context_for_sql(c: Config, sql: str, default_project: str | None = None) -> str:
     """Extracts referenced dataset.table identifiers from SQL and fetches their BigQuery DDLs."""
-    proj = c.get("project_id", "unknown_project")
-    matches = set(re.findall(r"(?:`?([A-Za-z0-9_-]+)\.)?([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)`?", sql))
+    proj = default_project or c.get("project_id", "unknown_project")
+    ctes = _cte_names(sql)
+    refs: list[tuple[str, str, str]] = []
+    for m in _TABLE_CLAUSE_RE.finditer(sql):
+        _, p_match, ds, tbl = m.group(1), m.group(2), m.group(3), m.group(4)
+        refs.append((p_match, ds, tbl))
+    for p_match, ds, tbl in re.findall(r"(?:`?([A-Za-z0-9_:-]+)\.)?([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)`?", sql):
+        if p_match:
+            refs.append((p_match, ds, tbl))
     ddls: list[str] = []
     seen_tables: set[str] = set()
-    for p_match, ds, tbl in matches:
-        if ds.upper() in ("INFORMATION_SCHEMA", "STAGING") or tbl.upper() in ("TABLES", "COLUMNS", "JOBS"):
+    for p_match, ds, tbl in refs:
+        if ds.lower() in ctes or ds.upper() in ("INFORMATION_SCHEMA", "STAGING") or tbl.upper() in ("TABLES", "COLUMNS", "JOBS"):
             continue
         target_p = p_match if p_match else proj
         fqn = f"{target_p}.{ds}.{tbl}"
@@ -2124,8 +2253,8 @@ def _fetch_schema_context_for_sql(c: Config, sql: str) -> str:
         try:
             res = bq.query(c, f"""
                 SELECT ddl FROM `{target_p}.{ds}.INFORMATION_SCHEMA.TABLES`
-                WHERE table_name = '{tbl}' LIMIT 1
-            """, location=bq.AUTO)   # the dataset may live in any region
+                WHERE table_name = @tbl LIMIT 1
+            """, {"tbl": tbl}, location=bq.AUTO)   # the dataset may live in any region
             if res and res[0].get("ddl"):
                 ddls.append(res[0]["ddl"].strip())
         except Exception:
@@ -2184,7 +2313,8 @@ def _run_gemini_sql_judge(c: Config, existing_findings: list[Finding],
         if not q_hash or not orig_sql or len(orig_sql) < 20:
             continue
 
-        schema_ddl = _fetch_schema_context_for_sql(c, orig_sql)
+        default_proj = str(row.get("billing_project") or "").strip() or None
+        schema_ddl = _fetch_schema_context_for_sql(c, orig_sql, default_project=default_proj)
         if not schema_ddl:
             continue
 
@@ -2245,8 +2375,8 @@ Respond strictly in JSON format with keys:
 
             opt_sql_raw = str(data["optimized_sql"]).strip()
             # Dry-Run Verification Guardrail
-            orig_valid, orig_bytes = _dry_run_sql(c, orig_sql)
-            opt_valid, opt_bytes = _dry_run_sql(c, opt_sql_raw)
+            orig_valid, orig_bytes = _dry_run_sql(c, orig_sql, default_project=default_proj)
+            opt_valid, opt_bytes = _dry_run_sql(c, opt_sql_raw, default_project=default_proj)
             if not opt_valid:
                 # Never surface broken SQL that fails BigQuery Dry-Run validation
                 continue
@@ -2286,7 +2416,7 @@ Respond strictly in JSON format with keys:
                 "target_project": money["target_project"],
                 "target_dataset": "queries",
                 "target_table": q_hash,
-                "target_region": c.get("location", "US"),
+                "target_region": row.get("sample_region") or c.get("location", "US"),
                 "finding_summary": f"[{rule_id}] Vertex AI Gemini ({antipattern_name}): {data.get('summary', '')}",
                 "evidence": {
                     "pattern_matched": f"Vertex AI Gemini: {antipattern_name}",
@@ -2366,7 +2496,7 @@ def _map_c4_antipatterns(row: dict, prices: dict, c: Config) -> list[Finding] | 
             "target_project": money["target_project"],
             "target_dataset": "queries",
             "target_table": q_hash,
-            "target_region": c.get("location", "US"),
+            "target_region": row.get("sample_region") or c.get("location", "US"),
             "finding_summary": f"[{rule_id}] {summary}",
             "evidence": {
                 "actor_classification": actor["actor_code"],

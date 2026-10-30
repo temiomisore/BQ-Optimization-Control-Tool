@@ -127,16 +127,21 @@ def cmd_collect(c) -> None:
     bq.client(c).query(sql).result()
     print(f"  + Executed SQL collector: sql/02_collector_run.sql for {', '.join(local) or 'no home region'} "
           f"(lookback={effective_days}d)")
-    if local and not c.get("target_dataset"):
-        extra_home = [p for p in remote_collector.projects_for_region(c, home, route_info)
-                      if p != c["project_id"]]
-        if extra_home:
-            print(f"[*] Collecting cross-project table metadata in {home} across {len(extra_home)} "
-                  f"additional project(s): {', '.join(extra_home[:8])}"
-                  + ("..." if len(extra_home) > 8 else ""))
-            xres = remote_collector.collect_extra_projects_home(c, home, extra_home, run_id)
-            for step, n in xres.items():
+    if local:
+        home_projs = remote_collector.projects_for_region(c, home, route_info)
+        if str(c.get("jobs_view") or "").upper() == "JOBS_BY_ORGANIZATION":
+            hres = remote_collector.hydrate_home_query_previews(c, home, home_projs, run_id)
+            for step, n in hres.items():
                 print(f"    {step:<22} {n}")
+        if not c.get("target_dataset"):
+            extra_home = [p for p in home_projs if p != c["project_id"]]
+            if extra_home:
+                print(f"[*] Collecting cross-project table metadata in {home} across {len(extra_home)} "
+                      f"additional project(s): {', '.join(extra_home[:8])}"
+                      + ("..." if len(extra_home) > 8 else ""))
+                xres = remote_collector.collect_extra_projects_home(c, home, extra_home, run_id)
+                for step, n in xres.items():
+                    print(f"    {step:<22} {n}")
     for reg in remote:
         reg_projs = remote_collector.projects_for_region(c, reg, route_info)
         print(f"[*] Collecting remote region {reg} across {len(reg_projs)} project(s) "

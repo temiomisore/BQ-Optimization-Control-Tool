@@ -349,6 +349,132 @@ class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
         by_model = {p["m"]: p["fqns"] for _, p in updates}
         self.assertEqual(by_model, {"LOGICAL": ["p1.core"], "PHYSICAL": ["p2.mart"]})
 
+    def test_query_previews_sql_and_hydration_fault_isolation(self):
+        from unittest import mock
+        sql = rc.query_previews_sql("us-east4", "exec-proj-01")
+        self.assertIn("`exec-proj-01.region-us-east4`.INFORMATION_SCHEMA.JOBS_BY_PROJECT", sql)
+        self.assertIn("SUBSTR(query, 1, 1024)", sql)
+
+        # No-op when jobs_view already includes SQL text
+        c_proj = cfg(project_id="p1", jobs_view="JOBS")
+        self.assertEqual(rc.hydrate_query_previews(c_proj, "us", "r1")[0], 0)
+
+        # First hydration (hydrated_90d == 0) scans 90d across compute-only projects too, isolating 403s
+        c_org = cfg(project_id="p1", jobs_view="JOBS_BY_ORGANIZATION", asset_scope="organizations/42")
+        queried_projs = []
+        executed_updates = []
+
+        def fake_bq_query(_c, q, params=None, location=None):
+            if "missing_projs_90d" in q:
+                return [{
+                    "hydrated_90d": 0,
+                    "missing_projs_90d": ["p1", "compute-only-proj", "locked-proj"],
+                    "missing_projs_inc": ["p1"],
+                }]
+            return []
+
+        def fake_q(_c, q, params=None, region=None):
+            proj = params["proj"]
+            queried_projs.append((proj, params["days"], region))
+            if proj == "locked-proj":
+                raise RuntimeError("403 Access Denied on locked-proj")
+            return [{"project_id": proj, "query_hash": f"h_{proj}", "query_preview": f"SELECT * FROM {proj}.d.t"}]
+
+        def fake_exec(_c, q, params=None, location=None):
+            executed_updates.append((q, params))
+            return 42
+
+        with mock.patch.object(rc.bq, "query", fake_bq_query), \
+                mock.patch.object(rc, "_q", fake_q), \
+                mock.patch.object(rc.bq, "load_rows", lambda *_a, **_k: 2), \
+                mock.patch.object(rc, "_drop", lambda *_a, **_k: None), \
+                mock.patch.object(rc.bq, "execute", fake_exec):
+            n, note = rc.hydrate_query_previews(c_org, "us", "run-1", projects=["p1"])
+
+        self.assertEqual(n, 42)
+        self.assertEqual([p for p, _, _ in queried_projs], ["p1", "compute-only-proj", "locked-proj"])
+        self.assertTrue(all(days == 90 for _, days, _ in queried_projs))
+        self.assertIn("2/3 project(s) (90d)", note)
+        self.assertIn("skipped 1: locked-proj", note)
+        self.assertEqual(len(executed_updates), 1)
+        self.assertEqual(executed_updates[0][1]["days"], 90)
+
+    def test_collector_sql_hourly_slots_has_no_ungrouped_period_start(self):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo_root, "sql", "02_collector_run.sql"), encoding="utf-8") as f:
+            collector_sql = f.read()
+        self.assertNotIn("FARM_FINGERPRINT(CAST(TIMESTAMP_TRUNC(period_start", collector_sql)
+        self.assertIn("SUM(period_slot_ms) AS total_slot_ms", collector_sql)
+
+    def test_cross_project_schema_context_and_stub_dry_run(self):
+        from unittest import mock
+        from optimizer import rules
+
+        c = cfg(project_id="host-proj")
+        sql = """
+        WITH helper AS (SELECT 1 AS x)
+        SELECT o.order_id, h.x
+        FROM helper h
+        JOIN analytics_ds.orders o ON TRUE
+        LEFT JOIN `sibling-proj.core_ds.customers` AS cu ON cu.id = o.cust_id
+        """
+        qualified = rules._qualify_default_project(sql, "billing-proj")
+        self.assertIn("FROM helper h", qualified)  # CTE untouched
+        self.assertIn("JOIN `billing-proj.analytics_ds.orders` o", qualified)
+        self.assertIn("LEFT JOIN `sibling-proj.core_ds.customers` AS cu", qualified)
+
+        fetched_tables = []
+
+        def fake_bq_query(_c, q, params=None, location=None):
+            if "INFORMATION_SCHEMA.TABLES" in q:
+                fetched_tables.append((q, params["tbl"]))
+                return [{"ddl": f"CREATE TABLE {params['tbl']} (id INT64);"}]
+            if "INFORMATION_SCHEMA.COLUMNS" in q:
+                tbl = params["tbl"]
+                if tbl == "orders":
+                    return [{"column_name": "order_id", "data_type": "INT64"},
+                            {"column_name": "cust_id", "data_type": "INT64"}]
+                if tbl == "customers":
+                    return [{"column_name": "id", "data_type": "INT64"}]
+            return []
+
+        with mock.patch.object(rules.bq, "query", fake_bq_query):
+            ddl = rules._fetch_schema_context_for_sql(c, sql, default_project="billing-proj")
+        self.assertIn("CREATE TABLE orders", ddl)
+        self.assertIn("CREATE TABLE customers", ddl)
+        self.assertTrue(any("billing-proj.analytics_ds" in q for q, _ in fetched_tables))
+
+        # 403 on direct dry-run triggers metadata-only stub dry-run; 400 syntax error fails immediately
+        dry_run_queries = []
+
+        class FakeJob:
+            total_bytes_processed = 0
+
+        class FakeClient:
+            def __init__(self, first_err):
+                self.first_err = first_err
+                self.calls = 0
+
+            def query(self, q, job_config=None):
+                self.calls += 1
+                dry_run_queries.append(q)
+                if self.calls == 1:
+                    raise RuntimeError(self.first_err)
+                return FakeJob()
+
+        with mock.patch.object(rules.bq, "query", fake_bq_query), \
+                mock.patch.object(rules.bq, "client", return_value=FakeClient("403 Access Denied: Table sibling-proj:core_ds.customers")):
+            ok, b = rules._dry_run_sql(c, sql, default_project="billing-proj")
+        self.assertTrue(ok)
+        self.assertEqual(b, 0)
+        self.assertEqual(len(dry_run_queries), 2)
+        self.assertIn("UNNEST(ARRAY<INT64>[])", dry_run_queries[1])
+
+        with mock.patch.object(rules.bq, "query", fake_bq_query), \
+                mock.patch.object(rules.bq, "client", return_value=FakeClient("400 Syntax error: Unexpected keyword WHERE")):
+            ok_bad, _ = rules._dry_run_sql(c, "SELECT FROM WHERE", default_project="billing-proj")
+        self.assertFalse(ok_bad)
+
 
 if __name__ == "__main__":
     unittest.main()

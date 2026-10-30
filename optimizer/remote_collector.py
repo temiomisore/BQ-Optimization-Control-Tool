@@ -117,6 +117,24 @@ def slots_sql(region: str, jobs_view: str) -> str:
       GROUP BY 1, 2, 3, 4"""
 
 
+def query_previews_sql(region: str, project: str) -> str:
+    """Per-project SQL text lookup keyed on query_hash (hydrates JOBS_BY_ORGANIZATION rows,
+    which omit the `query` column by BigQuery design). Params: @proj, @days."""
+    src = _src(region, project)
+    return f"""
+      SELECT @proj AS project_id,
+             query_info.query_hashes.normalized_literals AS query_hash,
+             ANY_VALUE(SUBSTR(query, 1, 1024)) AS query_preview
+      FROM {src}.JOBS_BY_PROJECT
+      WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+        AND job_type = 'QUERY'
+        AND query_info.query_hashes.normalized_literals IS NOT NULL
+        AND query IS NOT NULL
+        AND LENGTH(TRIM(query)) > 0
+      GROUP BY 1, 2
+      LIMIT 20000"""
+
+
 _STORAGE_COLS = [("total_rows", "INT64"), ("total_partitions", "INT64"),
                  ("total_logical_bytes", "INT64"), ("active_logical_bytes", "INT64"),
                  ("long_term_logical_bytes", "INT64"), ("total_physical_bytes", "INT64"),
@@ -436,6 +454,90 @@ def collect_jobs(c: Config, region: str, run_id: str, now: dt.datetime | None = 
     return n, f"window from {start:%Y-%m-%d %H:%M} UTC"
 
 
+def hydrate_query_previews(c: Config, region: str, run_id: str,
+                           projects: list[str] | None = None) -> tuple:
+    """Backfill `jobs_events.query_preview` from per-project `JOBS_BY_PROJECT` when
+    `jobs_view == 'JOBS_BY_ORGANIZATION'` (which omits SQL text by BigQuery design).
+
+    Groups by `(project_id, query_hash)` so even 250k+ org jobs transfer only ~1k-5k compact
+    rows. Discovers active query-running projects directly from `jobs_events` (covering
+    compute-only execution projects with 0 datasets) and isolates per-project 403 errors.
+    """
+    if _jobs_view(c) != "JOBS_BY_ORGANIZATION":
+        return 0, "not needed"
+    reg = regions.normalize(region) or region
+    inc_days = max(int(c.get("incremental_lookback_days", 3)) + 1, 4)
+    stats = bq.query(c, f"""
+        SELECT
+          COUNTIF(query_preview IS NOT NULL) AS hydrated_90d,
+          ARRAY_AGG(DISTINCT IF(query_hash IS NOT NULL AND query_preview IS NULL, project_id, NULL)
+                    IGNORE NULLS) AS missing_projs_90d,
+          ARRAY_AGG(DISTINCT IF(query_hash IS NOT NULL AND query_preview IS NULL
+                                AND creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @inc DAY),
+                                project_id, NULL) IGNORE NULLS) AS missing_projs_inc
+        FROM `{c.ops}.jobs_events`
+        WHERE region = @r
+          AND creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+          AND job_type = 'QUERY'""", {"r": reg, "inc": inc_days})
+    stat = stats[0] if stats else {}
+    first_hydration = int(stat.get("hydrated_90d") or 0) == 0
+    days = 90 if first_hydration else inc_days
+    raw_missing = list(stat.get("missing_projs_90d" if first_hydration else "missing_projs_inc") or [])
+    missing_set = {str(p) for p in raw_missing if _PROJECT_RE.match(str(p or ""))}
+    if c.get("target_dataset"):
+        missing_set &= {str(c["project_id"])}
+    ordered: list[str] = []
+    for p in list(projects or []) + sorted(missing_set):
+        if p in missing_set and p not in ordered:
+            ordered.append(p)
+    if not ordered:
+        return 0, f"0 unhydrated projects ({days}d window)"
+
+    rows: list[dict] = []
+    ok_projs, skipped_projs = 0, []
+    for proj in ordered:
+        try:
+            rows.extend(_q(c, query_previews_sql(reg, proj), {"proj": proj, "days": days}, reg))
+            ok_projs += 1
+        except Exception as pe:  # noqa: BLE001 — one locked-down project never aborts the rest
+            skipped_projs.append((proj, pe))
+    if ok_projs == 0 and skipped_projs:
+        raise skipped_projs[0][1]
+
+    updated = 0
+    if rows:
+        from google.cloud.bigquery import SchemaField
+        schema = [
+            SchemaField("project_id", "STRING"),
+            SchemaField("query_hash", "STRING"),
+            SchemaField("query_preview", "STRING"),
+        ]
+        stg = _stg(c, "query_previews", reg)
+        bq.load_rows(c, stg, rows, schema)
+        try:
+            updated = bq.execute(c, f"""
+                UPDATE `{c.ops}.jobs_events` T
+                SET query_preview = S.query_preview
+                FROM (
+                  SELECT project_id, query_hash, ANY_VALUE(query_preview) AS query_preview
+                  FROM `{stg}`
+                  WHERE query_preview IS NOT NULL
+                  GROUP BY 1, 2
+                ) S
+                WHERE T.region = @r
+                  AND T.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+                  AND T.project_id = S.project_id
+                  AND T.query_hash = S.query_hash
+                  AND T.query_preview IS NULL""", {"r": reg, "days": days})
+        finally:
+            _drop(c, stg)
+
+    note = f"{len(rows)} hash(es) from {ok_projs}/{len(ordered)} project(s) ({days}d)"
+    if skipped_projs:
+        note += f"; skipped {len(skipped_projs)}: {', '.join(p for p, _ in skipped_projs[:5])}"
+    return updated, note
+
+
 def collect_hourly_slots(c: Config, region: str, run_id: str, now: dt.datetime | None = None) -> tuple:
     now = now or dt.datetime.now(dt.timezone.utc)
     wm = _watermark(c, "jobs_hourly_slots", "hour_ts", region, "AND run_id != 'demo-seed'")
@@ -741,6 +843,23 @@ def collect_extra_projects_home(c: Config, home: str, extra_projects: list[str],
     return results
 
 
+def hydrate_home_query_previews(c: Config, home: str, projects: list[str] | None, run_id: str) -> dict:
+    """Hydrate `jobs_events.query_preview` across projects in the HOME region when using
+    `JOBS_BY_ORGANIZATION`, recording `1b_query_previews` in `collector_audit`."""
+    if _jobs_view(c) != "JOBS_BY_ORGANIZATION":
+        return {}
+    reg = regions.normalize(home)
+    if not reg:
+        raise ValueError(f"invalid region {home!r}")
+    try:
+        n, note = hydrate_query_previews(c, reg, run_id, projects)
+        _write_audit(c, run_id, reg, [("1b_query_previews", "OK", n, note)])
+        return {"1b_query_previews": n}
+    except Exception as e:  # noqa: BLE001
+        _write_audit(c, run_id, reg, [("1b_query_previews", "SKIPPED", 0, str(e)[:1000])])
+        return {"1b_query_previews": f"SKIPPED: {str(e)[:160]}"}
+
+
 def collect_region(c: Config, region: str, run_id: str,
                    projects: list[str] | None = None) -> dict:
     """Run every collector step for one non-home region. Each step is isolated: a failure is
@@ -753,6 +872,10 @@ def collect_region(c: Config, region: str, run_id: str,
     projs = list(projects) if projects is not None else [c["project_id"]]
     steps: list[tuple[str, Callable[[], tuple]]] = [
         ("1_jobs_events", lambda: collect_jobs(c, reg, run_id)),
+    ]
+    if _jobs_view(c) == "JOBS_BY_ORGANIZATION":
+        steps.append(("1b_query_previews", lambda: hydrate_query_previews(c, reg, run_id, projs)))
+    steps.extend([
         ("2_hourly_slots", lambda: collect_hourly_slots(c, reg, run_id)),
         ("3_table_state", lambda: collect_table_state(c, reg, run_id, projs)),
         ("4_columns", lambda: collect_columns(c, reg, run_id, projs)),
@@ -761,7 +884,7 @@ def collect_region(c: Config, region: str, run_id: str,
         ("7_objects", lambda: collect_objects(c, reg, run_id, projs)),
         ("8_recommendations", lambda: collect_recommendations(c, reg, run_id)),
         ("8_insights", lambda: collect_insights(c, reg, run_id)),
-    ]
+    ])
     if c.get("reservation_admin_project"):
         steps.append(("9_reservations", lambda: collect_reservations(c, reg, run_id)))
     results, audit = {}, []
