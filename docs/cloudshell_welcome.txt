@@ -1,0 +1,13 @@
+==============================================================================
+  BigQuery Optimization Control Tool — 1-Click Installer Ready
+==============================================================================
+
+  Paste or type this command below and press Enter to set everything up:
+
+    ./scripts/install.sh --yes
+
+  • If you haven't selected a GCP project yet, the installer will list your
+    projects as [1], [2], [3]... so you can pick one by number.
+  • Takes ~4 minutes, then prints your live web app link!
+
+==============================================================================

@@ -193,10 +193,12 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         script = os.path.join(repo_root, "scripts", "install.sh")
         tutorial = os.path.join(repo_root, "docs", "INSTALL.md")
+        welcome = os.path.join(repo_root, "docs", "cloudshell_welcome.txt")
         readme = os.path.join(repo_root, "README.md")
 
         self.assertTrue(os.path.isfile(script))
         self.assertTrue(os.path.isfile(tutorial))
+        self.assertTrue(os.path.isfile(welcome))
 
         syn = subprocess.run(["bash", "-n", script], capture_output=True, text=True)
         self.assertEqual(syn.returncode, 0, syn.stderr)
@@ -204,6 +206,7 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         hlp = subprocess.run(["bash", script, "--help"], capture_output=True, text=True)
         self.assertEqual(hlp.returncode, 0, hlp.stderr)
         self.assertIn("--project=PROJECT_ID", hlp.stdout)
+        self.assertIn("--ops-dataset=DATASET", hlp.stdout)
 
         with open(tutorial, encoding="utf-8") as f:
             tut_text = f.read()
@@ -212,7 +215,10 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
 
         with open(readme, encoding="utf-8") as f:
             rd_text = f.read()
+        self.assertIn("https://console.cloud.google.com/cloudshell/editor?shellonly=true", rd_text)
+        self.assertIn("cloudshell_print=docs/cloudshell_welcome.txt", rd_text)
         self.assertIn("cloudshell_tutorial=docs/INSTALL.md", rd_text)
+        self.assertNotIn("https://shell.cloud.google.com/cloudshell/editor", rd_text)
 
 
 if __name__ == "__main__":

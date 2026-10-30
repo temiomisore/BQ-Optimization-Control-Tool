@@ -51,6 +51,7 @@ Options:
   --project=PROJECT_ID             GCP project to host the app & optimizer_ops dataset
   --region=REGION                  Cloud Run & Scheduler region (default: us-central1)
   --bq-location=LOCATION           BigQuery home location for optimizer_ops (default: US)
+  --ops-dataset=DATASET            BigQuery ops dataset name (default: optimizer_ops)
   --admin=EMAIL                    Settings Admin email (default: active gcloud account)
   --finops=EMAIL[,EMAIL...]        FinOps approver email(s) (default: Settings Admin email)
   --reservation-project=PROJECT    Optional BigQuery reservation admin project ID
@@ -67,11 +68,13 @@ for arg in "$@"; do
     --project=*)             PROJECT_ID="${arg#*=}" ;;
     --region=*)              RUN_REGION="${arg#*=}" ;;
     --bq-location=*)         BQ_LOCATION="${arg#*=}" ;;
+    --ops-dataset=*)         OPS_DATASET="${arg#*=}" ;;
     --admin=*)               ADMIN_EMAIL="${arg#*=}" ;;
     --finops=*)              FINOPS_EMAILS="${arg#*=}" ;;
     --reservation-project=*) RESERVATION_PROJECT="${arg#*=}" ;;
     --service-name=*)        SERVICE_NAME="${arg#*=}" ;;
     --job-name=*)            JOB_NAME="${arg#*=}" ;;
+    --scheduler-name=*)      SCHEDULER_NAME="${arg#*=}" ;;
     --allow-domain)          ALLOW_DOMAIN="true" ;;
     --no-allow-domain)       ALLOW_DOMAIN="false" ;;
     --no-iap)                ENABLE_IAP="false" ;;
@@ -129,12 +132,40 @@ if [[ -z "$ADMIN_EMAIL" || "$ADMIN_EMAIL" != *"@"* ]]; then
 fi
 
 if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" || "$PROJECT_ID" == "<walkthrough-project-id/>" ]]; then
-  PROJECT_ID="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
+  PROJECT_ID=""
+  _ACTIVE_PROJ="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -n "$_ACTIVE_PROJ" && "$_ACTIVE_PROJ" != "(unset)" ]]; then
+    PROJECT_ID="$_ACTIVE_PROJ"
+  fi
 fi
-if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" ]]; then
-  if [[ "$ASSUME_YES" == "false" && -t 0 ]]; then
+if [[ -z "$PROJECT_ID" && -t 0 ]]; then
+  echo ""
+  echo "  Fetching your Google Cloud projects..."
+  _PROJ_IDS=()
+  _PROJ_NAMES=()
+  while IFS=$'\t' read -r _pid _pname; do
+    [[ -z "$_pid" ]] && continue
+    _PROJ_IDS+=("$_pid")
+    _PROJ_NAMES+=("${_pname:-$_pid}")
+  done < <(gcloud projects list --sort-by=projectId --limit=30 --format="value(projectId,name)" --quiet 2>/dev/null || true)
+
+  if [[ "${#_PROJ_IDS[@]}" -gt 0 ]]; then
+    echo "  Which Google Cloud project should host the app & ${OPS_DATASET} dataset?"
+    echo ""
+    for _i in "${!_PROJ_IDS[@]}"; do
+      printf "    [%d] %-34s (%s)\n" "$((_i + 1))" "${_PROJ_IDS[$_i]}" "${_PROJ_NAMES[$_i]}"
+    done
+    echo ""
+    read -r -p "  Enter a number [1-${#_PROJ_IDS[@]}] or type a Project ID: " _CHOICE
+    _CHOICE="$(printf '%s' "$_CHOICE" | tr -d '[:space:]')"
+    if [[ "$_CHOICE" =~ ^[0-9]+$ ]] && (( _CHOICE >= 1 && _CHOICE <= ${#_PROJ_IDS[@]} )); then
+      PROJECT_ID="${_PROJ_IDS[$((_CHOICE - 1))]}"
+    else
+      PROJECT_ID="$_CHOICE"
+    fi
+  else
     read -r -p "  Enter the GCP Project ID to install into: " PROJECT_ID
-    PROJECT_ID="$(echo "$PROJECT_ID" | tr -d '[:space:]')"
+    PROJECT_ID="$(printf '%s' "$PROJECT_ID" | tr -d '[:space:]')"
   fi
 fi
 if [[ -z "$PROJECT_ID" ]]; then
@@ -306,16 +337,18 @@ if [[ -n "$ORG_ID" ]]; then
   fi
 fi
 
-PROJECT_ID="$PROJECT_ID" \
-OPS_DATASET="$OPS_DATASET" \
-BQ_LOCATION="$BQ_LOCATION" \
-ASSET_SCOPE="$ASSET_SCOPE" \
-JOBS_VIEW="$JOBS_VIEW" \
-RESERVATION_PROJECT="$RESERVATION_PROJECT" \
-ADMIN_EMAIL="$ADMIN_EMAIL" \
-FINOPS_EMAILS="$FINOPS_EMAILS" \
-IAP_AUDIENCE="$IAP_AUDIENCE" \
-python3 - <<'PY'
+write_config_yaml() {
+  local _iap_aud="$1"
+  PROJECT_ID="$PROJECT_ID" \
+  OPS_DATASET="$OPS_DATASET" \
+  BQ_LOCATION="$BQ_LOCATION" \
+  ASSET_SCOPE="$ASSET_SCOPE" \
+  JOBS_VIEW="$JOBS_VIEW" \
+  RESERVATION_PROJECT="$RESERVATION_PROJECT" \
+  ADMIN_EMAIL="$ADMIN_EMAIL" \
+  FINOPS_EMAILS="$FINOPS_EMAILS" \
+  IAP_AUDIENCE="$_iap_aud" \
+  python3 - <<'PY'
 import os
 
 proj = os.environ["PROJECT_ID"]
@@ -366,6 +399,9 @@ demo_mode: false
 with open("config.yaml", "w", encoding="utf-8") as f:
     f.write(content)
 PY
+}
+
+write_config_yaml "$IAP_AUDIENCE"
 ok "Wrote config.yaml (Admin: ${ADMIN_EMAIL}, Scope: ${ASSET_SCOPE}, View: ${JOBS_VIEW})."
 
 # ---- Step 5: Deploy Cloud Run Web UI (+ Direct IAP) --------------------------
@@ -395,7 +431,9 @@ if [[ "$ENABLE_IAP" == "true" ]]; then
        --quiet; then
     DEPLOY_IAP_ACTIVE="true"
   else
-    warn "Direct --iap flag was rejected by project/org policy; deploying private service without --iap flag..."
+    warn "Direct --iap flag was rejected by project/org policy; redeploying private service without --iap flag..."
+    IAP_AUDIENCE=""
+    write_config_yaml ""
     gcloud run deploy "$SERVICE_NAME" \
       --project="$PROJECT_ID" \
       --region="$RUN_REGION" \

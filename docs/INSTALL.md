@@ -22,6 +22,13 @@ Click the **Copy to Cloud Shell** button on the command below and press **Enter*
 ./scripts/install.sh --project="<walkthrough-project-id/>" --yes
 ```
 
+*(Didn't pick a project in Step 1 yet? No problem — the installer automatically lists your Google Cloud projects as `[1]`, `[2]`, `[3]` so you can pick one by number!)*
+
+> **Switched Google accounts or opened a fresh Cloud Shell tab?** If your terminal says `No such file or directory`, paste this 1-liner instead to clone & run in one step:
+> ```bash
+> rm -rf BQ-Optimization-Control-Tool && git clone --depth=1 https://github.com/temiomisore/BQ-Optimization-Control-Tool.git && cd BQ-Optimization-Control-Tool && ./scripts/install.sh --yes
+> ```
+
 > **Optional flags** (only if you already know them — otherwise you can set everything in the web UI afterward!):
 > - Have a separate FinOps approver? Add `--finops="finops-lead@yourcompany.com"`
 > - Have a central slot/reservation admin project? Add `--reservation-project="your-slot-admin-project"`

@@ -19,9 +19,16 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 
 ## 1-Click Setup in Google Cloud (No Local Install or YAML Editing)
 
-Click below to open an interactive setup walkthrough in **Google Cloud Shell** (runs entirely in your browser):
+Click below to open a clean **terminal-only** guided setup in **Google Cloud Shell** (runs entirely in your browser):
 
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://shell.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_tutorial=docs/INSTALL.md)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_print=docs/cloudshell_welcome.txt&cloudshell_tutorial=docs/INSTALL.md)
+
+> **Tip:** On the Cloud Shell prompt, check **Trust repo** before clicking **Confirm**, then run `./scripts/install.sh --yes`.
+>
+> **Already inside Cloud Shell (or switched Google accounts)?** Paste this 1-liner into any Cloud Shell terminal:
+> ```bash
+> rm -rf BQ-Optimization-Control-Tool && git clone --depth=1 https://github.com/temiomisore/BQ-Optimization-Control-Tool.git && cd BQ-Optimization-Control-Tool && ./scripts/install.sh --yes
+> ```
 
 What `scripts/install.sh` sets up automatically (~4 minutes):
 1. **Auto-detects** your signed-in Google account (makes you **Settings Admin**), your GCP Project, and your GCP Organization ID.
