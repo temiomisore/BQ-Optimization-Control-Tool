@@ -211,6 +211,8 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         with open(script, encoding="utf-8") as f:
             script_text = f.read()
         self.assertIn("roles/run.builder", script_text)
+        self.assertIn("roles/storage.objectViewer", script_text)
+        self.assertIn("gs://run-sources-${PROJECT_ID}-${RUN_REGION}", script_text)
         self.assertIn("--build-service-account=", script_text)
         self.assertIn("spec.template.spec.containers[0].image", script_text)
 

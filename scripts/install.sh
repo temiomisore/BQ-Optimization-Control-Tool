@@ -273,6 +273,7 @@ fi
 
 PROJECT_ROLES=(
   "roles/run.builder"
+  "roles/storage.objectViewer"
   "roles/bigquery.jobUser"
   "roles/bigquery.dataEditor"
   "roles/bigquery.metadataViewer"
@@ -287,11 +288,22 @@ for ROLE in "${PROJECT_ROLES[@]}"; do
     --condition=None \
     --quiet >/dev/null
 done
+
+# If Cloud Run's source staging bucket already exists (e.g. re-installing after a reset),
+# bind storage.objectViewer directly on the bucket so GCS refreshes its bucket IAM etag immediately.
+SOURCE_BUCKET="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
+if gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+  gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/storage.objectViewer" \
+    --quiet >/dev/null 2>&1 || true
+fi
+
 if [[ "$HAD_RUN_BUILDER" == "false" ]]; then
-  ok "Granted project-level Cloud Run Builder, BigQuery, Recommender & Vertex AI roles (waiting 10s for IAM propagation)..."
-  sleep 10
+  ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles (waiting 15s for IAM propagation)..."
+  sleep 15
 else
-  ok "Granted project-level Cloud Run Builder, BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
+  ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
 fi
 
 # Attempt org-wide read-only discovery & JOBS_BY_ORGANIZATION grants if in an org.
@@ -459,19 +471,36 @@ run_source_deploy() {
     return 0
   fi
 
-  # Newly granted roles/run.builder on a fresh project can take ~10-15s to propagate to Cloud Build / GCS.
-  if python3 - "$_DEPLOY_LOG" <<'PY'
+  # Newly created (or deleted-and-recreated) service accounts can take 60-120s for GCS / Cloud Build
+  # IAM caches to propagate storage.objects.get on gs://run-sources-<project>-<region>.
+  local -a _waits=(15 20 25 30 30 30)
+  local _total="${#_waits[@]}"
+  local _idx=0
+  local _wait
+  for _wait in "${_waits[@]}"; do
+    _idx=$((_idx + 1))
+    if ! python3 - "$_DEPLOY_LOG" <<'PY'
 import sys
 txt = open(sys.argv[1], encoding="utf-8", errors="ignore").read().lower()
 sys.exit(0 if ("storage.objects.get" in txt or "artifactregistry" in txt or "permission" in txt) else 1)
 PY
-  then
-    warn "Waiting 15s for new Cloud Run Builder IAM permissions to finish propagating, then retrying..."
-    sleep 15
+    then
+      break
+    fi
+    # Attempt 1 creates gs://run-sources-<project>-<region> during "Uploading sources...";
+    # binding objectViewer directly on the bucket accelerates GCS IAM cache refresh.
+    if gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+      gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="roles/storage.objectViewer" \
+        --quiet >/dev/null 2>&1 || true
+    fi
+    warn "Waiting ${_wait}s for Google Cloud Storage / Builder IAM propagation (retry ${_idx}/${_total})..."
+    sleep "$_wait"
     if "${_cmd[@]}" 2>&1 | tee "$_DEPLOY_LOG"; then
       return 0
     fi
-  fi
+  done
   return 1
 }
 
