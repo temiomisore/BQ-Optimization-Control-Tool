@@ -1122,8 +1122,18 @@ function SettingRow({
   const v = fmtValue(s.value);
   const [editing, setEditing] = useState(false);
   const { save } = useSettingsMutations();
+  const parentSetting = s.table_key ? allSettings[s.table_key] : undefined;
+  const parentTable = String(parentSetting?.value || "").trim();
+  const waitingForTable = !!s.table_key && !parentTable;
+  const parentLabel = parentSetting?.label || s.table_key || "table above";
+  const displayText = waitingForTable && v.empty ? "Not needed (using built-in table)" : v.text;
+
+  useEffect(() => {
+    if (waitingForTable && editing) setEditing(false);
+  }, [waitingForTable, editing]);
+
   return (
-    <div className="border-t border-zinc-200 py-2.5 first:border-t-0 dark:border-ink-800">
+    <div className={cn("border-t border-zinc-200 py-2.5 first:border-t-0 dark:border-ink-800", waitingForTable && "opacity-75")}>
       <div className="grid gap-x-4 gap-y-1 md:grid-cols-[minmax(180px,1.1fr)_minmax(160px,1fr)_11rem_minmax(220px,1.6fr)] md:items-start">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-1.5 text-sm font-medium text-zinc-800 dark:text-zinc-100">
@@ -1133,13 +1143,21 @@ function SettingRow({
           <div className="truncate font-mono text-[11px] text-zinc-500" title={s.key}>{s.key}</div>
         </div>
         <div className="flex min-w-0 items-start gap-1.5">
-          <span className={cn("min-w-0 break-words font-mono text-[12px]", v.empty ? "italic text-zinc-400" : "text-zinc-800 dark:text-zinc-200")} title={v.text}>
-            {v.text}
+          <span
+            className={cn("min-w-0 break-words font-mono text-[12px]", v.empty ? "italic text-zinc-400" : "text-zinc-800 dark:text-zinc-200")}
+            title={waitingForTable ? `Select a custom table in "${parentLabel}" above first` : v.text}
+          >
+            {displayText}
           </span>
-          {s.editable_by_you && !editing && (
+          {s.editable_by_you && !waitingForTable && !editing && (
             <button type="button" title="Edit" onClick={() => setEditing(true)} className="shrink-0 rounded p-0.5 text-zinc-400 hover:bg-zinc-100 hover:text-sky-500 dark:hover:bg-white/5">
               <Pencil className="h-3.5 w-3.5" />
             </button>
+          )}
+          {s.editable_by_you && waitingForTable && (
+            <span title={`Select a custom table in "${parentLabel}" above to map columns`} className="shrink-0 pt-0.5 text-zinc-400">
+              <MinusCircle className="h-3.5 w-3.5" />
+            </span>
           )}
           {!s.editable_by_you && s.locked_reason && (
             <span title={s.locked_reason} className="shrink-0 pt-0.5 text-zinc-400"><Lock className="h-3 w-3" /></span>
@@ -1148,6 +1166,9 @@ function SettingRow({
         <div><SourceBadge source={s.source} /></div>
         <div className="text-xs leading-relaxed text-zinc-500">
           {s.desc}
+          {waitingForTable && (
+            <span className="ml-1 text-zinc-400">(Unlocks once a table is selected in “{parentLabel}” above.)</span>
+          )}
           {s.env && !s.source.includes("env ") && <span className="text-zinc-400"> Env var: <span className="font-mono">{s.env}</span>.</span>}
           {s.saved && (
             <div className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
@@ -1162,7 +1183,7 @@ function SettingRow({
           )}
         </div>
       </div>
-      {editing && <Editor s={s} onDone={() => setEditing(false)} options={options} allSettings={allSettings} />}
+      {editing && !waitingForTable && <Editor s={s} onDone={() => setEditing(false)} options={options} allSettings={allSettings} />}
     </div>
   );
 }

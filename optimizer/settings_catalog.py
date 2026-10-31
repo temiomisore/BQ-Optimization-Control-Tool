@@ -174,7 +174,7 @@ SETTINGS: list[dict] = [
        "director. Not set = optimizer_ops.employee_hierarchy.", env="BQOPT_EMPLOYEE_HIERARCHY_TABLE",
        edit="editor", kind="table", nullable=True, applies="owners"),
     _s("employee_hierarchy_columns", "HR table column names", "everyday", "Ownership & billing",
-       "Your column names, when they differ from ours: pick each column from your HR table.",
+       "Only needed if you select your own HR table above and its column names differ from ours.",
        edit="editor", kind="map", fields=HIERARCHY_FIELDS, table_key="employee_hierarchy_table",
        applies="owners"),
     _s("service_account_owner_table", "Service-account owner table", "everyday", "Ownership & billing",
@@ -182,7 +182,8 @@ SETTINGS: list[dict] = [
        "(project.dataset.table).", env="BQOPT_SERVICE_ACCOUNT_OWNER_TABLE",
        edit="editor", kind="table", nullable=True, applies="owners"),
     _s("service_account_owner_columns", "Owner table column names", "everyday", "Ownership & billing",
-       "Your column names: service_account and owner are required.",
+       "Only needed if you select your own service-account owner table above — map its "
+       "service_account and owner columns.",
        edit="editor", kind="map", fields=SA_OWNER_FIELDS, table_key="service_account_owner_table",
        applies="owners"),
     _s("billing_export_table", "Billing export table", "everyday", "Ownership & billing",
