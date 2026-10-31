@@ -370,6 +370,14 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
         self.assertEqual(app_main._COPILOT_MODELS[0], ("gemini-3.8-flash", "global"))
         self.assertTrue(all(not m.startswith("gemini-2.5") for m, _ in app_main._COPILOT_MODELS))
 
+    def test_jobs_view_org_label_reflects_sql_hydration(self):
+        from optimizer import settings_catalog as sc
+        spec = sc.BY_KEY["jobs_view"]
+        org_preset = next(p for p in spec["presets"] if p["value"] == "JOBS_BY_ORGANIZATION")
+        self.assertIn("auto-hydrated", org_preset["label"])
+        self.assertNotIn("omits SQL text", org_preset["label"])
+        self.assertIn("auto-hydrated", spec["desc"])
+
 
 if __name__ == "__main__":
     unittest.main()

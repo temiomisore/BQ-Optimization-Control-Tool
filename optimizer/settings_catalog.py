@@ -124,12 +124,13 @@ SETTINGS: list[dict] = [
                 {"value": 90, "label": "90 days"}]),
 
     _s("jobs_view", "Query history scope", "everyday", "Query history",
-       "JOBS = this project only. JOBS_BY_ORGANIZATION = every project in the organization "
-       "(needs an org-level role; BigQuery leaves query text out of that view).", env="BQOPT_JOBS_VIEW",
+       "JOBS = this project only. JOBS_BY_ORGANIZATION = every project in the organization across "
+       "every collected region (needs org-level resourceViewer; SQL text is auto-hydrated per project).",
+       env="BQOPT_JOBS_VIEW",
        edit="editor", kind="enum", choices=["JOBS", "JOBS_BY_ORGANIZATION"], applies="collect",
-       presets=[{"value": "JOBS", "label": "JOBS — This project only (keeps full SQL text · default)"},
+       presets=[{"value": "JOBS", "label": "JOBS — This project only (default)"},
                 {"value": "JOBS_BY_ORGANIZATION",
-                 "label": "JOBS_BY_ORGANIZATION — Every project in the org (omits SQL text)"}]),
+                 "label": "JOBS_BY_ORGANIZATION — Every project in the org (full SQL text auto-hydrated)"}]),
     _s("recs_view", "Google recommendations view", "everyday", "Query history",
        "RECOMMENDATIONS (this project) or RECOMMENDATIONS_BY_ORGANIZATION.", default="RECOMMENDATIONS",
        edit="editor", kind="enum", choices=["RECOMMENDATIONS", "RECOMMENDATIONS_BY_ORGANIZATION"],
