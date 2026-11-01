@@ -17,18 +17,23 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
                                   └──── d_history ◀────────┘
 ```
 
-## 1-Click Setup in Google Cloud (No Local Install or YAML Editing)
+## 1-Click Setup in Google Cloud (Zero Copy-Pasting or YAML Editing)
 
-Click below to open a clean **terminal-only** guided setup in **Google Cloud Shell** (runs entirely in your browser):
+Click below to launch the **fully automated** setup in **Google Cloud Shell** (runs entirely in your browser — nothing to type or paste):
 
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_print=docs/cloudshell_welcome.txt)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_image=gcr.io/cloudrun/button&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main)
 
-> **Tip:** On the Cloud Shell prompt, check **Trust repo** before clicking **Confirm**, then run `./scripts/install.sh --yes`.
+> **How it works (zero pasting):**
+> 1. On the Cloud Shell prompt, check **Trust repo** and click **Confirm** *(press **Authorize** if Google asks)*.
+> 2. Setup starts **automatically** — use your **`↑` / `↓` arrow keys + `Enter`** when asked **which GCP project** (and Cloud Run region, default `us-central1`) to deploy into.
+> 3. Sit back for ~4 minutes until you see **`🎉 Setup Complete — Your App Is Live!`**, then click your `https://bqopt-review-ui-.../#settings` link!
 >
-> **Already inside Cloud Shell (or switched Google accounts)?** Paste this 1-liner into any Cloud Shell terminal:
+> <details><summary>Optional: manual CLI command if you already have a regular Cloud Shell terminal open</summary>
+>
 > ```bash
 > rm -rf BQ-Optimization-Control-Tool && git clone --depth=1 https://github.com/temiomisore/BQ-Optimization-Control-Tool.git && cd BQ-Optimization-Control-Tool && ./scripts/install.sh --yes
 > ```
+> </details>
 
 What `scripts/install.sh` sets up automatically (~4 minutes):
 1. **Auto-detects** your signed-in Google account (makes you **Settings Admin**), your GCP Project, and your GCP Organization ID.
@@ -65,7 +70,7 @@ What `scripts/install.sh` sets up automatically (~4 minutes):
 | `notebooks/BigQuery_Optimization_Notebook.ipynb` | Interactive Jupyter Notebook for Customer Demo 1 in BigQuery Studio |
 | `notebooks/BigQuery_Optimization_Notebook_2.ipynb` | Interactive Jupyter Notebook for Customer Demo 2 in BigQuery Studio |
 | `scripts/demo_git_pr.py` | Renders the Class-4 CI pull-request (simulated PR output for demos) |
-| `scripts/install.sh`, `docs/INSTALL.md` | **1-click Cloud Shell installer** & interactive walkthrough (APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
+| `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (interactive project/region picker via `gcr.io/cloudrun/button`, APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
 | `optimizer/scan_runner.py` | On-demand **Run scan now** engine triggered from the Review UI (Cloud Run Job execution with automatic in-process fallback) |
 | `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, bundled OpenJDK + ZetaSQL `.jar`, multi-worker Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
 | `tests/` | Pure-logic unit tests (no GCP needed): `python -m unittest discover -s tests` |

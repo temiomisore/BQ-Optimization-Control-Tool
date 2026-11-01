@@ -1,5 +1,6 @@
 # Local configuration (copy config.yaml.example -> config.yaml)
 config.yaml
+.bqopt_*
 
 # Python bytecode & cache
 __pycache__/

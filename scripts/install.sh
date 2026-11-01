@@ -2,7 +2,12 @@
 # ==============================================================================
 # 1-Click Automated Installer — BigQuery Optimization Control Plane
 # ==============================================================================
-# Designed for Google Cloud Shell (zero local installs required).
+# Designed for Google Cloud Shell (zero local installs or copy-pasting required).
+#
+# Supports BOTH:
+#   - Automatic zero-paste launch via Google's official `gcr.io/cloudrun/button`
+#     (`app.json` lifecycle hooks: --phase=prepare|postbuild|precreate|finalize)
+#   - Standalone manual CLI execution (`./scripts/install.sh --yes`)
 #
 # What this script sets up automatically:
 #   1. Auto-detects your Google login, GCP Project, Project Number & Organization
@@ -28,7 +33,7 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 # ---- Defaults & CLI flags ----------------------------------------------------
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-}"
-RUN_REGION="${CLOUD_RUN_REGION:-us-central1}"
+RUN_REGION="${CLOUD_RUN_REGION:-${GOOGLE_CLOUD_REGION:-us-central1}}"
 BQ_LOCATION="US"
 OPS_DATASET="optimizer_ops"
 ADMIN_EMAIL=""
@@ -42,6 +47,11 @@ ALLOW_DOMAIN="auto"       # auto = allow corporate @domain.com on IAP, skip cons
 ENABLE_IAP="true"
 ASSUME_YES="false"
 RUN_FIRST_SCAN="false"
+PHASE="all"               # all | prepare | postbuild | precreate | finalize
+PREBUILT_IMAGE="${IMAGE_URL:-}"
+EXPLICIT_PROJECT="false"
+EXPLICIT_REGION="false"
+STATE_FILE="${REPO_ROOT}/.bqopt_prepared.env"
 
 usage() {
   cat <<'EOF'
@@ -58,6 +68,8 @@ Options:
   --allow-domain / --no-allow-domain
                                    Let colleagues in your corporate email domain sign into the UI
   --run-first-scan                 Kick off the first BigQuery scan automatically after deploy
+  --image=IMAGE_URI                Deploy from a pre-built container image instead of source build
+  --phase=PHASE                    Lifecycle phase: all (default), prepare, postbuild, precreate, finalize
   -y, --yes                        Non-interactive 1-click mode (accept auto-detected defaults)
   -h, --help                       Show this help
 EOF
@@ -65,8 +77,8 @@ EOF
 
 for arg in "$@"; do
   case "$arg" in
-    --project=*)             PROJECT_ID="${arg#*=}" ;;
-    --region=*)              RUN_REGION="${arg#*=}" ;;
+    --project=*)             PROJECT_ID="${arg#*=}"; EXPLICIT_PROJECT="true" ;;
+    --region=*)              RUN_REGION="${arg#*=}"; EXPLICIT_REGION="true" ;;
     --bq-location=*)         BQ_LOCATION="${arg#*=}" ;;
     --ops-dataset=*)         OPS_DATASET="${arg#*=}" ;;
     --admin=*)               ADMIN_EMAIL="${arg#*=}" ;;
@@ -75,6 +87,8 @@ for arg in "$@"; do
     --service-name=*)        SERVICE_NAME="${arg#*=}" ;;
     --job-name=*)            JOB_NAME="${arg#*=}" ;;
     --scheduler-name=*)      SCHEDULER_NAME="${arg#*=}" ;;
+    --image=*)               PREBUILT_IMAGE="${arg#*=}" ;;
+    --phase=*)               PHASE="${arg#*=}" ;;
     --allow-domain)          ALLOW_DOMAIN="true" ;;
     --no-allow-domain)       ALLOW_DOMAIN="false" ;;
     --no-iap)                ENABLE_IAP="false" ;;
@@ -88,6 +102,43 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+case "$PHASE" in
+  all|prepare|postbuild|precreate|finalize) ;;
+  *)
+    echo "Unknown --phase value: $PHASE (expected all|prepare|postbuild|precreate|finalize)" >&2
+    exit 1
+    ;;
+esac
+
+# Guard against upstream cloud-run-button's existingEnvVars formatting (`GOOGLE_CLOUD_PROJECT={}`)
+# and reliably extract region + project from `$IMAGE_URL` (`<region>-docker.pkg.dev/<project>/...`).
+if [[ "$PROJECT_ID" == "{}" ]]; then
+  PROJECT_ID=""
+fi
+if [[ "$RUN_REGION" == "{}" || -z "$RUN_REGION" ]]; then
+  RUN_REGION="us-central1"
+fi
+if [[ -n "$PREBUILT_IMAGE" && "$PREBUILT_IMAGE" == *-docker.pkg.dev/*/*/* ]]; then
+  _IMG_NO_REF="${PREBUILT_IMAGE%%@*}"
+  _IMG_NO_REF="${_IMG_NO_REF%%:*}"
+  _IMG_HOST="${_IMG_NO_REF%%/*}"
+  _IMG_REST="${_IMG_NO_REF#*/}"
+  _IMG_REGION="${_IMG_HOST%-docker.pkg.dev}"
+  _IMG_PROJECT="${_IMG_REST%%/*}"
+  if [[ "$EXPLICIT_PROJECT" == "false" && -n "$_IMG_PROJECT" ]]; then
+    PROJECT_ID="$_IMG_PROJECT"
+  fi
+  if [[ "$EXPLICIT_REGION" == "false" && -n "$_IMG_REGION" && "$_IMG_REGION" != "$_IMG_HOST" ]]; then
+    RUN_REGION="$_IMG_REGION"
+  fi
+fi
+
+# When invoked via `gcr.io/cloudrun/button` hooks, write directly to /dev/tty so banners render
+# in full color instead of `scripts.go`'s dim grey wrapper (can be disabled via BQOPT_NO_TTY=1).
+if [[ "$PHASE" != "all" && "${BQOPT_NO_TTY:-0}" != "1" && -c /dev/tty ]] && { true >/dev/tty; } 2>/dev/null; then
+  exec >/dev/tty 2>/dev/tty
+fi
 
 banner() {
   printf "\n\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"
@@ -117,255 +168,6 @@ is_consumer_domain() {
       return 1 ;;
   esac
 }
-
-banner "BigQuery Optimization Control Tool — 1-Click Automated Setup"
-
-# ---- Step 1: Detect identity, project, number & organization -----------------
-step "[1/7] Detecting your Google Cloud account & project..."
-
-if [[ -z "$ADMIN_EMAIL" ]]; then
-  ADMIN_EMAIL="$(gcloud config get-value account 2>/dev/null | tr -d '[:space:]' || true)"
-fi
-if [[ -z "$ADMIN_EMAIL" || "$ADMIN_EMAIL" != *"@"* ]]; then
-  echo "❌ No active Google Cloud login detected. Run: gcloud auth login" >&2
-  exit 1
-fi
-
-if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" || "$PROJECT_ID" == "<walkthrough-project-id/>" ]]; then
-  PROJECT_ID=""
-  _ACTIVE_PROJ="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
-  if [[ -n "$_ACTIVE_PROJ" && "$_ACTIVE_PROJ" != "(unset)" ]]; then
-    PROJECT_ID="$_ACTIVE_PROJ"
-  fi
-fi
-if [[ -z "$PROJECT_ID" && -t 0 ]]; then
-  echo ""
-  echo "  Fetching your Google Cloud projects..."
-  _PROJ_IDS=()
-  _PROJ_NAMES=()
-  while IFS=$'\t' read -r _pid _pname; do
-    [[ -z "$_pid" ]] && continue
-    _PROJ_IDS+=("$_pid")
-    _PROJ_NAMES+=("${_pname:-$_pid}")
-  done < <(gcloud projects list --sort-by=projectId --limit=30 --format="value(projectId,name)" --quiet 2>/dev/null || true)
-
-  if [[ "${#_PROJ_IDS[@]}" -gt 0 ]]; then
-    echo "  Which Google Cloud project should host the app & ${OPS_DATASET} dataset?"
-    echo ""
-    for _i in "${!_PROJ_IDS[@]}"; do
-      printf "    [%d] %-34s (%s)\n" "$((_i + 1))" "${_PROJ_IDS[$_i]}" "${_PROJ_NAMES[$_i]}"
-    done
-    echo ""
-    read -r -p "  Enter a number [1-${#_PROJ_IDS[@]}] or type a Project ID: " _CHOICE
-    _CHOICE="$(printf '%s' "$_CHOICE" | tr -d '[:space:]')"
-    if [[ "$_CHOICE" =~ ^[0-9]+$ ]] && (( _CHOICE >= 1 && _CHOICE <= ${#_PROJ_IDS[@]} )); then
-      PROJECT_ID="${_PROJ_IDS[$((_CHOICE - 1))]}"
-    else
-      PROJECT_ID="$_CHOICE"
-    fi
-  else
-    read -r -p "  Enter the GCP Project ID to install into: " PROJECT_ID
-    PROJECT_ID="$(printf '%s' "$PROJECT_ID" | tr -d '[:space:]')"
-  fi
-fi
-if [[ -z "$PROJECT_ID" ]]; then
-  echo "❌ No GCP Project selected. Pick a project at the top of Cloud Shell or pass --project=YOUR_PROJECT_ID" >&2
-  exit 1
-fi
-
-gcloud config set project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
-
-if [[ -z "$FINOPS_EMAILS" ]]; then
-  FINOPS_EMAILS="$ADMIN_EMAIL"
-fi
-
-EMAIL_DOMAIN="${ADMIN_EMAIL#*@}"
-SHARE_WITH_DOMAIN="false"
-if [[ "$ALLOW_DOMAIN" == "true" ]]; then
-  if ! is_consumer_domain "$EMAIL_DOMAIN"; then
-    SHARE_WITH_DOMAIN="true"
-  fi
-elif [[ "$ALLOW_DOMAIN" == "auto" ]]; then
-  if ! is_consumer_domain "$EMAIL_DOMAIN"; then
-    SHARE_WITH_DOMAIN="true"
-  fi
-fi
-
-ok "Signed in as        : ${ADMIN_EMAIL} (Settings Admin)"
-ok "Target GCP Project  : ${PROJECT_ID}"
-ok "BigQuery Location   : ${BQ_LOCATION} (dataset: ${OPS_DATASET})"
-ok "Cloud Run Region    : ${RUN_REGION}"
-ok "FinOps Approver(s)  : ${FINOPS_EMAILS}"
-if [[ "$ENABLE_IAP" == "true" && "$SHARE_WITH_DOMAIN" == "true" ]]; then
-  ok "Sign-in Access (IAP): @${EMAIL_DOMAIN} teammates (viewers by default; only you are Admin)"
-fi
-
-if [[ "$ASSUME_YES" == "false" && -t 0 ]]; then
-  echo ""
-  read -r -p "  Press Enter to set everything up automatically (or Ctrl+C to cancel)... " _
-fi
-
-# Enable APIs first so project number, ancestry, Cloud Run, Build, IAP & Scheduler work cleanly.
-step "[2/7] Enabling required Google Cloud APIs (~30-60s on a fresh project)..."
-gcloud services enable \
-  cloudresourcemanager.googleapis.com \
-  serviceusage.googleapis.com \
-  iam.googleapis.com \
-  bigquery.googleapis.com \
-  bigquerydatatransfer.googleapis.com \
-  bigquerystorage.googleapis.com \
-  bigqueryreservation.googleapis.com \
-  recommender.googleapis.com \
-  cloudasset.googleapis.com \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com \
-  cloudscheduler.googleapis.com \
-  iap.googleapis.com \
-  aiplatform.googleapis.com \
-  --project="$PROJECT_ID" --quiet
-ok "All required Google Cloud APIs enabled."
-
-PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" --quiet)"
-ANCESTORS_JSON="$(gcloud projects get-ancestors "$PROJECT_ID" --format=json --quiet 2>/dev/null || echo "[]")"
-ORG_ID="$(ANCESTORS_JSON="$ANCESTORS_JSON" python3 - <<'PY'
-import json, os
-try:
-    rows = json.loads(os.environ.get("ANCESTORS_JSON", "[]"))
-    for r in rows:
-        if r.get("type") == "organization" and r.get("id"):
-            print(r["id"])
-            break
-except Exception:
-    pass
-PY
-)"
-
-if [[ -n "$ORG_ID" ]]; then
-  ok "Detected GCP Organization: organizations/${ORG_ID}"
-else
-  warn "No parent GCP Organization detected — scoping discovery to project ${PROJECT_ID}."
-fi
-
-# ---- Step 3: Service Account & IAM -------------------------------------------
-step "[3/7] Creating Service Account & granting permissions..."
-SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
-
-if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
-  gcloud iam service-accounts create "$SA_NAME" \
-    --project="$PROJECT_ID" \
-    --display-name="BigQuery Optimization Control Plane" \
-    --description="Runs the BQ Optimization Review UI and nightly telemetry/rules pipeline" \
-    --quiet
-  ok "Created service account ${SA_EMAIL} (waiting 10s for IAM propagation)..."
-  sleep 10
-else
-  ok "Service account ${SA_EMAIL} already exists."
-fi
-
-HAD_RUN_BUILDER="false"
-if gcloud projects get-iam-policy "$PROJECT_ID" \
-     --flatten="bindings[].members" \
-     --filter="bindings.role:roles/run.builder AND bindings.members:serviceAccount:${SA_EMAIL}" \
-     --format="value(bindings.role)" --quiet 2>/dev/null | tr -d '[:space:]' | python3 -c "import sys; sys.exit(0 if sys.stdin.read().strip() else 1)"; then
-  HAD_RUN_BUILDER="true"
-fi
-
-PROJECT_ROLES=(
-  "roles/run.builder"
-  "roles/storage.objectViewer"
-  "roles/bigquery.jobUser"
-  "roles/bigquery.dataEditor"
-  "roles/bigquery.metadataViewer"
-  "roles/bigquery.resourceViewer"
-  "roles/recommender.bigqueryPartitionClusterViewer"
-  "roles/aiplatform.user"
-)
-for ROLE in "${PROJECT_ROLES[@]}"; do
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="$ROLE" \
-    --condition=None \
-    --quiet >/dev/null
-done
-
-# If Cloud Run's source staging bucket already exists (e.g. re-installing after a reset),
-# bind storage.objectViewer directly on the bucket so GCS refreshes its bucket IAM etag immediately.
-SOURCE_BUCKET="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
-if gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
-  gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/storage.objectViewer" \
-    --quiet >/dev/null 2>&1 || true
-fi
-
-if [[ "$HAD_RUN_BUILDER" == "false" ]]; then
-  ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles (waiting 15s for IAM propagation)..."
-  sleep 15
-else
-  ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
-fi
-
-# Attempt org-wide read-only discovery & JOBS_BY_ORGANIZATION grants if in an org.
-ORG_IAM_READY="false"
-MISSING_ORG_CMD=""
-if [[ -n "$ORG_ID" ]]; then
-  if gcloud organizations add-iam-policy-binding "$ORG_ID" \
-       --member="serviceAccount:${SA_EMAIL}" \
-       --role="roles/cloudasset.viewer" \
-       --condition=None --quiet >/dev/null 2>&1 \
-     && gcloud organizations add-iam-policy-binding "$ORG_ID" \
-       --member="serviceAccount:${SA_EMAIL}" \
-       --role="roles/bigquery.resourceViewer" \
-       --condition=None --quiet >/dev/null 2>&1; then
-    # Optional org-level metadata & recommender viewers for cross-project table cards (best-effort)
-    gcloud organizations add-iam-policy-binding "$ORG_ID" \
-      --member="serviceAccount:${SA_EMAIL}" \
-      --role="roles/bigquery.metadataViewer" \
-      --condition=None --quiet >/dev/null 2>&1 || true
-    gcloud organizations add-iam-policy-binding "$ORG_ID" \
-      --member="serviceAccount:${SA_EMAIL}" \
-      --role="roles/recommender.bigqueryPartitionClusterViewer" \
-      --condition=None --quiet >/dev/null 2>&1 || true
-    ORG_IAM_READY="true"
-    ok "Granted org-wide read-only discovery & table metadata roles (cloudasset, resourceViewer, metadataViewer)."
-  else
-    warn "Your account doesn't manage Organization-level IAM — starting safely in single-project mode."
-    warn "Everything will still deploy cleanly! We'll print 1 command at the end for your GCP Admin if you want org-wide scanning."
-    MISSING_ORG_CMD="for ROLE in roles/cloudasset.viewer roles/bigquery.resourceViewer roles/bigquery.metadataViewer; do gcloud organizations add-iam-policy-binding ${ORG_ID} --member=\"serviceAccount:${SA_EMAIL}\" --role=\"\$ROLE\" --condition=None; done"
-  fi
-fi
-
-# Optional reservation admin project read access
-MISSING_RES_CMD=""
-if [[ -n "$RESERVATION_PROJECT" && "$RESERVATION_PROJECT" != "$PROJECT_ID" ]]; then
-  if gcloud projects add-iam-policy-binding "$RESERVATION_PROJECT" \
-       --member="serviceAccount:${SA_EMAIL}" \
-       --role="roles/bigquery.resourceViewer" \
-       --condition=None --quiet >/dev/null 2>&1; then
-    ok "Granted reservation read access on ${RESERVATION_PROJECT}."
-  else
-    warn "Couldn't grant reservation viewer on ${RESERVATION_PROJECT} automatically (will show command at end)."
-    MISSING_RES_CMD="gcloud projects add-iam-policy-binding ${RESERVATION_PROJECT} --member=\"serviceAccount:${SA_EMAIL}\" --role=\"roles/bigquery.resourceViewer\" --condition=None"
-  fi
-fi
-
-# ---- Step 4: Generate production config.yaml ---------------------------------
-step "[4/7] Generating config.yaml..."
-
-IAP_AUDIENCE=""
-if [[ "$ENABLE_IAP" == "true" ]]; then
-  IAP_AUDIENCE="/projects/${PROJECT_NUMBER}/locations/${RUN_REGION}/services/${SERVICE_NAME}"
-fi
-
-ASSET_SCOPE="projects/${PROJECT_ID}"
-JOBS_VIEW="JOBS"
-if [[ -n "$ORG_ID" ]]; then
-  ASSET_SCOPE="organizations/${ORG_ID}"
-  if [[ "$ORG_IAM_READY" == "true" ]]; then
-    JOBS_VIEW="JOBS_BY_ORGANIZATION"
-  fi
-fi
 
 write_config_yaml() {
   local _iap_aud="$1"
@@ -431,306 +233,727 @@ with open("config.yaml", "w", encoding="utf-8") as f:
 PY
 }
 
-write_config_yaml "$IAP_AUDIENCE"
-ok "Wrote config.yaml (Admin: ${ADMIN_EMAIL}, Scope: ${ASSET_SCOPE}, View: ${JOBS_VIEW})."
+save_prepared_state() {
+  STATE_FILE="$STATE_FILE" \
+  EXISTING_BEFORE="$EXISTING_BEFORE" \
+  ADMIN_EMAIL="$ADMIN_EMAIL" \
+  PROJECT_ID="$PROJECT_ID" \
+  PROJECT_NUMBER="$PROJECT_NUMBER" \
+  RUN_REGION="$RUN_REGION" \
+  BQ_LOCATION="$BQ_LOCATION" \
+  OPS_DATASET="$OPS_DATASET" \
+  ORG_ID="$ORG_ID" \
+  ORG_IAM_READY="$ORG_IAM_READY" \
+  ASSET_SCOPE="$ASSET_SCOPE" \
+  JOBS_VIEW="$JOBS_VIEW" \
+  RESERVATION_PROJECT="$RESERVATION_PROJECT" \
+  FINOPS_EMAILS="$FINOPS_EMAILS" \
+  EMAIL_DOMAIN="$EMAIL_DOMAIN" \
+  SHARE_WITH_DOMAIN="$SHARE_WITH_DOMAIN" \
+  ENABLE_IAP="$ENABLE_IAP" \
+  IAP_AUDIENCE="$IAP_AUDIENCE" \
+  SERVICE_NAME="$SERVICE_NAME" \
+  JOB_NAME="$JOB_NAME" \
+  SCHEDULER_NAME="$SCHEDULER_NAME" \
+  SA_NAME="$SA_NAME" \
+  SA_EMAIL="$SA_EMAIL" \
+  MISSING_ORG_CMD="$MISSING_ORG_CMD" \
+  MISSING_RES_CMD="$MISSING_RES_CMD" \
+  python3 - <<'PY'
+import os, shlex
 
-# ---- Step 5: Deploy Cloud Run Web UI (+ Direct IAP) --------------------------
-step "[5/7] Building & deploying the Web UI to Cloud Run (~2-3 minutes)..."
+keys = [
+    "EXISTING_BEFORE", "ADMIN_EMAIL", "PROJECT_ID", "PROJECT_NUMBER",
+    "RUN_REGION", "BQ_LOCATION", "OPS_DATASET", "ORG_ID", "ORG_IAM_READY",
+    "ASSET_SCOPE", "JOBS_VIEW", "RESERVATION_PROJECT", "FINOPS_EMAILS",
+    "EMAIL_DOMAIN", "SHARE_WITH_DOMAIN", "ENABLE_IAP", "IAP_AUDIENCE",
+    "SERVICE_NAME", "JOB_NAME", "SCHEDULER_NAME", "SA_NAME", "SA_EMAIL",
+    "MISSING_ORG_CMD", "MISSING_RES_CMD",
+]
+with open(os.environ["STATE_FILE"], "w", encoding="utf-8") as f:
+    for k in keys:
+        f.write(f"{k}={shlex.quote(os.environ.get(k, ''))}\n")
+PY
+}
 
-ENV_VARS="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}"
-if [[ -n "$IAP_AUDIENCE" ]]; then
-  ENV_VARS="${ENV_VARS},IAP_AUDIENCE=${IAP_AUDIENCE}"
-fi
+load_prepared_state() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "❌ Setup preparation state (${STATE_FILE}) is missing — an earlier step failed." >&2
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+}
 
-BUILD_SA_RESOURCE="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
-_DEPLOY_LOG="$(mktemp "${TMPDIR:-/tmp}/bqopt_deploy.XXXXXX")"
-trap 'rm -f "$_DEPLOY_LOG"' EXIT
+run_prepare_steps() {
+  rm -f "$STATE_FILE"
+  banner "BigQuery Optimization Control Tool — 1-Click Automated Setup"
 
-run_source_deploy() {
-  local _use_iap="$1"
-  local _env_str="$2"
-  local -a _cmd=(
-    gcloud run deploy "$SERVICE_NAME"
-    --project="$PROJECT_ID"
-    --region="$RUN_REGION"
-    --source=.
-    --build-service-account="$BUILD_SA_RESOURCE"
-    --service-account="$SA_EMAIL"
-    --memory=1Gi
-    --cpu=1
-    --timeout=900
-    --no-allow-unauthenticated
-    --set-env-vars="$_env_str"
-    --quiet
+  # ---- Step 1: Detect identity, project, number & organization ---------------
+  step "[1/7] Detecting your Google Cloud account & project..."
+
+  if [[ -z "$ADMIN_EMAIL" ]]; then
+    ADMIN_EMAIL="$(gcloud config get-value account 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  if [[ -z "$ADMIN_EMAIL" || "$ADMIN_EMAIL" != *"@"* ]]; then
+    echo "❌ No active Google Cloud login detected. Run: gcloud auth login" >&2
+    exit 1
+  fi
+
+  if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" || "$PROJECT_ID" == "<walkthrough-project-id/>" ]]; then
+    PROJECT_ID=""
+    _ACTIVE_PROJ="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$_ACTIVE_PROJ" && "$_ACTIVE_PROJ" != "(unset)" && "$_ACTIVE_PROJ" != "{}" ]]; then
+      PROJECT_ID="$_ACTIVE_PROJ"
+    fi
+  fi
+  if [[ -z "$PROJECT_ID" && -t 0 ]]; then
+    echo ""
+    echo "  Fetching your Google Cloud projects..."
+    _PROJ_IDS=()
+    _PROJ_NAMES=()
+    while IFS=$'\t' read -r _pid _pname; do
+      [[ -z "$_pid" ]] && continue
+      _PROJ_IDS+=("$_pid")
+      _PROJ_NAMES+=("${_pname:-$_pid}")
+    done < <(gcloud projects list --sort-by=projectId --limit=30 --format="value(projectId,name)" --quiet 2>/dev/null || true)
+
+    if [[ "${#_PROJ_IDS[@]}" -gt 0 ]]; then
+      echo "  Which Google Cloud project should host the app & ${OPS_DATASET} dataset?"
+      echo ""
+      for _i in "${!_PROJ_IDS[@]}"; do
+        printf "    [%d] %-34s (%s)\n" "$((_i + 1))" "${_PROJ_IDS[$_i]}" "${_PROJ_NAMES[$_i]}"
+      done
+      echo ""
+      read -r -p "  Enter a number [1-${#_PROJ_IDS[@]}] or type a Project ID: " _CHOICE
+      _CHOICE="$(printf '%s' "$_CHOICE" | tr -d '[:space:]')"
+      if [[ "$_CHOICE" =~ ^[0-9]+$ ]] && (( _CHOICE >= 1 && _CHOICE <= ${#_PROJ_IDS[@]} )); then
+        PROJECT_ID="${_PROJ_IDS[$((_CHOICE - 1))]}"
+      else
+        PROJECT_ID="$_CHOICE"
+      fi
+    else
+      read -r -p "  Enter the GCP Project ID to install into: " PROJECT_ID
+      PROJECT_ID="$(printf '%s' "$PROJECT_ID" | tr -d '[:space:]')"
+    fi
+  fi
+  if [[ -z "$PROJECT_ID" ]]; then
+    echo "❌ No GCP Project selected. Pick a project when prompted or pass --project=YOUR_PROJECT_ID" >&2
+    exit 1
+  fi
+
+  gcloud config set project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+
+  if [[ -z "$FINOPS_EMAILS" ]]; then
+    FINOPS_EMAILS="$ADMIN_EMAIL"
+  fi
+
+  EMAIL_DOMAIN="${ADMIN_EMAIL#*@}"
+  SHARE_WITH_DOMAIN="false"
+  if [[ "$ALLOW_DOMAIN" == "true" ]]; then
+    if ! is_consumer_domain "$EMAIL_DOMAIN"; then
+      SHARE_WITH_DOMAIN="true"
+    fi
+  elif [[ "$ALLOW_DOMAIN" == "auto" ]]; then
+    if ! is_consumer_domain "$EMAIL_DOMAIN"; then
+      SHARE_WITH_DOMAIN="true"
+    fi
+  fi
+
+  ok "Signed in as        : ${ADMIN_EMAIL} (Settings Admin)"
+  ok "Target GCP Project  : ${PROJECT_ID}"
+  ok "BigQuery Location   : ${BQ_LOCATION} (dataset: ${OPS_DATASET})"
+  ok "Cloud Run Region    : ${RUN_REGION}"
+  ok "FinOps Approver(s)  : ${FINOPS_EMAILS}"
+  if [[ "$ENABLE_IAP" == "true" && "$SHARE_WITH_DOMAIN" == "true" ]]; then
+    ok "Sign-in Access (IAP): @${EMAIL_DOMAIN} teammates (viewers by default; only you are Admin)"
+  fi
+
+  if [[ "$ASSUME_YES" == "false" && -t 0 ]]; then
+    echo ""
+    read -r -p "  Press Enter to set everything up automatically (or Ctrl+C to cancel)... " _
+  fi
+
+  # Enable APIs first so project number, ancestry, Cloud Run, Build, IAP & Scheduler work cleanly.
+  step "[2/7] Enabling required Google Cloud APIs (~30-60s on a fresh project)..."
+  gcloud services enable \
+    cloudresourcemanager.googleapis.com \
+    serviceusage.googleapis.com \
+    iam.googleapis.com \
+    bigquery.googleapis.com \
+    bigquerydatatransfer.googleapis.com \
+    bigquerystorage.googleapis.com \
+    bigqueryreservation.googleapis.com \
+    recommender.googleapis.com \
+    cloudasset.googleapis.com \
+    run.googleapis.com \
+    cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com \
+    cloudscheduler.googleapis.com \
+    iap.googleapis.com \
+    aiplatform.googleapis.com \
+    --project="$PROJECT_ID" --quiet
+  ok "All required Google Cloud APIs enabled."
+
+  EXISTING_BEFORE="false"
+  if [[ "$PHASE" == "prepare" ]]; then
+    if gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --quiet >/dev/null 2>&1; then
+      EXISTING_BEFORE="true"
+    fi
+  fi
+
+  PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" --quiet)"
+  ANCESTORS_JSON="$(gcloud projects get-ancestors "$PROJECT_ID" --format=json --quiet 2>/dev/null || echo "[]")"
+  ORG_ID="$(ANCESTORS_JSON="$ANCESTORS_JSON" python3 - <<'PY'
+import json, os
+try:
+    rows = json.loads(os.environ.get("ANCESTORS_JSON", "[]"))
+    for r in rows:
+        if r.get("type") == "organization" and r.get("id"):
+            print(r["id"])
+            break
+except Exception:
+    pass
+PY
+)"
+
+  if [[ -n "$ORG_ID" ]]; then
+    ok "Detected GCP Organization: organizations/${ORG_ID}"
+  else
+    warn "No parent GCP Organization detected — scoping discovery to project ${PROJECT_ID}."
+  fi
+
+  # ---- Step 3: Service Account & IAM -----------------------------------------
+  step "[3/7] Creating Service Account & granting permissions..."
+  SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+
+  if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+    gcloud iam service-accounts create "$SA_NAME" \
+      --project="$PROJECT_ID" \
+      --display-name="BigQuery Optimization Control Plane" \
+      --description="Runs the BQ Optimization Review UI and nightly telemetry/rules pipeline" \
+      --quiet
+    ok "Created service account ${SA_EMAIL} (waiting ${BQOPT_SA_SLEEP_SECONDS:-10}s for IAM propagation)..."
+    sleep "${BQOPT_SA_SLEEP_SECONDS:-10}"
+  else
+    ok "Service account ${SA_EMAIL} already exists."
+  fi
+
+  HAD_RUN_BUILDER="false"
+  if gcloud projects get-iam-policy "$PROJECT_ID" \
+       --flatten="bindings[].members" \
+       --filter="bindings.role:roles/run.builder AND bindings.members:serviceAccount:${SA_EMAIL}" \
+       --format="value(bindings.role)" --quiet 2>/dev/null | tr -d '[:space:]' | python3 -c "import sys; sys.exit(0 if sys.stdin.read().strip() else 1)"; then
+    HAD_RUN_BUILDER="true"
+  fi
+
+  PROJECT_ROLES=(
+    "roles/run.builder"
+    "roles/storage.objectViewer"
+    "roles/bigquery.jobUser"
+    "roles/bigquery.dataEditor"
+    "roles/bigquery.metadataViewer"
+    "roles/bigquery.resourceViewer"
+    "roles/recommender.bigqueryPartitionClusterViewer"
+    "roles/aiplatform.user"
   )
-  if [[ "$_use_iap" == "true" ]]; then
-    _cmd+=(--iap)
+  for ROLE in "${PROJECT_ROLES[@]}"; do
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="$ROLE" \
+      --condition=None \
+      --quiet >/dev/null
+  done
+
+  # If Cloud Run's source staging bucket already exists (standalone `--source=.` installs),
+  # bind storage.objectViewer directly on the bucket so GCS refreshes its bucket IAM etag immediately.
+  SOURCE_BUCKET="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
+  if [[ -z "$PREBUILT_IMAGE" ]] && gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+    gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="roles/storage.objectViewer" \
+      --quiet >/dev/null 2>&1 || true
   fi
 
-  if "${_cmd[@]}" 2>&1 | tee "$_DEPLOY_LOG"; then
-    return 0
+  if [[ -z "$PREBUILT_IMAGE" && "$HAD_RUN_BUILDER" == "false" ]]; then
+    ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles (waiting ${BQOPT_IAM_SLEEP_SECONDS:-15}s for IAM propagation)..."
+    sleep "${BQOPT_IAM_SLEEP_SECONDS:-15}"
+  else
+    ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles on ${PROJECT_ID}."
   fi
 
-  # Newly created (or deleted-and-recreated) service accounts can take 60-120s for GCS / Cloud Build
-  # IAM caches to propagate storage.objects.get on gs://run-sources-<project>-<region>.
-  local -a _waits=(15 20 25 30 30 30)
-  local _total="${#_waits[@]}"
-  local _idx=0
-  local _wait
-  for _wait in "${_waits[@]}"; do
-    _idx=$((_idx + 1))
-    if ! python3 - "$_DEPLOY_LOG" <<'PY'
+  # Attempt org-wide read-only discovery & JOBS_BY_ORGANIZATION grants if in an org.
+  ORG_IAM_READY="false"
+  MISSING_ORG_CMD=""
+  if [[ -n "$ORG_ID" ]]; then
+    if gcloud organizations add-iam-policy-binding "$ORG_ID" \
+         --member="serviceAccount:${SA_EMAIL}" \
+         --role="roles/cloudasset.viewer" \
+         --condition=None --quiet >/dev/null 2>&1 \
+       && gcloud organizations add-iam-policy-binding "$ORG_ID" \
+         --member="serviceAccount:${SA_EMAIL}" \
+         --role="roles/bigquery.resourceViewer" \
+         --condition=None --quiet >/dev/null 2>&1; then
+      # Optional org-level metadata & recommender viewers for cross-project table cards (best-effort)
+      gcloud organizations add-iam-policy-binding "$ORG_ID" \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="roles/bigquery.metadataViewer" \
+        --condition=None --quiet >/dev/null 2>&1 || true
+      gcloud organizations add-iam-policy-binding "$ORG_ID" \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="roles/recommender.bigqueryPartitionClusterViewer" \
+        --condition=None --quiet >/dev/null 2>&1 || true
+      ORG_IAM_READY="true"
+      ok "Granted org-wide read-only discovery & table metadata roles (cloudasset, resourceViewer, metadataViewer)."
+    else
+      warn "Your account doesn't manage Organization-level IAM — starting safely in single-project mode."
+      warn "Everything will still deploy cleanly! We'll print 1 command at the end for your GCP Admin if you want org-wide scanning."
+      MISSING_ORG_CMD="for ROLE in roles/cloudasset.viewer roles/bigquery.resourceViewer roles/bigquery.metadataViewer; do gcloud organizations add-iam-policy-binding ${ORG_ID} --member=\"serviceAccount:${SA_EMAIL}\" --role=\"\$ROLE\" --condition=None; done"
+    fi
+  fi
+
+  # Optional reservation admin project read access
+  MISSING_RES_CMD=""
+  if [[ -n "$RESERVATION_PROJECT" && "$RESERVATION_PROJECT" != "$PROJECT_ID" ]]; then
+    if gcloud projects add-iam-policy-binding "$RESERVATION_PROJECT" \
+         --member="serviceAccount:${SA_EMAIL}" \
+         --role="roles/bigquery.resourceViewer" \
+         --condition=None --quiet >/dev/null 2>&1; then
+      ok "Granted reservation read access on ${RESERVATION_PROJECT}."
+    else
+      warn "Couldn't grant reservation viewer on ${RESERVATION_PROJECT} automatically (will show command at end)."
+      MISSING_RES_CMD="gcloud projects add-iam-policy-binding ${RESERVATION_PROJECT} --member=\"serviceAccount:${SA_EMAIL}\" --role=\"roles/bigquery.resourceViewer\" --condition=None"
+    fi
+  fi
+
+  # ---- Step 4: Generate production config.yaml -------------------------------
+  step "[4/7] Generating config.yaml..."
+
+  IAP_AUDIENCE=""
+  if [[ "$ENABLE_IAP" == "true" ]]; then
+    IAP_AUDIENCE="/projects/${PROJECT_NUMBER}/locations/${RUN_REGION}/services/${SERVICE_NAME}"
+  fi
+
+  ASSET_SCOPE="projects/${PROJECT_ID}"
+  JOBS_VIEW="JOBS"
+  if [[ -n "$ORG_ID" ]]; then
+    ASSET_SCOPE="organizations/${ORG_ID}"
+    if [[ "$ORG_IAM_READY" == "true" ]]; then
+      JOBS_VIEW="JOBS_BY_ORGANIZATION"
+    fi
+  fi
+
+  write_config_yaml "$IAP_AUDIENCE"
+  ok "Wrote config.yaml (Admin: ${ADMIN_EMAIL}, Scope: ${ASSET_SCOPE}, View: ${JOBS_VIEW})."
+}
+
+build_service_env_vars() {
+  local _aud="$1"
+  local _vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}"
+  if [[ -n "$_aud" ]]; then
+    _vars="${_vars},IAP_AUDIENCE=${_aud}"
+  else
+    _vars="${_vars},IAP_AUDIENCE="
+  fi
+  printf '%s' "$_vars"
+}
+
+run_precreate_step() {
+  load_prepared_state
+  if [[ -z "$PREBUILT_IMAGE" ]]; then
+    echo "❌ --phase=precreate requires --image=IMAGE_URI" >&2
+    exit 1
+  fi
+  step "[5/7] Creating Cloud Run service ${SERVICE_NAME} with dedicated service account ${SA_EMAIL}..."
+  local _env_vars
+  _env_vars="$(build_service_env_vars "$IAP_AUDIENCE")"
+  gcloud run deploy "$SERVICE_NAME" \
+    --project="$PROJECT_ID" \
+    --region="$RUN_REGION" \
+    --image="$PREBUILT_IMAGE" \
+    --service-account="$SA_EMAIL" \
+    --memory=1Gi \
+    --cpu=1 \
+    --timeout=900 \
+    --no-allow-unauthenticated \
+    --set-env-vars="$_env_vars" \
+    --quiet
+  ok "Created base Cloud Run service ${SERVICE_NAME} running as ${SA_EMAIL}."
+}
+
+run_finalize_steps() {
+  local _deploy_log
+  _deploy_log="$(mktemp "${TMPDIR:-/tmp}/bqopt_deploy.XXXXXX")"
+  # Clean up temp log when function returns.
+  # shellcheck disable=SC2064
+  trap "rm -f '$_deploy_log'" RETURN
+
+  local _source_bucket="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
+  local _build_sa_resource="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
+
+  deploy_ui_revision() {
+    local _use_iap="$1"
+    local _env_str="$2"
+    if [[ -n "$PREBUILT_IMAGE" ]]; then
+      local -a _img_cmd=(
+        gcloud run deploy "$SERVICE_NAME"
+        --project="$PROJECT_ID"
+        --region="$RUN_REGION"
+        --image="$PREBUILT_IMAGE"
+        --service-account="$SA_EMAIL"
+        --memory=1Gi
+        --cpu=1
+        --timeout=900
+        --no-allow-unauthenticated
+        --set-env-vars="$_env_str"
+        --quiet
+      )
+      if [[ "$_use_iap" == "true" ]]; then
+        _img_cmd+=(--iap)
+      fi
+      "${_img_cmd[@]}" 2>&1 | tee "$_deploy_log"
+      return $?
+    fi
+
+    local -a _cmd=(
+      gcloud run deploy "$SERVICE_NAME"
+      --project="$PROJECT_ID"
+      --region="$RUN_REGION"
+      --source=.
+      --build-service-account="$_build_sa_resource"
+      --service-account="$SA_EMAIL"
+      --memory=1Gi
+      --cpu=1
+      --timeout=900
+      --no-allow-unauthenticated
+      --set-env-vars="$_env_str"
+      --quiet
+    )
+    if [[ "$_use_iap" == "true" ]]; then
+      _cmd+=(--iap)
+    fi
+
+    if "${_cmd[@]}" 2>&1 | tee "$_deploy_log"; then
+      return 0
+    fi
+
+    # Newly created (or deleted-and-recreated) service accounts can take 60-120s for GCS / Cloud Build
+    # IAM caches to propagate storage.objects.get on gs://run-sources-<project>-<region>.
+    local -a _waits=(15 20 25 30 30 30)
+    local _total="${#_waits[@]}"
+    local _idx=0
+    local _wait
+    for _wait in "${_waits[@]}"; do
+      _idx=$((_idx + 1))
+      if ! python3 - "$_deploy_log" <<'PY'
 import sys
 txt = open(sys.argv[1], encoding="utf-8", errors="ignore").read().lower()
 sys.exit(0 if ("storage.objects.get" in txt or "artifactregistry" in txt or "permission" in txt) else 1)
 PY
-    then
-      break
-    fi
-    # Attempt 1 creates gs://run-sources-<project>-<region> during "Uploading sources...";
-    # binding objectViewer directly on the bucket accelerates GCS IAM cache refresh.
-    if gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
-      gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
-        --member="serviceAccount:${SA_EMAIL}" \
-        --role="roles/storage.objectViewer" \
-        --quiet >/dev/null 2>&1 || true
-    fi
-    warn "Waiting ${_wait}s for Google Cloud Storage / Builder IAM propagation (retry ${_idx}/${_total})..."
-    sleep "$_wait"
-    if "${_cmd[@]}" 2>&1 | tee "$_DEPLOY_LOG"; then
-      return 0
-    fi
-  done
-  return 1
-}
+      then
+        break
+      fi
+      if gcloud storage buckets describe "$_source_bucket" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+        gcloud storage buckets add-iam-policy-binding "$_source_bucket" \
+          --member="serviceAccount:${SA_EMAIL}" \
+          --role="roles/storage.objectViewer" \
+          --quiet >/dev/null 2>&1 || true
+      fi
+      warn "Waiting ${_wait}s for Google Cloud Storage / Builder IAM propagation (retry ${_idx}/${_total})..."
+      sleep "$_wait"
+      if "${_cmd[@]}" 2>&1 | tee "$_deploy_log"; then
+        return 0
+      fi
+    done
+    return 1
+  }
 
-DEPLOY_IAP_ACTIVE="false"
-if [[ "$ENABLE_IAP" == "true" ]]; then
-  # Provision the Google-managed IAP Service Agent so IAP can invoke the private Cloud Run service.
-  gcloud beta services identity create --service=iap.googleapis.com --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+  # ---- Step 5: Deploy Cloud Run Web UI (+ Direct IAP) ------------------------
+  if [[ -n "$PREBUILT_IMAGE" ]]; then
+    step "[5/7] Configuring Web UI on Cloud Run & enabling Direct Identity-Aware Proxy (IAP)..."
+  else
+    step "[5/7] Building & deploying the Web UI to Cloud Run (~2-3 minutes)..."
+  fi
 
-  if run_source_deploy "true" "$ENV_VARS"; then
-    DEPLOY_IAP_ACTIVE="true"
-  elif python3 - "$_DEPLOY_LOG" <<'PY'
+  local _env_vars
+  _env_vars="$(build_service_env_vars "$IAP_AUDIENCE")"
+
+  local _deploy_iap_active="false"
+  if [[ "$ENABLE_IAP" == "true" ]]; then
+    # Provision the Google-managed IAP Service Agent so IAP can invoke the private Cloud Run service.
+    gcloud beta services identity create --service=iap.googleapis.com --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+
+    if deploy_ui_revision "true" "$_env_vars"; then
+      _deploy_iap_active="true"
+    elif python3 - "$_deploy_log" <<'PY'
 import sys
 txt = open(sys.argv[1], encoding="utf-8", errors="ignore").read().lower()
 # Only fall back when the failure is actually IAP-related (never on a source/Docker build failure).
 is_iap_err = ("iap" in txt) and ("invalid build request" not in txt) and ("storage.objects.get" not in txt)
 sys.exit(0 if is_iap_err else 1)
 PY
-  then
-    warn "Direct --iap flag was rejected by project/org policy; redeploying private service without --iap flag..."
-    IAP_AUDIENCE=""
-    write_config_yaml ""
-    run_source_deploy "false" "GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}"
-  else
-    echo "❌ Cloud Run source build/deployment failed (see error above)." >&2
-    exit 1
-  fi
-else
-  run_source_deploy "false" "$ENV_VARS"
-fi
-
-if [[ "$DEPLOY_IAP_ACTIVE" == "true" ]]; then
-  IAP_SA="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
-  if ! gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-       --project="$PROJECT_ID" \
-       --region="$RUN_REGION" \
-       --member="serviceAccount:${IAP_SA}" \
-       --role="roles/run.invoker" \
-       --quiet >/dev/null 2>&1; then
-    sleep 5
-    gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
-      --project="$PROJECT_ID" \
-      --region="$RUN_REGION" \
-      --member="serviceAccount:${IAP_SA}" \
-      --role="roles/run.invoker" \
-      --quiet >/dev/null
-  fi
-
-  gcloud iap web add-iam-policy-binding \
-    --project="$PROJECT_ID" \
-    --resource-type=cloud-run \
-    --region="$RUN_REGION" \
-    --service="$SERVICE_NAME" \
-    --member="user:${ADMIN_EMAIL}" \
-    --role="roles/iap.httpsResourceAccessor" \
-    --quiet >/dev/null
-
-  IFS=',' read -r -a _FIN_ARR <<< "$FINOPS_EMAILS"
-  for _FE in "${_FIN_ARR[@]}"; do
-    _FE="$(echo "$_FE" | tr -d '[:space:]')"
-    if [[ -n "$_FE" && "$_FE" != "$ADMIN_EMAIL" ]]; then
-      gcloud iap web add-iam-policy-binding \
-        --project="$PROJECT_ID" \
-        --resource-type=cloud-run \
-        --region="$RUN_REGION" \
-        --service="$SERVICE_NAME" \
-        --member="user:${_FE}" \
-        --role="roles/iap.httpsResourceAccessor" \
-        --quiet >/dev/null || true
+    then
+      warn "Direct --iap flag was rejected by project/org policy; redeploying private service without --iap flag..."
+      IAP_AUDIENCE=""
+      if [[ -z "$PREBUILT_IMAGE" ]]; then
+        write_config_yaml ""
+      fi
+      deploy_ui_revision "false" "$(build_service_env_vars "")"
+    else
+      echo "❌ Cloud Run deployment failed (see error above)." >&2
+      exit 1
     fi
-  done
+  else
+    deploy_ui_revision "false" "$_env_vars"
+  fi
 
-  if [[ "$SHARE_WITH_DOMAIN" == "true" ]]; then
+  if [[ "$_deploy_iap_active" == "true" ]]; then
+    local _iap_sa="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
+    if ! gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+         --project="$PROJECT_ID" \
+         --region="$RUN_REGION" \
+         --member="serviceAccount:${_iap_sa}" \
+         --role="roles/run.invoker" \
+         --quiet >/dev/null 2>&1; then
+      sleep "${BQOPT_IAP_SLEEP_SECONDS:-5}"
+      gcloud run services add-iam-policy-binding "$SERVICE_NAME" \
+        --project="$PROJECT_ID" \
+        --region="$RUN_REGION" \
+        --member="serviceAccount:${_iap_sa}" \
+        --role="roles/run.invoker" \
+        --quiet >/dev/null
+    fi
+
     gcloud iap web add-iam-policy-binding \
       --project="$PROJECT_ID" \
       --resource-type=cloud-run \
       --region="$RUN_REGION" \
       --service="$SERVICE_NAME" \
-      --member="domain:${EMAIL_DOMAIN}" \
+      --member="user:${ADMIN_EMAIL}" \
       --role="roles/iap.httpsResourceAccessor" \
-      --quiet >/dev/null || true
+      --quiet >/dev/null
+
+    IFS=',' read -r -a _FIN_ARR <<< "$FINOPS_EMAILS"
+    for _FE in "${_FIN_ARR[@]}"; do
+      _FE="$(echo "$_FE" | tr -d '[:space:]')"
+      if [[ -n "$_FE" && "$_FE" != "$ADMIN_EMAIL" ]]; then
+        gcloud iap web add-iam-policy-binding \
+          --project="$PROJECT_ID" \
+          --resource-type=cloud-run \
+          --region="$RUN_REGION" \
+          --service="$SERVICE_NAME" \
+          --member="user:${_FE}" \
+          --role="roles/iap.httpsResourceAccessor" \
+          --quiet >/dev/null || true
+      fi
+    done
+
+    if [[ "$SHARE_WITH_DOMAIN" == "true" ]]; then
+      gcloud iap web add-iam-policy-binding \
+        --project="$PROJECT_ID" \
+        --resource-type=cloud-run \
+        --region="$RUN_REGION" \
+        --service="$SERVICE_NAME" \
+        --member="domain:${EMAIL_DOMAIN}" \
+        --role="roles/iap.httpsResourceAccessor" \
+        --quiet >/dev/null || true
+    fi
+    ok "Secured ${SERVICE_NAME} behind Google Identity-Aware Proxy (no Load Balancer needed)."
   fi
-  ok "Secured ${SERVICE_NAME} behind Google Identity-Aware Proxy (no Load Balancer needed)."
-fi
 
-SERVICE_URL="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(status.url)" --quiet)"
-IMAGE_URI="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(spec.template.spec.containers[0].image)" --quiet)"
-if [[ -z "$IMAGE_URI" ]]; then
-  IMAGE_URI="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(template.containers[0].image)" --quiet)"
-fi
-if [[ -z "$IMAGE_URI" ]]; then
-  echo "❌ Could not read deployed container image URI from ${SERVICE_NAME}." >&2
-  exit 1
-fi
-ok "Web UI deployed at: ${SERVICE_URL}"
+  local _service_url _image_uri
+  _service_url="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(status.url)" --quiet)"
+  _image_uri="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(spec.template.spec.containers[0].image)" --quiet)"
+  if [[ -z "$_image_uri" ]]; then
+    _image_uri="$(gcloud run services describe "$SERVICE_NAME" --project="$PROJECT_ID" --region="$RUN_REGION" --format="value(template.containers[0].image)" --quiet)"
+  fi
+  if [[ -z "$_image_uri" && -n "$PREBUILT_IMAGE" ]]; then
+    _image_uri="$PREBUILT_IMAGE"
+  fi
+  if [[ -z "$_image_uri" ]]; then
+    echo "❌ Could not read deployed container image URI from ${SERVICE_NAME}." >&2
+    exit 1
+  fi
+  ok "Web UI deployed at: ${_service_url}"
 
-# ---- Step 6: Nightly Cloud Run Job + BigQuery Schema Init --------------------
-step "[6/7] Creating Nightly Pipeline Job & initializing BigQuery dataset (${OPS_DATASET})..."
+  # ---- Step 6: Nightly Cloud Run Job + BigQuery Schema Init ------------------
+  step "[6/7] Creating Nightly Pipeline Job & initializing BigQuery dataset (${OPS_DATASET})..."
 
-gcloud run jobs deploy "$JOB_NAME" \
-  --project="$PROJECT_ID" \
-  --region="$RUN_REGION" \
-  --image="$IMAGE_URI" \
-  --service-account="$SA_EMAIL" \
-  --memory=2Gi \
-  --cpu=2 \
-  --task-timeout=3600s \
-  --max-retries=0 \
-  --command=python \
-  --args="-m,optimizer.cli,pipeline" \
-  --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
-  --quiet
+  gcloud run jobs deploy "$JOB_NAME" \
+    --project="$PROJECT_ID" \
+    --region="$RUN_REGION" \
+    --image="$_image_uri" \
+    --service-account="$SA_EMAIL" \
+    --memory=2Gi \
+    --cpu=2 \
+    --task-timeout=3600s \
+    --max-retries=0 \
+    --command=python \
+    --args="-m,optimizer.cli,pipeline" \
+    --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
+    --quiet
 
-# Let the Web UI's "Run scan now" button & Cloud Scheduler invoke this job cleanly.
-gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
-  --project="$PROJECT_ID" \
-  --region="$RUN_REGION" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/run.developer" \
-  --quiet >/dev/null
+  # Let the Web UI's "Run scan now" button & Cloud Scheduler invoke this job cleanly.
+  gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
+    --project="$PROJECT_ID" \
+    --region="$RUN_REGION" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/run.developer" \
+    --quiet >/dev/null
 
-ok "Deployed Cloud Run Job ${JOB_NAME} and linked 'Run scan now' button."
+  ok "Deployed Cloud Run Job ${JOB_NAME} and linked 'Run scan now' button."
 
-gcloud run jobs execute "$JOB_NAME" \
-  --project="$PROJECT_ID" \
-  --region="$RUN_REGION" \
-  --args="-m,optimizer.cli,init" \
-  --wait \
-  --quiet
-ok "Initialized BigQuery dataset ${PROJECT_ID}.${OPS_DATASET} (tables + views ready)."
+  gcloud run jobs execute "$JOB_NAME" \
+    --project="$PROJECT_ID" \
+    --region="$RUN_REGION" \
+    --args="-m,optimizer.cli,init" \
+    --wait \
+    --quiet
+  ok "Initialized BigQuery dataset ${PROJECT_ID}.${OPS_DATASET} (tables + views ready)."
 
-# Enable BigQuery INFORMATION_SCHEMA.TABLE_STORAGE views across active regions so Setup Check is green out of the box.
-DISCOVERED_LOCS="$(gcloud asset search-all-resources \
-  --scope="$ASSET_SCOPE" \
-  --asset-types="bigquery.googleapis.com/Dataset" \
-  --read-mask="location" \
-  --limit=500 \
-  --format="value(location)" \
-  --quiet 2>/dev/null || true)"
-if [[ -z "$DISCOVERED_LOCS" && "$ASSET_SCOPE" != "projects/${PROJECT_ID}" ]]; then
-  DISCOVERED_LOCS="$(gcloud asset search-all-resources \
-    --scope="projects/${PROJECT_ID}" \
+  # Enable BigQuery INFORMATION_SCHEMA.TABLE_STORAGE views across active regions so Setup Check is green out of the box.
+  local _discovered_locs _storage_regions
+  _discovered_locs="$(gcloud asset search-all-resources \
+    --scope="$ASSET_SCOPE" \
     --asset-types="bigquery.googleapis.com/Dataset" \
     --read-mask="location" \
     --limit=500 \
     --format="value(location)" \
     --quiet 2>/dev/null || true)"
-fi
-STORAGE_REGIONS="$(printf '%s\n%s\n%s\n' "$BQ_LOCATION" "$RUN_REGION" "$DISCOVERED_LOCS" \
-  | tr '[:upper:]' '[:lower:]' \
-  | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-  | awk 'NF && !seen[$0]++')"
-ENABLED_STORAGE_REGIONS=()
-while IFS= read -r _R; do
-  [[ -z "$_R" ]] && continue
-  if [[ -n "$ORG_ID" && "$ORG_IAM_READY" == "true" ]]; then
-    bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
-      "ALTER ORGANIZATION SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1 || true
+  if [[ -z "$_discovered_locs" && "$ASSET_SCOPE" != "projects/${PROJECT_ID}" ]]; then
+    _discovered_locs="$(gcloud asset search-all-resources \
+      --scope="projects/${PROJECT_ID}" \
+      --asset-types="bigquery.googleapis.com/Dataset" \
+      --read-mask="location" \
+      --limit=500 \
+      --format="value(location)" \
+      --quiet 2>/dev/null || true)"
   fi
-  if bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
-       "ALTER PROJECT \`${PROJECT_ID}\` SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1; then
-    ENABLED_STORAGE_REGIONS+=("$_R")
+  _storage_regions="$(printf '%s\n%s\n%s\n' "$BQ_LOCATION" "$RUN_REGION" "$_discovered_locs" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | awk 'NF && !seen[$0]++')"
+  local -a _enabled_storage_regions=()
+  while IFS= read -r _R; do
+    [[ -z "$_R" ]] && continue
+    if [[ -n "$ORG_ID" && "$ORG_IAM_READY" == "true" ]]; then
+      bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
+        "ALTER ORGANIZATION SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1 || true
+    fi
+    if bq --quiet --project_id="$PROJECT_ID" --location="$_R" query --use_legacy_sql=false \
+         "ALTER PROJECT \`${PROJECT_ID}\` SET OPTIONS (\`region-${_R}.enable_info_schema_storage\` = TRUE);" >/dev/null 2>&1; then
+      _enabled_storage_regions+=("$_R")
+    fi
+  done <<< "$_storage_regions"
+  if [[ "${#_enabled_storage_regions[@]}" -gt 0 ]]; then
+    ok "Enabled BigQuery TABLE_STORAGE size views in: ${_enabled_storage_regions[*]}"
   fi
-done <<< "$STORAGE_REGIONS"
-if [[ "${#ENABLED_STORAGE_REGIONS[@]}" -gt 0 ]]; then
-  ok "Enabled BigQuery TABLE_STORAGE size views in: ${ENABLED_STORAGE_REGIONS[*]}"
-fi
 
-# ---- Step 7: Nightly Cloud Scheduler (02:00 UTC) -----------------------------
-step "[7/7] Scheduling automatic nightly scans (02:00 UTC)..."
+  # ---- Step 7: Nightly Cloud Scheduler (02:00 UTC) ---------------------------
+  step "[7/7] Scheduling automatic nightly scans (02:00 UTC)..."
 
-SCHEDULER_URI="https://${RUN_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run"
-if gcloud scheduler jobs describe "$SCHEDULER_NAME" --project="$PROJECT_ID" --location="$RUN_REGION" --quiet >/dev/null 2>&1; then
-  gcloud scheduler jobs update http "$SCHEDULER_NAME" \
-    --project="$PROJECT_ID" \
-    --location="$RUN_REGION" \
-    --schedule="0 2 * * *" \
-    --time-zone="Etc/UTC" \
-    --uri="$SCHEDULER_URI" \
-    --http-method=POST \
-    --oauth-service-account-email="$SA_EMAIL" \
-    --quiet >/dev/null
-else
-  gcloud scheduler jobs create http "$SCHEDULER_NAME" \
-    --project="$PROJECT_ID" \
-    --location="$RUN_REGION" \
-    --schedule="0 2 * * *" \
-    --time-zone="Etc/UTC" \
-    --uri="$SCHEDULER_URI" \
-    --http-method=POST \
-    --oauth-service-account-email="$SA_EMAIL" \
-    --description="Nightly BigQuery Optimization Control Plane run (collect -> rules -> execute approved -> verify)" \
-    --quiet >/dev/null
-fi
-ok "Scheduled ${SCHEDULER_NAME} every night at 02:00 UTC."
+  local _scheduler_uri="https://${RUN_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run"
+  if gcloud scheduler jobs describe "$SCHEDULER_NAME" --project="$PROJECT_ID" --location="$RUN_REGION" --quiet >/dev/null 2>&1; then
+    gcloud scheduler jobs update http "$SCHEDULER_NAME" \
+      --project="$PROJECT_ID" \
+      --location="$RUN_REGION" \
+      --schedule="0 2 * * *" \
+      --time-zone="Etc/UTC" \
+      --uri="$_scheduler_uri" \
+      --http-method=POST \
+      --oauth-service-account-email="$SA_EMAIL" \
+      --quiet >/dev/null
+  else
+    gcloud scheduler jobs create http "$SCHEDULER_NAME" \
+      --project="$PROJECT_ID" \
+      --location="$RUN_REGION" \
+      --schedule="0 2 * * *" \
+      --time-zone="Etc/UTC" \
+      --uri="$_scheduler_uri" \
+      --http-method=POST \
+      --oauth-service-account-email="$SA_EMAIL" \
+      --description="Nightly BigQuery Optimization Control Plane run (collect -> rules -> execute approved -> verify)" \
+      --quiet >/dev/null
+  fi
+  ok "Scheduled ${SCHEDULER_NAME} every night at 02:00 UTC."
 
-if [[ "$RUN_FIRST_SCAN" == "true" ]]; then
-  step "Starting your first BigQuery scan in the background..."
-  gcloud run jobs execute "$JOB_NAME" \
-    --project="$PROJECT_ID" \
-    --region="$RUN_REGION" \
-    --args="-m,optimizer.cli,scan" \
-    --async \
-    --quiet
-  ok "First scan is running in the background!"
-fi
+  if [[ "$RUN_FIRST_SCAN" == "true" ]]; then
+    step "Starting your first BigQuery scan in the background..."
+    gcloud run jobs execute "$JOB_NAME" \
+      --project="$PROJECT_ID" \
+      --region="$RUN_REGION" \
+      --args="-m,optimizer.cli,scan" \
+      --async \
+      --quiet
+    ok "First scan is running in the background!"
+  fi
 
-banner "🎉 Setup Complete — Your App Is Live!"
-echo ""
-echo "  👉 Click here to open Settings & run your first scan:"
-echo "     ${SERVICE_URL}/#settings"
-echo ""
-echo "  What to do next (all inside the browser — no terminal needed):"
-echo "    1. Check 'Setup check' on that page to confirm green checkmarks."
-echo "    2. Optionally add teammates under 'Who can edit settings' or pick your HR / owner tables."
-echo "    3. Click the blue 'Run scan now' button at the top of the page!"
-echo ""
+  rm -f "$STATE_FILE"
 
-if [[ -n "$MISSING_ORG_CMD" ]]; then
-  echo "  ── Optional: Enable Organization-Wide Scanning ──────────────────────────"
-  echo "  Ask a GCP Organization Admin to run this once, then switch 'Query history"
-  echo "  source' to 'Entire organization' in Settings:"
+  banner "🎉 Setup Complete — Your App Is Live!"
   echo ""
-  echo "    ${MISSING_ORG_CMD}"
+  echo "  👉 Click here to open Settings & run your first scan:"
+  echo "     ${_service_url}/#settings"
   echo ""
-fi
+  echo "  What to do next (all inside the browser — no terminal needed):"
+  echo "    1. Check 'Setup check' on that page to confirm green checkmarks."
+  echo "    2. Optionally add teammates under 'Who can edit settings' or pick your HR / owner tables."
+  echo "    3. Click the blue 'Run scan now' button at the top of the page!"
+  echo ""
 
-if [[ -n "$MISSING_RES_CMD" ]]; then
-  echo "  ── Optional: Enable Reservation Admin Telemetry ─────────────────────────"
-  echo "  Ask an owner of project '${RESERVATION_PROJECT}' to run this once:"
-  echo ""
-  echo "    ${MISSING_RES_CMD}"
-  echo ""
-fi
+  if [[ -n "$MISSING_ORG_CMD" ]]; then
+    echo "  ── Optional: Enable Organization-Wide Scanning ──────────────────────────"
+    echo "  Ask a GCP Organization Admin to run this once, then switch 'Query history"
+    echo "  source' to 'Entire organization' in Settings:"
+    echo ""
+    echo "    ${MISSING_ORG_CMD}"
+    echo ""
+  fi
+
+  if [[ -n "$MISSING_RES_CMD" ]]; then
+    echo "  ── Optional: Enable Reservation Admin Telemetry ─────────────────────────"
+    echo "  Ask an owner of project '${RESERVATION_PROJECT}' to run this once:"
+    echo ""
+    echo "    ${MISSING_RES_CMD}"
+    echo ""
+  fi
+}
+
+# ---- Dispatch lifecycle phase ------------------------------------------------
+case "$PHASE" in
+  prepare)
+    run_prepare_steps
+    save_prepared_state
+    ;;
+  postbuild)
+    if [[ ! -f "$STATE_FILE" ]]; then
+      echo "❌ Earlier setup preparation step failed — aborting image push." >&2
+      if [[ -n "$PREBUILT_IMAGE" ]]; then
+        docker rmi -f "$PREBUILT_IMAGE" >/dev/null 2>&1 || true
+      fi
+      exit 1
+    fi
+    load_prepared_state
+    if [[ "$EXISTING_BEFORE" == "true" ]]; then
+      # On redeploy (`existingService != nil`), cloud-run-button skips `precreate` & `postcreate`.
+      # Push the built image and finalize IAP + Job + BigQuery schema + Scheduler right here.
+      _POSTBUILD_DONE="false"
+      trap 'if [[ "$_POSTBUILD_DONE" != "true" && -n "$PREBUILT_IMAGE" ]]; then docker rmi -f "$PREBUILT_IMAGE" >/dev/null 2>&1 || true; fi' EXIT
+      step "Pushing updated container image to Artifact Registry..."
+      docker push "$PREBUILT_IMAGE"
+      run_finalize_steps
+      _POSTBUILD_DONE="true"
+    fi
+    ;;
+  precreate)
+    run_precreate_step
+    ;;
+  finalize)
+    load_prepared_state
+    run_finalize_steps
+    ;;
+  all)
+    run_prepare_steps
+    run_finalize_steps
+    ;;
+esac

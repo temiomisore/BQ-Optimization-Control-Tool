@@ -1,0 +1,32 @@
+{
+  "name": "bqopt-review-ui",
+  "description": "BigQuery Optimization Control Plane — Review UI & Automated Nightly Scanner",
+  "options": {
+    "allow-unauthenticated": false,
+    "memory": "1Gi",
+    "cpu": "1",
+    "port": 8080
+  },
+  "hooks": {
+    "prebuild": {
+      "commands": [
+        "./scripts/install.sh --phase=prepare --image=\"$IMAGE_URL\" --yes"
+      ]
+    },
+    "postbuild": {
+      "commands": [
+        "./scripts/install.sh --phase=postbuild --image=\"$IMAGE_URL\" --yes"
+      ]
+    },
+    "precreate": {
+      "commands": [
+        "./scripts/install.sh --phase=precreate --image=\"$IMAGE_URL\" --yes"
+      ]
+    },
+    "postcreate": {
+      "commands": [
+        "./scripts/install.sh --phase=finalize --image=\"$IMAGE_URL\" --yes"
+      ]
+    }
+  }
+}

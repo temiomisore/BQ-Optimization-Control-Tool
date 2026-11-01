@@ -190,13 +190,17 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
             self.assertIn("--region=us-east4", cmd)
 
     def test_install_script_syntax_help_and_docs(self):
+        import json
+
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         script = os.path.join(repo_root, "scripts", "install.sh")
+        app_json_path = os.path.join(repo_root, "app.json")
         tutorial = os.path.join(repo_root, "docs", "INSTALL.md")
         welcome = os.path.join(repo_root, "docs", "cloudshell_welcome.txt")
         readme = os.path.join(repo_root, "README.md")
 
         self.assertTrue(os.path.isfile(script))
+        self.assertTrue(os.path.isfile(app_json_path))
         self.assertTrue(os.path.isfile(tutorial))
         self.assertTrue(os.path.isfile(welcome))
 
@@ -207,6 +211,8 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         self.assertEqual(hlp.returncode, 0, hlp.stderr)
         self.assertIn("--project=PROJECT_ID", hlp.stdout)
         self.assertIn("--ops-dataset=DATASET", hlp.stdout)
+        self.assertIn("--phase=PHASE", hlp.stdout)
+        self.assertIn("--image=IMAGE_URI", hlp.stdout)
 
         with open(script, encoding="utf-8") as f:
             script_text = f.read()
@@ -216,6 +222,30 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         self.assertIn("--build-service-account=", script_text)
         self.assertIn("spec.template.spec.containers[0].image", script_text)
 
+        # Validate app.json strictly against GoogleCloudPlatform/cloud-run-button's
+        # `appFile` schema (which uses `json.Decoder.DisallowUnknownFields()`).
+        with open(app_json_path, encoding="utf-8") as f:
+            app_cfg = json.load(f)
+        allowed_top = {
+            "name", "env", "options", "build", "hooks",
+            "description", "keywords", "logo", "repository", "website", "stack", "formation",
+        }
+        allowed_options = {
+            "allow-unauthenticated", "memory", "cpu", "port", "http2", "concurrency", "max-instances",
+        }
+        allowed_hooks = {"precreate", "postcreate", "prebuild", "postbuild"}
+        self.assertTrue(set(app_cfg.keys()).issubset(allowed_top), set(app_cfg.keys()) - allowed_top)
+        self.assertEqual(app_cfg.get("name"), "bqopt-review-ui")
+        opts = app_cfg.get("options", {})
+        self.assertTrue(set(opts.keys()).issubset(allowed_options), set(opts.keys()) - allowed_options)
+        self.assertIs(opts.get("allow-unauthenticated"), False)
+        hooks = app_cfg.get("hooks", {})
+        self.assertEqual(set(hooks.keys()), allowed_hooks)
+        for h_name, h_obj in hooks.items():
+            self.assertEqual(set(h_obj.keys()), {"commands"}, h_name)
+            self.assertTrue(h_obj["commands"], h_name)
+            self.assertIn("./scripts/install.sh", h_obj["commands"][0])
+
         with open(tutorial, encoding="utf-8") as f:
             tut_text = f.read()
         self.assertIn("<walkthrough-project-setup", tut_text)
@@ -223,13 +253,164 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
 
         with open(readme, encoding="utf-8") as f:
             rd_text = f.read()
-        self.assertIn("https://console.cloud.google.com/cloudshell/editor?shellonly=true", rd_text)
-        self.assertIn("cloudshell_print=docs/cloudshell_welcome.txt", rd_text)
-        # Omit cloudshell_tutorial so Cloud Shell opens full-screen terminal
-        # without the cross-origin walkthroughs.googleusercontent.com iframe
-        # that Chrome Incognito blocks via third-party cookie restrictions.
+        self.assertIn(
+            "https://console.cloud.google.com/cloudshell/editor?shellonly=true"
+            "&cloudshell_image=gcr.io/cloudrun/button"
+            "&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool"
+            "&cloudshell_git_branch=main",
+            rd_text,
+        )
+        # gcr.io/cloudrun/button's /bin/cloudshell_open only defines --repo_url,
+        # --git_branch, --dir, --context, --page, and --force_new_clone; passing
+        # cloudshell_print or cloudshell_tutorial would cause flag.Parse warnings
+        # or cross-origin Incognito iframe failures.
+        self.assertNotIn("cloudshell_print=", rd_text)
         self.assertNotIn("cloudshell_tutorial=", rd_text)
         self.assertNotIn("https://shell.cloud.google.com/cloudshell/editor", rd_text)
+
+    def test_cloudrun_button_hook_phases_fresh_and_redeploy(self):
+        import shutil
+        import tempfile
+        import yaml
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        orig_script = os.path.join(repo_root, "scripts", "install.sh")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_repo = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(work_repo, "scripts"), exist_ok=True)
+            script_copy = os.path.join(work_repo, "scripts", "install.sh")
+            shutil.copy2(orig_script, script_copy)
+            os.chmod(script_copy, 0o755)
+
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            log_file = os.path.join(tmp, "calls.log")
+            svc_flag = os.path.join(tmp, "service_exists")
+
+            fake_gcloud = os.path.join(bin_dir, "gcloud")
+            with open(fake_gcloud, "w", encoding="utf-8") as f:
+                f.write(f"""#!/usr/bin/env bash
+set -euo pipefail
+echo "gcloud $*" >> "{log_file}"
+if [[ "$*" == *"config get-value account"* ]]; then
+  echo "alice@company.com"
+  exit 0
+fi
+if [[ "$*" == *"projects describe"* ]]; then
+  echo "987654321"
+  exit 0
+fi
+if [[ "$*" == *"projects get-ancestors"* ]]; then
+  echo '[{{"type":"organization","id":"14682041824"}}]'
+  exit 0
+fi
+if [[ "$*" == *"iam service-accounts describe"* ]]; then
+  exit 1
+fi
+if [[ "$*" == *"run services describe"* ]]; then
+  if [[ ! -f "{svc_flag}" ]]; then
+    exit 1
+  fi
+  if [[ "$*" == *"status.url"* ]]; then
+    echo "https://bqopt-review-ui-xyz-uc.a.run.app"
+  elif [[ "$*" == *"containers[0].image"* ]]; then
+    echo "us-east4-docker.pkg.dev/demo-proj-123/cloud-run-source-deploy/bqopt-review-ui@sha256:deadbeef"
+  fi
+  exit 0
+fi
+if [[ "$*" == *"run deploy bqopt-review-ui"* ]]; then
+  touch "{svc_flag}"
+  exit 0
+fi
+if [[ "$*" == *"asset search-all-resources"* ]]; then
+  printf "US\\nus-east4\\n"
+  exit 0
+fi
+if [[ "$*" == *"scheduler jobs describe"* ]]; then
+  exit 1
+fi
+exit 0
+""")
+            os.chmod(fake_gcloud, 0o755)
+
+            for tool in ("bq", "docker"):
+                p = os.path.join(bin_dir, tool)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(f'#!/usr/bin/env bash\necho "{tool} $*" >> "{log_file}"\nexit 0\n')
+                os.chmod(p, 0o755)
+
+            img_url = "us-east4-docker.pkg.dev/demo-proj-123/cloud-run-source-deploy/bqopt-review-ui"
+            env = dict(os.environ)
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            env["BQOPT_NO_TTY"] = "1"
+            env["BQOPT_SA_SLEEP_SECONDS"] = "0"
+            env["BQOPT_IAM_SLEEP_SECONDS"] = "0"
+            env["BQOPT_IAP_SLEEP_SECONDS"] = "0"
+            # Simulate upstream cloud-run-button's GOOGLE_CLOUD_PROJECT="{}" clobber:
+            env["GOOGLE_CLOUD_PROJECT"] = "{}"
+            env["GOOGLE_CLOUD_REGION"] = "{}"
+            env["IMAGE_URL"] = img_url
+
+            # --- 1) Fresh project flow: prepare -> postbuild (noop) -> precreate -> finalize ---
+            for phase in ("prepare", "postbuild", "precreate", "finalize"):
+                res = subprocess.run(
+                    ["bash", script_copy, f"--phase={phase}", f"--image={img_url}", "--yes"],
+                    cwd=work_repo, env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 0, f"phase={phase} failed:\n{res.stdout}\n{res.stderr}")
+                if phase == "prepare":
+                    self.assertTrue(os.path.isfile(os.path.join(work_repo, "config.yaml")))
+                    self.assertTrue(os.path.isfile(os.path.join(work_repo, ".bqopt_prepared.env")))
+                if phase == "finalize":
+                    self.assertIn("https://bqopt-review-ui-xyz-uc.a.run.app/#settings", res.stdout)
+                    self.assertFalse(os.path.exists(os.path.join(work_repo, ".bqopt_prepared.env")))
+
+            with open(os.path.join(work_repo, "config.yaml"), encoding="utf-8") as f:
+                gen_cfg = yaml.safe_load(f)
+            self.assertEqual(gen_cfg["project_id"], "demo-proj-123")
+            self.assertEqual(gen_cfg["asset_scope"], "organizations/14682041824")
+            self.assertEqual(gen_cfg["jobs_view"], "JOBS_BY_ORGANIZATION")
+            self.assertEqual(gen_cfg["governance"]["settings_admins"], ["alice@company.com"])
+            self.assertEqual(
+                gen_cfg["governance"]["iap_audience"],
+                "/projects/987654321/locations/us-east4/services/bqopt-review-ui",
+            )
+
+            with open(log_file, encoding="utf-8") as f:
+                calls_fresh = f.read()
+            self.assertNotIn("docker push", calls_fresh)  # fresh flow lets main.go push
+            self.assertIn("gcloud run deploy bqopt-review-ui --project=demo-proj-123 --region=us-east4 --image=" + img_url, calls_fresh)
+            self.assertIn("--iap", calls_fresh)
+            self.assertIn("gcloud run jobs deploy bqopt-nightly-pipeline", calls_fresh)
+            self.assertIn("@sha256:deadbeef", calls_fresh)
+            self.assertIn("gcloud scheduler jobs create http bqopt-nightly-schedule", calls_fresh)
+
+            # --- 2) Redeploy flow (`service_exists` already true): prepare -> postbuild runs push + finalize ---
+            open(log_file, "w", encoding="utf-8").close()
+            for phase in ("prepare", "postbuild"):
+                res = subprocess.run(
+                    ["bash", script_copy, f"--phase={phase}", f"--image={img_url}", "--yes"],
+                    cwd=work_repo, env=env, capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 0, f"redeploy phase={phase} failed:\n{res.stdout}\n{res.stderr}")
+
+            with open(log_file, encoding="utf-8") as f:
+                calls_redeploy = f.read()
+            self.assertIn(f"docker push {img_url}", calls_redeploy)
+            self.assertIn("gcloud run jobs deploy bqopt-nightly-pipeline", calls_redeploy)
+            self.assertFalse(os.path.exists(os.path.join(work_repo, ".bqopt_prepared.env")))
+
+            # --- 3) Fail-closed if prepare failed (missing state file) ---
+            open(log_file, "w", encoding="utf-8").close()
+            fail_res = subprocess.run(
+                ["bash", script_copy, "--phase=postbuild", f"--image={img_url}", "--yes"],
+                cwd=work_repo, env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(fail_res.returncode, 0)
+            with open(log_file, encoding="utf-8") as f:
+                calls_fail = f.read()
+            self.assertIn(f"docker rmi -f {img_url}", calls_fail)
 
 
 if __name__ == "__main__":

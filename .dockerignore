@@ -1,5 +1,6 @@
 .git
 .venv
+.bqopt_*
 __pycache__
 *.pyc
 *.pyo
