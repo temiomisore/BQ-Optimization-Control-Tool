@@ -6,15 +6,16 @@ and the durable value is the **control plane**: honest scoring, one approval per
 change set, an apply layer that never drops a security binding, and receipts
 that prove realized vs. predicted savings.
 
-Companion documents: `bigquery-optimization-control-plane-design.md` (full
-design) and `sql/` (collector + schema, deployable standalone).
+Companion documents: `docs/bigquery-optimization-control-plane-design.md` (full
+design), `docs/OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md` & `docs/BIGQUERY_TABLES_CATALOG.md`
+(**18 persistent tables & 16 analytical/queue views**), and `sql/` (collector + schema).
 
 ```
-collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
-        ─▶ change_sets (state machine) ─▶ review UI  👍 / 👎
-        ─▶ executor (class routing, guardrails) ─▶ verifier ─▶ receipts
-                                  ▲                        │
-                                  └──── d_history ◀────────┘
+collector (SQL + multi-region/project courier) ─▶ rules engine ─▶ scoring ─▶ plan compiler
+        ─▶ change_sets (state machine) ─▶ review UI  👍 / 👎 (+ /#settings & Run scan now)
+        ─▶ executor (class routing, guardrails, PR hand-offs) ─▶ verifier ─▶ receipts
+                                  ▲                                             │
+                                  └───────────────── d_history ◀────────────────┘
 ```
 
 ## 1-Click Setup in Google Cloud (Zero Copy-Pasting or YAML Editing)
@@ -36,229 +37,177 @@ Click below to launch the **fully automated** setup in **Google Cloud Shell** (r
 > </details>
 
 What `scripts/install.sh` sets up automatically (~4 minutes):
-1. **Auto-detects** your signed-in Google account (makes you **Settings Admin**), your GCP Project, and your GCP Organization ID.
-2. **Enables required APIs** and creates a dedicated least-privilege service account (`bqopt-sa`).
-3. **Deploys the Web UI** on Cloud Run behind **Direct Identity-Aware Proxy (`--iap`)** — no Load Balancer, SSL certificate, or DNS setup needed.
-4. **Initializes `optimizer_ops`** in BigQuery and schedules automatic nightly refreshes (`02:00 UTC`) via Cloud Run Jobs + Cloud Scheduler.
-5. **Configure & scan in the browser:** Open `<your-app-url>/#settings` to verify permissions, pick tables/columns from dropdowns, add teammates, and click **Run scan now** right in the UI.
+1. **Auto-detects** your signed-in Google account (makes you **Settings Admin** + initial **FinOps Approver**), your GCP Project, and your GCP Organization ID.
+2. **Enables required APIs** (`BatchEnable`) and creates a dedicated least-privilege service account (`bqopt-sa`).
+3. **Deploys the Web UI** on Cloud Run behind **Direct Identity-Aware Proxy (`--iap`)** — no Load Balancer, SSL certificate, or DNS setup needed, with corporate `@domain` view access pre-bound.
+4. **Initializes `optimizer_ops`** (18 tables + 16 views + `enable_info_schema_storage = TRUE` across discovered regions) and schedules the nightly pipeline (`bqopt-nightly-pipeline` + `bqopt-nightly-schedule`) at **`03:00 UTC`** (inside the `03:00–09:00 UTC` safe change window).
+5. **Configure & scan in the browser:** Open `<your-app-url>/#settings` to verify permissions, pick HR / service-account owner tables and columns from live dropdowns, add teammates, and click **▶ Run scan now** right in the UI.
 
 ## Repo map
 
 | Path | What it is |
 |---|---|
-| `sql/01_ops_schema.sql` | Ops dataset + telemetry tables + pricing config + **employee hierarchy** |
-| `sql/02_collector_run.sql` | Daily collector for the home location (a scheduled query covers one location; `python -m optimizer.cli collect` also visits every other region) |
-| `sql/03_derived_views.sql` | Views the rules engine reads + **executive spend rollup (`v_spend_by_director`) & director recommendations (`v_director_recommendations`)** |
-| `sql/04_change_sets.sql` | Recommendation store, rule accuracy, watchdogs, queue views |
-| `optimizer/rules.py` | 14 infra & billing rules (including `W-01` Option 1 vs Option 2 Reservation Sizing, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, and **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** |
-| `optimizer/scoring.py` | Net value × confidence ÷ risk; **subquery-summation cap** |
-| `optimizer/pricing.py` | **Billing-aware money**: on-demand jobs at bytes × $/TiB, reservation jobs at slot-hours × edition rate; compounding of overlapping cards; headline capped at actual spend |
-| `optimizer/governance.py` | **FinOps split**: which cards are billing / commitment / reservation / project-level, who may see and approve them (server-side 403 + executor re-check), verified IAP identity |
-| `optimizer/attribution.py` | Points the attribution views at your employee-hierarchy and **service-account → owner** tables (column names configurable) |
-| `optimizer/compiler.py` | Dedupe, partition+cluster merge, rebuild-supersedes conflicts |
-| `optimizer/store.py` | DML-based state machine with append-only history |
-| `optimizer/executor/` | Router + guardrails, Class 1/2/3 applies (including `W-01` & `W-02` governance execution), **Class 3 copy-swap-rebind machine**, Recommender write-back |
-| `optimizer/verifier.py` | Baseline freeze at approval, receipts, regression → rollback path, rule accuracy, and **Outbound Slack/Teams Webhook Alerts (`SLACK_WEBHOOK_URL`)** |
-| `review_app/` | Enterprise SaaS FinOps UI (`Space Grotesk` + `JetBrains Mono`) with **Workload Actor Badges (`👤 Human Ad-Hoc Only · 🤖 ETL Service Accounts 100% Exempt`)**, interactive `W-01` & `W-02` Option 1/Option 2 DDL toggles, Tri-Engine SQL diff headers, OWASP WAF security headers, and `/healthz` probe |
-| `notebooks/Run_Optimization_On_Your_Dataset.ipynb` | Interactive Jupyter Notebook for analyzing your dataset or running across your GCP Organization |
-| `docs/HOW_TO_RUN_ON_YOUR_DATASET.md` | Comprehensive step-by-step operational guide for running against your own datasets |
-| `docs/OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md` | Detailed schema reference for all 15 tables and 11 derived views in `optimizer_ops` |
-| `scripts/demo_setup.py` / `demo_cleanup.py` | Seed / reset a self-contained `demo_ecommerce` environment (Demo 1: Core clustering, partitioning, and RPF) |
-| `scripts/demo_setup_2.py` / `demo_setup_2.sh` | Seed / reset Demo 2 fixtures (Two-person approval, dynamic honest math, storage churn, streaming cutovers, C1-04..C4-07) |
-| `docs/DEMO_MASTER_PLAYBOOK.md` | Customer Demo Playbook 1 (Foundational Clustering, Partitioning & S0–S9 Rebuilds) |
-| `docs/DEMO_MASTER_PLAYBOOK_2.md` | Customer Demo Playbook 2 (Enterprise Two-Person Governance, Dynamic Honest Math, Storage Receipts, Streaming Buffer Cutovers & Extended Rules Catalog) |
-| `notebooks/BigQuery_Optimization_Notebook.ipynb` | Interactive Jupyter Notebook for Customer Demo 1 in BigQuery Studio |
-| `notebooks/BigQuery_Optimization_Notebook_2.ipynb` | Interactive Jupyter Notebook for Customer Demo 2 in BigQuery Studio |
-| `scripts/demo_git_pr.py` | Renders the Class-4 CI pull-request (simulated PR output for demos) |
-| `.deploystack/`, `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (auto-launch via `gcr.io/ds-artifacts-cloudshell/deploystack_custom_image`, interactive `↑`/`↓` project picker, `BatchEnable` APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
-| `optimizer/scan_runner.py` | On-demand **Run scan now** engine triggered from the Review UI (Cloud Run Job execution with automatic in-process fallback) |
-| `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, bundled OpenJDK + ZetaSQL `.jar`, multi-worker Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
-| `tests/` | Pure-logic unit tests (no GCP needed): `python -m unittest discover -s tests` |
+| `sql/01_ops_schema.sql` | Ops dataset + **15 persistent tables**: query/slot telemetry, daily table/column/partition/dataset/object snapshots, Active Assist ingest, pricing config, **`employee_hierarchy`**, **`service_account_owners`**, **`regions_seen`**, and **`settings_changes`** |
+| `sql/02_collector_run.sql` | Daily collector SQL for the home location & host project (`optimizer/remote_collector.py` extends this across all discovered regions and sibling projects) |
+| `sql/03_derived_views.sql` | **13 analytical & attribution views**: `v_config`, **`v_reservation_rates`**, **`v_jobs_costed`** (`schema_version` stamp), `v_table_read_write_90d`, `v_query_families_28d`, `v_dataset_storage_billing_gap`, `v_unpartitioned_scan_targets`, `v_employee_hierarchy_src`, `v_service_account_owners_src`, **`v_principal_directory`**, **`v_unmapped_service_accounts`**, **`v_spend_by_director`**, and **`v_director_recommendations`** |
+| `sql/04_change_sets.sql` | **3 governance tables** (`change_sets`, `rule_accuracy`, `cost_watchdogs`) + **3 queue/receipt views** (`v_pending_review`, `v_approved_ready`, `v_receipts`) |
+| `optimizer/regions.py` & `optimizer/remote_collector.py` | Cloud Asset Inventory **region + multi-project discovery** (`regions_seen`), cross-region & cross-project courier (`_stg_*` 24h staging + `MERGE`), org-mode **`1b_query_previews` SQL text hydration**, and `TABLE_STORAGE_BY_ORGANIZATION` → per-project `TABLE_STORAGE` fallback |
+| `optimizer/schema_guard.py` | Stamps a DDL `schema_version` hash label on `v_jobs_costed` and automatically self-heals `optimizer_ops` views/tables whenever code upgrades |
+| `optimizer/rules.py` | 14 infra & billing rules (`W-01` Option 1 vs Option 2 Editions Sizing, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** (Regex + ZetaSQL `.jar` + **Vertex AI `gemini-3.8-flash`** + cross-project schema-stub `dry_run=True` byte-reduction verifier) |
+| `optimizer/scoring.py` & `optimizer/compiler.py` | Net value × confidence ÷ risk, **subquery-summation cap**, partition+cluster merge, conflict resolution, and **money-losing card suppression (`min_card_net_monthly_usd`)** |
+| `optimizer/pricing.py` | **Billing-aware money**: on-demand jobs at bytes × \$/TiB, reservation jobs at slot-hours × edition rate; compounding of overlapping cards; headline capped at actual 30d compute spend |
+| `optimizer/governance.py` & `optimizer/attribution.py` | **FinOps gate** (server-side 403 + executor re-check, verified IAP JWT identity) and configurable HR + **service-account → human owner → Director** view shims |
+| `optimizer/setup_check.py`, `settings_catalog.py`, `settings_options.py`, `settings_store.py` | **In-app `/#settings` backend**: 14-probe read-only Setup Check with copy-pasteable `gcloud`/`bq` fixes, 54-setting catalog, live schema/region/teammate dropdown discovery, and append-only `settings_changes` store with 1-click Undo |
+| `optimizer/scan_runner.py` | Read-only **Run scan now** engine (`collect` → `rules`, never `execute`) triggered from the Review UI via Cloud Run Job with automatic in-process fallback |
+| `optimizer/executor/` | Router + change-window deferral (`OutsideChangeWindow`), per-region Class 1/2/3 applies (`W-01` & `W-02` governance, **Class 3 S0–S9 copy-swap-rebind**), **Class 4 `pr_handoff.py` (`PR_HANDED_OFF`)**, and Recommender write-back |
+| `optimizer/verifier.py` | Baseline freeze at approval, Day-14 receipts, regression → rollback path, `rule_accuracy` learning, MV watchdogs, and **Slack/Teams Webhook Alerts** |
+| `review_app/` & `frontend/` | React + Flask FinOps Control Plane UI with **Project / Dataset / Region / Owner / Confidence / Min-value filters**, clickable **`RegionsBar` & `RegionBadge`**, **`SettingsPage` (`/#settings`)**, **Ask Gemini Copilot (`gemini-3.8-flash`)**, **PR hand-offs**, OWASP security headers, and `/healthz` |
+| `.deploystack/`, `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (`gcr.io/ds-artifacts-cloudshell/deploystack_custom_image`, interactive `↑`/`↓` project picker, local Docker build acceleration, Direct Cloud Run `--iap`, nightly Cloud Run Job + `03:00 UTC` Scheduler) |
+| `docs/OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md` & `docs/BIGQUERY_TABLES_CATALOG.md` | Complete schema & data-flow reference for all **18 tables and 16 views** in `optimizer_ops` |
+| `docs/HOW_TO_RUN_ON_YOUR_DATASET.md` & `docs/STEP_BY_STEP_OPTIMIZATION_GUIDE.md` | End-to-end operational guides for running against your own datasets and GCP Organization |
+| `docs/DEMO_MASTER_PLAYBOOK.md` & `docs/DEMO_MASTER_PLAYBOOK_2.md` (+ `notebooks/`, `scripts/demo_setup*.py`) | Customer Demo Playbooks 1 & 2, BigQuery Studio notebooks, and synthetic fixture generators |
+| `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, OpenJDK + ZetaSQL `.jar`, Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
+| `tests/` | 146 pure-logic unit tests (no live GCP required): `python -m unittest discover -s tests -t .` |
 
-## Quickstart
+## Quickstart (Local CLI)
 
 ```bash
 pip install -r requirements.txt
-cp config.yaml.example config.yaml   # edit project_id + regions
-python -m optimizer.cli init         # creates optimizer_ops schema + views
-python -m optimizer.cli collect      # 1st run: auto-pulls full 180-day (6-month) history; subsequent runs: 3-day daily incremental MERGE
-python -m optimizer.cli rules        # findings -> scored change sets (immediate Day-1 ROI!)
-FLASK_APP=review_app.main flask run  # review + approve locally
-python -m optimizer.cli execute      # applies APPROVED (class 1 only by default)
-python -m optimizer.cli verify       # after the window: receipts + regressions
+cp config.yaml.example config.yaml   # edit project_id + regions (or deploy in 1 click above)
+python -m optimizer.cli init         # creates/updates 18 tables + 16 views in optimizer_ops
+python -m optimizer.cli check        # read-only permission & region setup check
+python -m optimizer.cli scan         # read-only collect + rules refresh (safe at any hour)
+FLASK_APP=review_app.main flask run  # review + approve + edit settings locally
+python -m optimizer.cli execute      # applies APPROVED cards inside change_window_utc (defers outside window)
+python -m optimizer.cli verify       # after verify_window_days: receipts + regressions + watchdogs
 ```
 
-> After upgrading, run `init` once before `rules`: the rules need the billing-aware
-> views (`rules` stops with a clear message if they are missing).
-
-## Savings math, FinOps view and ownership (Sept 29, 2026 review)
+## Savings math, FinOps view, money-losing guard & ownership
 
 **1. Savings match how you are billed.**
-- On-demand jobs are priced at bytes × $/TiB; reservation (Editions) jobs at slot-hours ×
-  their reservation's edition rate (read from `reservation_admin_project`; Enterprise list
-  price if unknown). Slot-time savings are scaled by `pricing.reservation_savings_realization`
-  (1.0 = autoscale slots you stop paying for; lower it when most capacity is committed).
-- A job that reads N tables is split across them, never counted N times.
-- The headline does not double count: cards on the same table / query / dataset compound
-  (50% + 50% = 75%), a single-table query rewrite joins its table's cards, Editions and
-  byte-cap cards only count against what the table and query fixes leave, and the total is
-  **capped at the last 30 days' actual compute spend**.
-- W-01 prices autoscaling the way it is billed (50-slot steps, every busy minute, from
-  `JOBS_TIMELINE`) and flags slot telemetry that can't cover the bytes scanned.
-- Every card shows its formula ("How this saving is calculated"). Synthetic demo minimums
-  exist only with `demo_mode: true` (sandbox only) and are labelled on the card.
-- Unapproved cards priced the old way are re-priced from current telemetry or retired
-  (`SUPERSEDED`) by the next `rules` run.
+- On-demand jobs are priced at bytes × \$/TiB; reservation (Editions) jobs at slot-hours ×
+  their reservation's edition rate (`v_reservation_rates`, read from `reservation_admin_project`;
+  Enterprise list price if unknown). Slot-time savings are scaled by
+  `pricing.reservation_savings_realization` (1.0 = autoscale slots you stop paying for; lower it
+  when most capacity is committed baseline).
+- A job that reads N tables is split proportionally across them, never counted N times.
+- **No money-losing cards in the queue:** `min_card_net_monthly_usd` (default `0.0`) automatically
+  skips findings — and retires unsigned `PENDING_REVIEW` cards as `SUPERSEDED` — whenever ongoing
+  maintenance costs (e.g., MV background refresh) exceed gross savings. \$0 guardrail cards
+  (`require_partition_filter`, byte caps) are preserved; operators can inspect hidden negative cards
+  anytime via the toolbar's *Incl. money-losing* filter.
+- **De-overlapped headline:** cards on the same table / query / dataset compound (50% + 50% = 75%),
+  a single-table query rewrite joins its table's cards, Editions and byte-cap cards only count
+  against what the table and query fixes leave, and total compute savings are **capped at the last
+  30 days' actual compute spend** (`v_jobs_costed`).
+- Every card shows its formula ("How this saving is calculated"). Synthetic demo minimums exist
+  only with `demo_mode: true` (sandbox only) and are explicitly badged on the card.
 
-**2. Billing controls live in a separate FinOps view.** W-01/W-02, storage billing model,
-reservations/commitments and project-level cards are shown and approvable only for
+**2. Billing controls live in a separate FinOps view.** `W-01`/`W-02`, storage billing model,
+reservations/commitments, and project-level cards are shown and approvable only for
 `governance.finops_approvers` (plus env `BQOPT_FINOPS_APPROVERS`). Others get HTTP 403
-(`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the W-01 panel, or the spend
-figure. `execute` re-checks the approvers and sends a card back to review if needed.
-Identity comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker is
-honored only with `trust_client_identity: true` (demo only).
+(`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the `W-01` panel, or the org-wide
+spend figure. `execute` re-checks approvers and sends a card back to review if needed. Identity
+comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker is honored only
+with `trust_client_identity: true` (demo only).
 
-**3. Service-account spend rolls up to a human owner.** Set `service_account_owner_table`
-and `service_account_owner_columns` (your column names), then run `init`. PowerBI / ETL
-service-account spend then rolls up SA → owner → Director in `v_spend_by_director` and on
-the cards; `v_unmapped_service_accounts` lists what still needs an owner. The review app's
-service account needs read access to that table.
+**3. Service-account spend rolls up to a human owner.** Pick your HR table (`employee_hierarchy_table`)
+and service-account mapping table (`service_account_owner_table`) plus column mappings directly from
+dropdowns on `<app-url>/#settings` (or in `config.yaml`). PowerBI / Looker / Airflow / dbt
+service-account spend then rolls up `SA → human owner → Director` in `v_principal_directory`,
+`v_spend_by_director`, and on every card, while `v_unmapped_service_accounts` lists unclaimed
+service accounts ranked by 90-day spend.
 
-## Multi-region collection and automatic region discovery
+## Multi-region & cross-project collection (`regions: auto`)
 
-A BigQuery query job runs in one location, so `sql/02_collector_run.sql` can only collect the
-**home** location (`location`, where `optimizer_ops` lives). Every other location is collected by
-`optimizer/remote_collector.py` with the "courier" pattern, and everything lands in the same master
-tables (`jobs_events`, `table_state_daily`, … all carry a `region` column):
+A BigQuery query job runs in a single location, so `sql/02_collector_run.sql` collects the host
+project in the **home** location (`location`, where `optimizer_ops` lives). Everything else —
+**sibling projects in the home location** plus **all discovered projects in every remote region** —
+is collected by `optimizer/remote_collector.py` using the **courier** pattern into the same master
+tables (every raw table carries `region` and `project_id`):
 
-1. **Watermark:** a query job in the home location reads `MAX(creation_time)` for that region.
-2. **Fetch:** a query job *in that region* reads only newer rows from `region-<r>`.INFORMATION_SCHEMA
-   (1-day safety overlap; the first run backfills 180 days day by day).
-3. **Load:** a load job uploads them to a short-lived staging table `optimizer_ops._stg_*` (expires in 24h).
-4. **Merge:** `MERGE` into the master table (events) or replace today's rows for that region (snapshots).
-
-No dataset is created outside the home location.
-
-**Which regions?** Set `regions: auto` to discover them on every run with Cloud Asset Inventory
-(every `bigquery.googleapis.com/Dataset` in `asset_scope`, ideally `organizations/<id>`). The route is
-the discovered locations, plus `regions_include`, minus `regions_exclude`; home is always visited.
-Each run upserts `optimizer_ops.regions_seen`. A region that appears after the first run is flagged
-in the review UI ("New region detected"). If discovery fails, the collector keeps going with the last
-known regions. A fixed list (`regions: ["us", "us-east4"]`) still works.
+1. **Discover (`optimizer/regions.py`):** With `regions: auto`, Cloud Asset Inventory discovers
+   every `bigquery.googleapis.com/Dataset` across `asset_scope` (e.g. `organizations/<id>`),
+   extracting both BigQuery locations and active `project_id`s (falling back to projects seen in
+   `jobs_events` if needed) and upserting `optimizer_ops.regions_seen`. Newly created regions trigger
+   a **"New region detected"** alert in the UI's `RegionsBar`.
+2. **Watermark & Fetch:** Queries each region's `INFORMATION_SCHEMA` in place (`location=<region>`),
+   pulling only rows newer than that region's watermark (180-day backfill on first run; incremental
+   thereafter). For table sizes, tries `TABLE_STORAGE_BY_ORGANIZATION` first and automatically falls
+   back per project to `TABLE_STORAGE` with fault isolation (a `403` on one project never aborts the rest).
+3. **Org-Mode SQL Preview Hydration (`1b_query_previews`):** Because BigQuery omits SQL text from
+   `JOBS_BY_ORGANIZATION`, `remote_collector.hydrate_query_previews` automatically queries
+   per-project `JOBS_BY_PROJECT` grouped by `(project_id, query_hash)` so clustering filter analysis
+   and Class 4 SQL anti-pattern rewrites work across every project in the organization.
+4. **Load & Merge:** Uploads rows to short-lived staging tables `optimizer_ops._stg_*` (24-hour
+   expiration safety net), `MERGE`s events / refreshes daily snapshots, and drops `_stg_*`.
+5. **Least-Privilege Cross-Project Dry-Run (`optimizer/rules.py`):** When verifying Engine 3 Gemini
+   SQL rewrites on sibling projects where `bqopt-sa` holds `metadataViewer` without `dataViewer`,
+   `_dry_run_sql_with_schema_stubs` compiles the SQL against typed empty schema stubs from
+   `INFORMATION_SCHEMA.COLUMNS` so customer row data access is never required.
+6. **Regional Execution:** `optimizer/executor/` and `rollback` dispatch every DDL statement in the
+   card's `target_region`.
 
 ```bash
-python -m optimizer.cli regions --no-record     # show tonight's route without writing anything
-python -m optimizer.cli regions                 # discover + record regions_seen
-python -m optimizer.cli collect                 # home SQL + every remote region
+python -m optimizer.cli regions --no-record     # preview discovered regions & projects without writing
+python -m optimizer.cli regions                 # discover + record optimizer_ops.regions_seen
+python -m optimizer.cli collect                 # home SQL + sibling projects + every remote region
+python -m optimizer.cli scan                    # read-only init/self-heal + collect + rules
 ```
 
-Prerequisites for `auto`: the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled in the tool's
-project and **`roles/cloudasset.viewer`** on `asset_scope` for the collector's service account.
-Fixes also run in the right place: the executor and rollback start every statement on a customer
-table in that table's `target_region`.
-
-## Settings page and setup check
+## Settings page, Setup Check & On-Demand Scan (`/#settings`)
 
 Open the review UI's **Settings** button (or `<app-url>/#settings`):
 
-- **Setup check**: read-only probes run as the app's service account. They cover running queries, the
-  `optimizer_ops` dataset, region discovery, and, for each region, query history, table details,
-  table sizes, Google recommendations and reservations, plus your lookup tables. Anything that fails
-  shows the exact `gcloud` / `GRANT` / `ALTER` command that fixes it.
-- **All settings**: every setting the tool reads (`optimizer/settings_catalog.py`), grouped into
-  Startup, Everyday and Safety switches, with its current value, where the value comes from
-  (default, `config.yaml`, saved in the app or an environment variable) and a plain-English description.
-  **Download config.yaml** exports a commented file with the values in use (secrets left out).
-
-**Editing everyday settings** (click ✏️ next to a value): changes are validated (ranges, real
-regions, tables that exist, owner-column mappings that compile) and saved to
-`optimizer_ops.settings_changes`, one row per change, so every change has who / when / why and
-an **Undo**. Precedence: built-in default < `config.yaml` < saved in the app < environment variable
-(env-pinned values show a lock). The app uses a change right away; the nightly job picks it up on its
-next run (`optimizer.cli` reads saved values at start).
-
-Who may edit:
+- **▶ Run scan now**: triggers a strictly read-only `scan` (`collect` → `rules`, never `execute`) via
+  the Cloud Run Job (with automatic in-process fallback) and streams live progress in the browser.
+- **Setup check**: 14 read-only probes run as the app's service account (query execution,
+  `optimizer_ops` read/write, Cloud Asset discovery, per-region `JOBS` / `TABLES` / `TABLE_STORAGE` /
+  `RECOMMENDATIONS` / `RESERVATIONS`, cross-project metadata, HR/SA lookup tables, DTS). Any gap
+  prints a ready-to-paste `gcloud` / `bq query` command for Cloud Shell.
+- **Interactive dropdown editors**: edit everyday settings with live BigQuery table, schema-column,
+  region, and teammate-email dropdowns (`optimizer/settings_options.py`). Column-map settings stay
+  dimmed ("Not needed — using built-in table") until a custom lookup table is chosen. Every change
+  is validated and appended to `optimizer_ops.settings_changes` with who/when/why and 1-click **Undo**,
+  and is picked up automatically by both the UI and the nightly Cloud Run Job.
 
 | Role | Set by | Can change |
 |---|---|---|
-| Settings admin | `governance.settings_admins` in config.yaml (or `BQOPT_SETTINGS_ADMINS`), deploy-time only | everyday settings, verification thresholds, and the editors list |
-| Settings editor | added on the Settings page by an admin | everyday settings (regions, scope, history windows, lookup tables, engines) |
-| + FinOps approver | `governance.finops_approvers` | the savings-math settings (minimum card value, realization, caps, weights) |
-
-Startup settings and safety switches (approvers, executor flags, identity) are never editable in the
-UI. Permissions are only as strong as the sign-in: in production set `trust_client_identity: false`
-and put the app behind Identity-Aware Proxy (`iap_audience`), so every change is signed by a real login.
-
-Run the same checks from a terminal or as another account (exit code 1 when something blocks the tool):
-
-```bash
-python -m optimizer.cli check
-gcloud run jobs execute <your-nightly-job> --args=-m,optimizer.cli,check --wait   # as the job's account
-```
+| Settings admin | `governance.settings_admins` in `config.yaml` (or `BQOPT_SETTINGS_ADMINS`), deploy-time only | Everyday settings, verification thresholds, and the settings editors list |
+| Settings editor | Added on `/#settings` by an admin (`_access.settings_editors`) | Everyday settings (regions, scope, history windows, lookup tables, Gemini model, Run scan now) |
+| + FinOps approver | `governance.finops_approvers` (or `BQOPT_FINOPS_APPROVERS`) | Savings-math settings (minimum card value, realization, caps, risk weights) |
 
 ## Honest status matrix
 
 | Component | Status |
 |---|---|
-| Collector SQL + views | Complete; **Smart Auto-Watermark** (`180-day / 6-month` historical backfill on 1st run, then `3-day` daily incremental `MERGE`) across project-level and GCP Org-level (`JOBS_BY_ORGANIZATION`) telemetry |
-| Org-Wide Query Ingestion | Complete; centralizes queries across all enterprise projects into `jobs_events` |
-| Attribution & Hierarchy | Complete; joins query history with `employee_hierarchy` for Director/VP spend rollups (`v_spend_by_director`) and card attribution (`v_director_recommendations`) |
-| Proactive Cost Guardrail (`W-02`) | **Complete**: Filters `jobs_events` by `user_email` to enforce a **50 GiB per-query safety cap (`@@maximum_bytes_billed`) & 50-slot autoscaling sandbox on Human Ad-Hoc Analysts ONLY**, while marking **Service Accounts (`*.iam.gserviceaccount.com`), Airflow, dbt, and Dataform production ETL as 100% EXEMPT** so pipelines never break |
-| Rules + scoring + compiler | Complete; 14 infrastructure/billing rules (`W-01`, `W-02`, `C2-01` with `max_staleness = INTERVAL '4' HOUR`) + unit-tested pure logic |
-| Store / state machine / review UI | Complete; displays Workload Actor Badges (`👤 Human Ad-Hoc` vs `🤖 Service Account ETL Exempt`), interactive Option 1/Option 2 DDL toggles, Director badges, and root-cause DDL on blocked guardrails |
-| Class 1 executor (clustering, RPF, expirations, billing model, W-02 guardrail) | Complete, with fresh would-break re-check and rollback |
-| Class 2 (MV + `max_staleness` + watchdog) | Functional; includes `max_staleness = INTERVAL '4' HOUR` to prevent peak-hour background refresh slot spikes |
-| Class 3 REPARTITION & `W-01` Reservation Sizing | Implemented end-to-end incl. clean abort + rollback |
-| Class 3 streaming branch | Deliberately refuses (`Blocked`) when a streaming buffer exists — dual-write/drain is your phase-4 work |
-| Shard consolidation / archive-to-GCS | Detected + carded; apply is runbook-only in v1 |
-| CI_PULL_REQUEST route | Routed + skipped with a message; wire your Terraform/dbt MR bot here |
-| Ownership detection | Config list + `user_email` Actor Classifier (`HUMAN_AD_HOC`, `SERVICE_ACCOUNT_ETL`, `DBT_PIPELINE`, `BI_DASHBOARD`) |
-| Anti-pattern detection (Class 4 — Tri-Engine) | **Complete Tri-Engine Pipeline:** **Engine 1** (Python Regex Rewriter `C4-01`..`C4-09`), **Engine 2** (Bundled Google Official ZetaSQL AST `.jar`), and **Engine 3** (Vertex AI Gemini 2.5 Flash Schema-Aware Judge + `dry_run=True` Byte-Reduction Verifier) |
-| Google Cloud WAF Hardening | **Complete (`98.6/100`)**: ADC singleton client caching (`optimizer/bq.py`), OWASP HTTP security headers, `/healthz` readiness probe, non-root Docker user (`UID 10001`), multi-threaded Gunicorn, Outbound Slack/Teams Webhook Alerts, and Cloud Armor WAF policy in `terraform/main.tf` |
-| Class 4 PR route | `scripts/demo_git_pr.py` renders the PR (clearly simulated); real CI wiring is still yours |
-| Demo environment | `scripts/demo_setup.py` seeds `demo_ecommerce` + synthetic telemetry; `config.yaml` in this repo is demo-tuned (class 3 on, 24/7 window, instant verify) — production defaults live in `config.yaml.example` |
+| Collector SQL + Multi-Region / Cross-Project Courier | **Complete**: 180-day initial backfill + 3-day incremental `MERGE`, Cloud Asset Inventory discovery (`regions_seen`), cross-project table/column/partition/storage snapshots, and org-mode `1b_query_previews` SQL hydration |
+| Schema Self-Heal (`schema_guard.py`) | **Complete**: Stamps `schema_version` on `v_jobs_costed` and non-destructively refreshes DDL whenever views/tables evolve |
+| Attribution & Service-Account Rollup | **Complete**: `employee_hierarchy` + `service_account_owners` (`SA → human owner → Director`) powering `v_principal_directory`, `v_unmapped_service_accounts`, `v_spend_by_director`, and `v_director_recommendations` |
+| Proactive Cost Guardrail (`W-02`) | **Complete**: Enforces a **50 GiB per-query safety cap (`@@maximum_bytes_billed`) & 50-slot autoscaling sandbox on Human Ad-Hoc Analysts ONLY**, while marking **Service Accounts (`*.iam.gserviceaccount.com`), Airflow, dbt, and Dataform ETL as 100% EXEMPT** |
+| Rules + Billing-Aware Scoring + Compiler | **Complete**: 14 infra/billing rules (`W-01`, `W-02`, `C2-01` with `max_staleness = INTERVAL '4' HOUR`), money-losing card suppression (`min_card_net_monthly_usd`), and de-overlapped spend-capped headline |
+| Review UI + Filters + Settings (`/#settings`) | **Complete**: Filter by **Project, Dataset, Region (dropdown + clickable `RegionsBar` chips), Owner/Director, Confidence, Min Value, and Class**; live Setup Check, dropdown Settings editors, **Run scan now**, and **Ask Gemini FinOps Copilot (`gemini-3.8-flash`)** |
+| Class 1 / 2 / 3 Executor | **Complete**: Regional DDL routing, `W-01` & `W-02` governance applies, Class 2 MV watchdogs, Class 3 S0–S9 copy-swap-rebind, and safe deferral (`OutsideChangeWindow`) when invoked outside `change_window_utc` |
+| Class 4 Tri-Engine SQL + PR Hand-Off | **Complete**: **Engine 1** (Regex `C4-01`..`C4-09`), **Engine 2** (Bundled ZetaSQL AST `.jar`), **Engine 3** (Vertex AI **`gemini-3.8-flash`** + cross-project schema-stub `dry_run=True` verifier), and **`pr_handoff.py`** (`APPROVED` → `PR_HANDED_OFF` → **Mark PR merged** → `VERIFYING`) |
+| 1-Click Cloud Shell Installer | **Complete**: Zero-paste launch via `deploystack_custom_image`, interactive `↑`/`↓` project picker, `BatchEnable` APIs, local Docker push, Direct Cloud Run `--iap`, and `03:00 UTC` nightly schedule |
+| Security & WAF Hardening | **Complete**: Verified IAP JWT auth, ADC client caching, OWASP HTTP headers, `/healthz` readiness probe, non-root Docker user (`UID 10001`), Gunicorn, Slack/Teams webhooks, and Cloud Armor WAF (`terraform/main.tf`) |
 
 ## Non-negotiable safety properties (as built)
 
-1. Nothing applies without an `APPROVED` state written by a human; approvals expire (`approval_ttl_days`).
-2. Class 3 captures IAM, row-access policies, labels, and a snapshot **before** touching anything, validates row counts + `FARM_FINGERPRINT` checksums, and any pre-swap failure is a clean abort that resumes writers and drops the copy.
-3. `require_partition_filter` re-counts would-break queries **at apply time** and refuses unless zero or explicitly forced.
-4. Unused-table findings carry `ORG_WIDE_READ_CHECK_REQUIRED` and have no automated apply path, because project-scope JOBS data cannot prove a table is unread.
-5. Change window + per-table structural rate limit enforced in the router; every transition appended to `state_history`.
-6. Native recommender estimates are capped at the table's actual measured monthly spend x a conservative scan-reduction ceiling (default 0.68, config key `native_cap_scan_reduction`) before a human ever sees a dollar figure — the cap is always computed from real telemetry, never from a preset number.
-7. Verification receipts never fabricate: when no comparable post-window query families exist yet, `realized_usd` stays null (pending) rather than echoing the prediction, and rule-accuracy learning is skipped until real data arrives.
+1. Nothing applies without a human `APPROVED` state; approvals expire (`approval_ttl_days`), and `execute` invoked outside `change_window_utc` safely defers `APPROVED` cards to the next change window rather than failing them.
+2. Class 3 captures IAM, row-access policies, labels, and a zero-copy clone **before** touching anything, validates row counts + `FARM_FINGERPRINT` checksums, and aborts cleanly on any pre-swap mismatch.
+3. `require_partition_filter` (`C1-02`) re-counts would-break queries **at apply time** and refuses unless zero.
+4. Unused-table findings (`C3-05`) carry `ORG_WIDE_READ_CHECK_REQUIRED` when running in single-project `JOBS` scope.
+5. Native recommender estimates are capped at the table's real monthly spend × `native_cap_scan_reduction` (default `0.68`), and cards whose recurring cost exceeds gross savings are suppressed (`min_card_net_monthly_usd`).
+6. Verification receipts never fabricate: when no post-window executions exist yet, `realized_usd` remains `null` (pending) rather than echoing the prediction.
 
-## Deploy notes
+## Review UI & JSON API
 
-Split identities: `bqopt-collector` (read-only) vs `bqopt-executor` (jobUser +
-**per-dataset** dataOwner where needed for IAM rebind). The review app has no
-auth of its own — put IAP in front and set `governance.iap_audience` (or env
-`IAP_AUDIENCE`): it verifies the signed IAP JWT and uses that email for the FinOps
-permission check and the approvals audit trail (a bare identity header is never
-trusted). Schedules in `terraform/main.tf` place `execute` inside the change window
-on purpose.
-
-## Review UI (React) 
-
-- `/` — React + Vite + Tailwind + ECharts app in `frontend/` (built inside the
-  Docker image; Node stage → `frontend/dist`, served by Flask).
-- `/classic` — the original Jinja page, kept as a fallback.
-- JSON API used by the React app: `GET /api/dashboard`, `POST /api/decisions`
-  (`approve | reject | reset | unsnooze | rollback`), `POST /api/finops-chat`.
-- Local dev: `.venv/bin/python3 review_app/main.py --port 8080` then
-  `cd frontend && npm install && npm run dev` (Vite on :5173 proxies `/api`).
-- Gunicorn timeout is 900s because a W-01 reservation rollback waits for queries
-  to route back to on-demand.
-
-## Verify-before-trust checklist (first week)
-
-- Run `rules` and eyeball `v_pending_review` — do the dollar figures pass the
-  sniff test against last month's invoice? The headline should never exceed the
-  bill; open a card's "How this saving is calculated" to check its inputs.
-- Check `v_unmapped_service_accounts` and add owners for the big spenders.
-- Approve one **C1-01 clustering** card on a mid-size table; watch it through the
-  full APPLYING → APPLIED → VERIFYING → VERIFIED path.
-- Confirm the Active Assist console shows the recommendation as claimed and,
-  after verification, succeeded.
-- Only then consider `enable_class2`, and much later `enable_class3` after a
-  scratch-table rehearsal of the swap + rollback.
+- `/` — React + Vite + Tailwind + ECharts app (`frontend/`, built in Docker multi-stage build and served by Flask).
+- `/#settings` — Setup Check, interactive Settings editors, audit history with Undo, and **Run scan now**.
+- `/classic` — Server-rendered Jinja UI fallback (including Project, Dataset, Region, and Class filters).
+- **JSON API endpoints (`review_app/main.py`):**
+  - Dashboard & Actions: `GET /api/dashboard`, `POST /api/decisions` (`approve | reject | reset | unsnooze | rollback | mark_merged`), `POST /api/finops-chat`, `GET /healthz`
+  - Settings & Setup Check: `GET /api/setup-check`, `GET /api/settings`, `GET /api/settings/options`, `GET /api/settings/table-columns`, `POST /api/settings`, `POST /api/settings/revert`, `GET /api/settings/history`, `POST /api/settings/editors`
+  - On-Demand Scan: `GET /api/scan/status`, `POST /api/scan/run`
+- Local dev: `.venv/bin/python3 review_app/main.py --port 8080` then `cd frontend && npm install && npm run dev` (Vite on `:5173` proxies `/api`).

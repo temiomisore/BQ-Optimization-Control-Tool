@@ -315,6 +315,8 @@ def cmd_execute(c) -> None:
                                     "applied_at": bq.query(c, "SELECT CURRENT_TIMESTAMP() AS t")[0]["t"].isoformat()})
             store.transition(c, cs["change_set_id"], "VERIFYING", "executor")
             print(f"applied {cs['change_set_id']} ({target})")
+        except router.OutsideChangeWindow as e:
+            print(f"deferred {cs['change_set_id']} ({target}): {e} — keeping APPROVED for next change window")
         except router.Blocked as e:
             store.transition(c, cs["change_set_id"], "FAILED", "executor", str(e))
             recommender_sync.mark(cs.get("native_rec_names"), "FAILED")

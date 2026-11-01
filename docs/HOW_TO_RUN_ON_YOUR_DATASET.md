@@ -58,27 +58,27 @@ Running this on your production dataset is safe:
 
 ## 3. ⚡ Quick-Start (TL;DR Cheat Sheet)
 
-If you already have your terminal open and authenticated, run these commands:
+### Fastest Path: 1-Click Cloud Shell Install (Zero Pasting or YAML Editing)
+Click **Open in Cloud Shell** in [`README.md`](../README.md), select your GCP project with `↑`/`↓` + `Enter`, and once deployed (~4 min), open `<your-app-url>/#settings` to review **Setup check**, configure lookup tables from dropdowns, and click **▶ Run scan now** right in your browser.
+
+### Local / Terminal CLI Cheat Sheet
+If you are running from a terminal instead, run:
 
 ```bash
-# 1. Initialize control plane dataset (one-time setup)
+# 1. Initialize control plane dataset (18 tables + 16 views) & verify permissions
 ./run.sh init
+./run.sh check
 
-# 2. Collect telemetry:
-# Project-scoped:
-./run.sh collect -d YOUR_DATASET_NAME
-# OR Organization-wide (across all projects in GCP Org):
-./run.sh collect --org
+# 2. Preview discovered BigQuery regions & projects, then run a read-only scan (collect + rules):
+./run.sh regions --no-record
+./run.sh scan                      # or: ./run.sh collect --org && ./run.sh rules
 
-# 3. Analyze patterns and generate honest recommendations
-./run.sh rules -d YOUR_DATASET_NAME
-
-# 4. Open the visual review UI in your browser (shows exact DDL & Director)
+# 4. Open the visual review UI in your browser (filter by Project, Dataset, Region, Owner & Class)
 ./run.sh python3 review_app/main.py --port 8080
-# Open http://localhost:8080 and click "Approve" on cards you want
+# Open http://localhost:8080 (and http://localhost:8080/#settings) to review & approve cards
 
-# 5. Safely apply approved optimizations
-./run.sh execute -d YOUR_DATASET_NAME
+# 5. Safely apply approved optimizations (defers automatically if outside change_window_utc)
+./run.sh execute
 
 # 6. Verify post-apply query performance & CFO receipts
 ./run.sh verify
@@ -135,14 +135,19 @@ You do **not** need to edit any files. Just pass the flags:
 ./run.sh collect --org
 ```
 
-### Method B: Set Defaults in `config.yaml`
-Edit [config.yaml](file:///usr/local/google/home/temiomisore/My-Jetski-Folder/Jetski-Drive-Folder/BQOpt-Optimization-Work/config.yaml):
+### Method B: Edit Everyday Settings in the Web UI (`/#settings` — Recommended in Production)
+Open **`<your-app-url>/#settings`** in your browser:
+* Pick **BigQuery regions**, **query history source** (`JOBS` vs `JOBS_BY_ORGANIZATION`), **HR employee hierarchy table**, **service-account owner table**, **schema column mappings**, **Gemini model (`gemini-3.8-flash`)**, and **savings thresholds** directly from live dropdowns.
+* Every edit is validated and stored in `optimizer_ops.settings_changes` with an immutable audit trail and 1-click **Undo**, and applies automatically to both the web app and the nightly Cloud Run Job (`03:00 UTC`).
+
+### Method C: Set Startup / Safety Defaults in `config.yaml`
+Copy [`config.yaml.example`](../config.yaml.example) to `config.yaml`:
 ```yaml
 project_id: "your-gcp-project-id"
 ops_dataset: "optimizer_ops"
 location: "US"                         # home location: where optimizer_ops lives
 
-# Which BigQuery locations to collect: "auto" finds every location that holds a dataset
+# Which BigQuery locations to collect: "auto" finds every location & project that holds a dataset
 # (Cloud Asset Inventory: needs the Cloud Asset API + roles/cloudasset.viewer on asset_scope),
 # or a fixed list such as ["us", "us-east4"]. The home location is always collected.
 regions: auto
@@ -152,10 +157,10 @@ regions_exclude: []                    # never visit
 
 # Telemetry Scope:
 # Set to JOBS_BY_ORGANIZATION to collect query telemetry across all projects in your GCP Org:
-jobs_view: "JOBS_BY_ORGANIZATION"   # or "JOBS_BY_PROJECT"
+jobs_view: "JOBS_BY_ORGANIZATION"      # or "JOBS"
 
-# Employee Hierarchy Table:
-employee_hierarchy_table: "optimizer_ops.employee_hierarchy"
+# Employee Hierarchy Table (leave null to use built-in optimizer_ops.employee_hierarchy):
+employee_hierarchy_table: null
 
 # Reservation admin project: reservation jobs are priced at their reservation's
 # edition slot rate, read from here (Enterprise list price if left null).
@@ -171,26 +176,29 @@ service_account_owner_columns:
   director_name: director_name     # optional
   application: app_name            # optional
 
-# Savings math
+# Savings math & queue hygiene
 demo_mode: false                   # never true for a real customer
+min_card_net_monthly_usd: 0        # skip / retire unsigned money-losing cards
 pricing:
   reservation_savings_realization: 1.0   # lower (e.g. 0.3) if most slots are committed baseline
 
 # FinOps / governance: who may see and approve billing, commitment,
-# reservation and project-level cards (everyone else gets HTTP 403)
+# reservation and project-level cards, and who manages /#settings
 governance:
+  settings_admins: ["data-platform-lead@yourco.com"]
   finops_approvers: ["finops-lead@yourco.com", "data-platform-director@yourco.com"]
   trust_client_identity: false     # keep false outside demos
   iap_audience: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"
 ```
 
 > [!IMPORTANT]
-> `finops_approvers` empty means **nobody** can approve FinOps cards (fail closed). You can add approvers without editing the file via the env var `BQOPT_FINOPS_APPROVERS` (comma-separated). The review app only trusts the email inside a **verified IAP JWT**; put the app behind IAP and set `iap_audience`.
+> `finops_approvers` empty means **nobody** can approve FinOps cards (fail closed). You can add approvers without editing the file via the env var `BQOPT_FINOPS_APPROVERS` (comma-separated). The review app only trusts the email inside a **verified IAP JWT**; put the app behind IAP and set `iap_audience` (done automatically by `scripts/install.sh`).
 
 > [!NOTE]
-> **Understanding BigQuery's Telemetry Scopes**:
-> BigQuery provides `region-{location}.INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION` to view all query executions, bytes scanned, and slot reservations across every project in the GCP Organization.
-> However, BigQuery does **not** provide `TABLES_BY_ORGANIZATION` or `TABLE_STORAGE_BY_ORGANIZATION`. Therefore, table storage metadata and column schemas are evaluated per project/dataset, while query workloads and Director-level spend can be captured across the entire enterprise!
+> **How Multi-Project & Multi-Region Organization Scanning Works**:
+> * **Org-Wide Views:** When `jobs_view: "JOBS_BY_ORGANIZATION"` is active, the collector queries `JOBS_BY_ORGANIZATION`, `JOBS_TIMELINE_BY_ORGANIZATION`, `TABLE_STORAGE_BY_ORGANIZATION` (with automatic per-project `TABLE_STORAGE` fallback), and `RECOMMENDATIONS_BY_ORGANIZATION` across every discovered region.
+> * **Automatic SQL Text Hydration (`1b_query_previews`):** Because BigQuery omits the `query` text column from `JOBS_BY_ORGANIZATION`, `optimizer/remote_collector.py` automatically hydrates normalized 1 KB `query_preview` snippets per `(project_id, query_hash)` from per-project `JOBS_BY_PROJECT` views so clustering filter extraction and Class 4 SQL rewrites work across all projects.
+> * **Cross-Project Table Schemas & Partitions:** Because BigQuery's `TABLES`, `COLUMNS`, `TABLE_OPTIONS`, and `PARTITIONS` views are project/dataset-scoped, `optimizer/regions.py` + `optimizer/remote_collector.py` discover every dataset-owning project via Cloud Asset Inventory (or `jobs_events` fallback) and collect table/column/partition metadata across all projects and regions with per-project fault isolation!
 
 ---
 
@@ -202,20 +210,15 @@ Run this once per project:
 ```
 
 ### What happens under the hood:
-* Creates a dataset called `optimizer_ops` in your project (location defaults to `US`).
-* Deploys state tables:
-  * `jobs_events`: Stores normalized query execution history (project or org-wide).
-  * `table_state_daily`: Snapshots table sizes, partition counts, and formats.
-  * `employee_hierarchy`: Enterprise mapping of users to Directors and Departments.
-  * `service_account_owners`: Service account → accountable human owner (used when `service_account_owner_table` is not set).
-  * `change_sets`: The audit state machine tracking all recommendations.
-  * `v_jobs_costed`: Every job priced the way it was billed (`billing_mode`, `est_cost_usd`).
-  * `v_pending_review`: View feeding the Review Web UI.
-  * `v_spend_by_director`: Executive spend rollup by Director and Project (service-account spend rolls up to its owner's Director).
-  * `v_unmapped_service_accounts`: Service accounts with spend but no owner — the to-do list for the mapping table.
-  * `v_director_recommendations`: Recommendations mapped to Directors and impacted teams.
-  * `v_receipts`: View showing verified savings receipts.
-* Points the attribution views at your own hierarchy / service-account tables when they are configured (column names mapped from `config.yaml`). `init` stops with a clear error if a required column mapping is missing.
+* Creates a dataset called `optimizer_ops` in your project (location defaults to `US`) with **18 persistent tables** and **16 views** (full reference in [`OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md`](./OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md)):
+  * `jobs_events` & `jobs_hourly_slots`: Long-term query and slot concurrency archives across all discovered regions & projects.
+  * `table_state_daily`, `columns_daily`, `table_partitions_daily`, `dataset_state_daily`, `object_state_raw_daily`: Daily table, column, partition, dataset, reservation, and scheduled-query snapshots.
+  * `employee_hierarchy` & `service_account_owners` (+ shims `v_employee_hierarchy_src`, `v_service_account_owners_src`, `v_principal_directory`, `v_unmapped_service_accounts`): Enterprise mapping of humans and service accounts to Directors and Departments.
+  * `regions_seen` & `settings_changes`: Discovered BigQuery regions (with new-region alerts) and the append-only audit log for UI-edited settings.
+  * `change_sets`, `rule_accuracy`, `cost_watchdogs`: Master recommendation state machine, closed-loop `d_history` learning, and Class 2 recurring-cost watchdogs.
+  * `v_reservation_rates` & `v_jobs_costed`: Every job priced honestly by how it was billed (`ON_DEMAND` vs `RESERVATION`), stamped with `schema_version` so `optimizer/schema_guard.py` automatically self-heals views whenever code upgrades.
+  * `v_pending_review`, `v_approved_ready`, `v_receipts`, `v_spend_by_director`, `v_director_recommendations`: Views powering the Review UI, executor queue, CFO receipts, and Director rollups.
+* Points the attribution views at your own hierarchy / service-account tables when they are configured (column names mapped from `/#settings` or `config.yaml`). `init` stops with a clear error if a required column mapping is missing.
 
 > **Note:** If `optimizer_ops` already exists, running `init` is completely idempotent and safe. Re-run it after upgrading the tool or changing the attribution tables — `rules` refuses to run on views that predate billing-aware pricing.
 
@@ -259,14 +262,14 @@ expired=0 findings=3 inserted=3 suppressed=0 refreshed=2 retired=1
 ```
 
 ### What happens under the hood:
-* **Evaluates Rules**:
-  * `C1-01`: Detects unclustered tables that are frequently filtered in `WHERE` clauses.
-  * `C1-02`: Enforces `require_partition_filter` where every observed query already filters.
-  * `C1-03`: Sets default expirations on staging/scratch datasets.
-  * `C4-01`: Flags queries scanning unnecessary columns (`SELECT *`).
-  * `C4-03`: Flags non-sargable functions preventing partition pruning.
-* **Calculates Honest, Billing-Aware Savings**: on-demand spend at bytes × $/TiB, reservation spend at slot-hours × edition rate (scaled by `pricing.reservation_savings_realization`), split across the tables a job reads, and capped by the actual spend. Each card records its formula under `evidence.savings_math`.
-* **Keeps the queue current**: unapproved cards that are detected again are re-priced in place (`refreshed`); unapproved cards priced the old way that no longer hold up are retired as `SUPERSEDED` (`retired`).
+* **Evaluates 14 Infra/Billing Rules + Tri-Engine Class 4 SQL Pipeline**:
+  * `C1-01`..`C1-10`, `W-01`, `W-02`: Clustering, `require_partition_filter`, staging expirations, time-travel tuning, physical storage flips, PK/FK join constraints, Editions sizing, and human-only ad-hoc cost guardrails.
+  * `C2-01`..`C2-02`: Smart-Tuned Materialized Views (`max_staleness = INTERVAL '4' HOUR`) and Search Indexes with recurring-cost watchdogs.
+  * `C3-01`..`C3-05`: Partitioning rebuilds, date-shard consolidation, partition granularity tuning, and cold-table archival.
+  * `C4-01`..`C4-09` / `C4-AST-*` / `C4-AI-*`: Tri-Engine SQL anti-pattern detection (**Engine 1** Python Regex + **Engine 2** ZetaSQL AST `.jar` + **Engine 3** Vertex AI `gemini-3.8-flash` verified via BigQuery `dry_run=True` with cross-project schema-stub fallback).
+* **Calculates Honest, Billing-Aware Savings**: on-demand spend at bytes × \$/TiB, reservation spend at slot-hours × edition rate (scaled by `pricing.reservation_savings_realization`), split proportionally across the tables a job reads, and capped by actual spend. Each card records its formula under `evidence.savings_math`.
+* **Suppresses Money-Losing Cards (`min_card_net_monthly_usd`)**: automatically skips findings — and retires unsigned `PENDING_REVIEW` cards as `SUPERSEDED` — whenever ongoing maintenance costs exceed gross savings (`net < 0`), while preserving \$0 guardrail cards.
+* **Keeps the queue current**: unapproved cards that are detected again are re-priced in place (`refreshed`); unapproved legacy estimates that no longer hold up are retired as `SUPERSEDED` (`retired`).
 * **Inserts Change Sets**: New recommendations are created in state `PENDING_REVIEW`.
 
 ---
@@ -282,8 +285,14 @@ Launch the lightweight review server:
 ```
 Open **`http://localhost:8080`** in your browser.
 
+#### Toolbar Filters, Region Chips, Copilot & Settings:
+* **Multi-Dimension Filtering**: Filter recommendations across all tabs by **Min Value** (including an *Incl. money-losing* toggle), **Project**, **Dataset**, **Region** (dropdown with human-readable location names like `us-east4 · N. Virginia`, or click any region pill in the top **Watching N regions** bar), **Owner / Director**, **Confidence**, and **Optimization Class** (`Class 1..4`).
+* **PR Hand-Offs Tab (Class 4 SQL Rewrites)**: Approved Class 4 query rewrites move to **`PR_HANDED_OFF`** (`optimizer/executor/pr_handoff.py`) with a ready-to-open Git branch, SQL diff, and `gh pr create` command; once merged in Git, click **Mark PR merged** to start Day-14 savings verification.
+* **Settings, Setup Check & Run Scan Now (`/#settings`)**: Verify permissions with 14 read-only probes, edit everyday settings via live dropdowns, and click **▶ Run scan now** anytime to trigger a read-only refresh (`collect` → `rules`).
+* **Ask Gemini FinOps Copilot**: Click **Ask Gemini** in the top header to ask natural-language questions grounded in your live `optimizer_ops` queue and Director spend (`gemini-3.8-flash`).
+
 #### What Each Review Card Displays:
-* **Target Table**: e.g., `temi-project-408005.temi_telco_demo.fact_network_events`
+* **Target Asset & Region Badge**: e.g., `temi-project-408005.temi_telco_demo.fact_network_events` + color-coded `RegionBadge` (`us`, `us-east4 · N. Virginia`, etc.)
 * **Recommended Action**: e.g., `REPARTITION (MONTH on event_start_timestamp)` or `SET_CLUSTERING`
 * **Projected Monthly Savings**: Net dollar savings realized after factoring in write churn (e.g., `$30.00 / mo`)
 * **Safety Class & Route**: `Class 1 (In-Place DDL, Zero Downtime)` or `Class 3 (Safe Zero-Copy Rebuild)`

@@ -1,7 +1,7 @@
 # BigQuery Optimization Control Plane — Design Document
 
-**Status:** Draft v1 (merged design)
-**Date:** August 2026
+**Status:** Implemented Production Control Plane (v2 — Multi-Region, Cross-Project & In-App Governance)
+**Date:** August 2026 *(Updated November 2026 — see §14 for as-built production extensions)*
 **Scope:** Design for a recommendation → human approval → automated apply → verification system for BigQuery cost and performance optimization.
 
 ---
@@ -417,8 +417,40 @@ Anti-pattern tool output (scoped to top-N cost families) → rewrite proposal �
 ## 13. Risks, open questions, build-vs-buy
 
 - **Market.** DoiT (BigQuery Lens), Masthead Data, and adjacent FinOps vendors sell into this space, and Google keeps absorbing detection (recommenders, Gemini "Optimize"). The durable differentiator is not detection — it is **lineage-aware safe apply + verified savings attribution**. (Verify any competitor names/claims independently before customer-facing use.)
-- **Open questions for v1:** multi-region ops-dataset strategy; handling tables owned by external SaaS writers; BigLake/Iceberg (observe-only); how aggressively to backfill re-sorts on very large clustered tables (cost vs. benefit per table).
+- **Open questions for v1:** *(multi-region ops-dataset strategy resolved in §14.1)*; handling tables owned by external SaaS writers; BigLake/Iceberg (observe-only); how aggressively to backfill re-sorts on very large clustered tables (cost vs. benefit per table).
 - **Honest limitation:** savings estimates assume the last 30–90 days predict the future; `d_volatility` mitigates but does not eliminate this.
+
+---
+
+## 14. As-Built Production Extensions (Oct–Nov 2026)
+
+As built in `sql/` and `optimizer/`, `optimizer_ops` initializes **18 persistent tables** and **16 analytical/queue views** (cataloged in `docs/OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md` and `docs/BIGQUERY_TABLES_CATALOG.md`). Five architecture extensions were added beyond the initial v1 draft:
+
+### 14.1 Multi-Region & Cross-Project Courier (`optimizer/regions.py`, `optimizer/remote_collector.py`)
+- **Single-Location Master Dataset + Courier Pattern:** Because BigQuery queries cannot span locations, `optimizer_ops` resides in one home location (`location`, e.g., `US`). `sql/02_collector_run.sql` collects the host project in the home location, while `remote_collector.py` queries sibling projects in the home location plus all discovered projects in every remote region (`location=<region>`), uploads incremental deltas into short-lived staging tables `optimizer_ops._stg_*` (24-hour TTL), `MERGE`s them into the master tables (all keyed with `region` and `project_id`), and drops `_stg_*`. Zero datasets are created outside the home location.
+- **Automatic Region & Project Discovery (`optimizer_ops.regions_seen`):** With `regions: auto`, `regions.discover_with_projects` queries Cloud Asset Inventory (`bigquery.googleapis.com/Dataset` across `asset_scope`) on every run, upserts `regions_seen`, and raises `is_new_alert = TRUE` in the UI (`RegionsBar`: *"New region detected"*) whenever datasets appear in a new region.
+- **Org-Mode SQL Preview Hydration (`1b_query_previews`):** Because BigQuery omits `query` text from `JOBS_BY_ORGANIZATION`, `remote_collector.hydrate_query_previews` queries per-project `JOBS_BY_PROJECT` grouped by `(project_id, query_hash)` so clustering filter extraction and Class 4 SQL anti-pattern detection work org-wide.
+- **Fault-Isolated Storage & Least-Privilege Dry-Run:** `collect_table_state` tries `TABLE_STORAGE_BY_ORGANIZATION` first and falls back per project to `TABLE_STORAGE` (skipping unauthorized projects without aborting the run). For Engine 3 `dry_run=True` byte verification on sibling projects where `bqopt-sa` holds `metadataViewer` without `dataViewer`, `rules._dry_run_sql_with_schema_stubs` compiles rewritten SQL against typed empty schema stubs read from `INFORMATION_SCHEMA.COLUMNS`.
+- **Regional Execution & Filtering:** Executor applies/rollbacks run in each card's `target_region`, and the Review UI supports filtering across all tabs by **Region** (dropdown + clickable `RegionsBar` chips), **Project**, **Dataset**, **Owner**, **Confidence**, **Min Value**, and **Class**.
+
+### 14.2 Billing-Aware Pricing, Overlap Compounding & Money-Losing Guard (`optimizer/pricing.py`)
+- **Per-Job Billing Honesty (`v_reservation_rates`, `v_jobs_costed`):** On-demand jobs are priced at bytes × \$/TiB; reservation jobs at slot-hours × their reservation's actual edition/commitment rate (scaled by `pricing.reservation_savings_realization`). Multi-table reads split cost proportionally across referenced tables (`v_table_read_write_90d`).
+- **De-Overlapped Headline:** `pricing.deoverlap_total` compounds overlapping cards on the same spend pool (`50% + 50% = 75%`), sequences `W-01`/`W-02` against post-fix residual spend, and caps total compute savings at the last 30 days' actual compute bill.
+- **Money-Losing Suppression (`min_card_net_monthly_usd`):** `compiler.split_money_losing` skips findings and retires unsigned `PENDING_REVIEW` cards (`SUPERSEDED`) whose recurring cost exceeds gross savings (`net < 0`), while preserving \$0 guardrail cards.
+
+### 14.3 FinOps Gate, Workload-Aware `W-02` & Service-Account Ownership (`optimizer/governance.py`, `optimizer/attribution.py`)
+- **FinOps Separation:** Billing, commitment, reservation, and project-level rules (`W-01`, `W-02`, `C1-05`, `C1-06`, `C1-07`) live in a dedicated **FinOps & billing** tab gated by verified IAP JWT identity against `governance.finops_approvers` (HTTP 403 + executor defense-in-depth re-check).
+- **Proactive Cost Guardrail (`W-02`):** Classifies `jobs_events.user_email` to enforce a 50 GiB `@@maximum_bytes_billed` cap and 50-slot autoscaling pool on **human ad-hoc queries only**, keeping service accounts (`*.gserviceaccount.com`), Airflow, dbt, and Dataform production pipelines 100% exempt.
+- **Accountable Ownership Shims:** `employee_hierarchy` + `service_account_owners` (or external tables mapped via `v_employee_hierarchy_src` and `v_service_account_owners_src`) feed `v_principal_directory`, `v_unmapped_service_accounts`, `v_spend_by_director`, and `v_director_recommendations` (`SA → human owner → Director`).
+
+### 14.4 Tri-Engine Class 4 SQL Pipeline & PR Hand-Off (`optimizer/rules.py`, `optimizer/executor/pr_handoff.py`)
+- Combines **Engine 1** (deterministic regex rewriters `C4-01..C4-09`), **Engine 2** (bundled Google ZetaSQL AST `.jar`), and **Engine 3** (Vertex AI **`gemini-3.8-flash`**, `location="global"`, verified via `dry_run=True` byte-reduction checks).
+- Approved `CI_PULL_REQUEST` cards transition to **`PR_HANDED_OFF`** (`pr_handoff.py`) with a generated Git branch, rewritten SQL artifact, and `gh pr create` command; clicking **Mark PR merged** in the UI transitions the card to `APPLIED` → `VERIFYING`.
+
+### 14.5 In-App Settings, Schema Self-Heal & Zero-Paste Cloud Shell Installer
+- **In-App Settings (`optimizer_ops.settings_changes`):** `/#settings` exposes a 14-probe read-only **Setup check** (`setup_check.py`), live schema/region/email dropdown editors (`settings_options.py`), append-only audit history with 1-click **Undo** (`settings_store.py`, read by both Flask and `optimizer.cli`), and a read-only **▶ Run scan now** trigger (`scan_runner.py`).
+- **Automatic Schema Self-Heal (`optimizer/schema_guard.py`):** Stamps a DDL content hash (`schema_version`) on `v_jobs_costed` and automatically re-runs idempotent `init` whenever views or tables change across deployments.
+- **Zero-Paste Installer & Safe Window Cadence (`scripts/install.sh`, `.deploystack/`):** Launches via `gcr.io/ds-artifacts-cloudshell/deploystack_custom_image` with an interactive `↑`/`↓` project picker, `BatchEnable` API provisioning, Direct Cloud Run `--iap`, and `bqopt-nightly-schedule` firing at **`03:00 UTC` (`0 3 * * *`)** inside `change_window_utc: [3, 9]` (while any manual `execute` outside the window raises `OutsideChangeWindow` and safely defers `APPROVED` cards to the next window).
 
 ---
 

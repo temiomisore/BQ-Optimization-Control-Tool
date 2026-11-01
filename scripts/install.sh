@@ -1056,15 +1056,15 @@ PY
     ok "Enabled BigQuery TABLE_STORAGE size views in: ${_enabled_storage_regions[*]}"
   fi
 
-  # ---- Step 7: Nightly Cloud Scheduler (02:00 UTC) ---------------------------
-  step "[7/7] Scheduling automatic nightly scans (02:00 UTC)..."
+  # ---- Step 7: Nightly Cloud Scheduler (03:00 UTC, inside [3, 9] window) -----
+  step "[7/7] Scheduling automatic nightly scans (03:00 UTC)..."
 
   local _scheduler_uri="https://${RUN_REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB_NAME}:run"
   if gcloud scheduler jobs describe "$SCHEDULER_NAME" --project="$PROJECT_ID" --location="$RUN_REGION" --quiet >/dev/null 2>&1; then
     gcloud scheduler jobs update http "$SCHEDULER_NAME" \
       --project="$PROJECT_ID" \
       --location="$RUN_REGION" \
-      --schedule="0 2 * * *" \
+      --schedule="0 3 * * *" \
       --time-zone="Etc/UTC" \
       --uri="$_scheduler_uri" \
       --http-method=POST \
@@ -1074,7 +1074,7 @@ PY
     gcloud scheduler jobs create http "$SCHEDULER_NAME" \
       --project="$PROJECT_ID" \
       --location="$RUN_REGION" \
-      --schedule="0 2 * * *" \
+      --schedule="0 3 * * *" \
       --time-zone="Etc/UTC" \
       --uri="$_scheduler_uri" \
       --http-method=POST \
@@ -1082,7 +1082,7 @@ PY
       --description="Nightly BigQuery Optimization Control Plane run (collect -> rules -> execute approved -> verify)" \
       --quiet >/dev/null
   fi
-  ok "Scheduled ${SCHEDULER_NAME} every night at 02:00 UTC."
+  ok "Scheduled ${SCHEDULER_NAME} every night at 03:00 UTC (inside 03:00-09:00 UTC change window)."
 
   if [[ "$RUN_FIRST_SCAN" == "true" ]]; then
     step "Starting your first BigQuery scan in the background..."

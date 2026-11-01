@@ -61,23 +61,34 @@ graph TD
   - `fact_subscriptions` (34,285 rows)
   - `potential_churn_customers` (51 rows)
 
-### Configuration Options (Config File vs. CLI Parameters):
-You have two flexible options to specify your target project and dataset:
+### Configuration Options (1-Click Browser UI, Config File, or CLI Flags):
+You have three flexible ways to configure your project, regions, and governance:
 
-#### Option A: Set defaults in `config.yaml`
+#### Option A: 1-Click Cloud Shell Install + In-App Settings (`/#settings` — Recommended)
+Deploy via the **Open in Cloud Shell** button in [`README.md`](../README.md), then open `<your-app-url>/#settings` to:
+- Run **Setup check** (14 read-only permission & region probes with copy-pasteable `gcloud` / `bq` fixes).
+- Pick **regions**, **query history source** (`JOBS` vs `JOBS_BY_ORGANIZATION`), **HR employee hierarchy table**, **service-account owner table**, **schema columns**, and **Gemini model (`gemini-3.8-flash`)** from live dropdowns (saved to `optimizer_ops.settings_changes` with 1-click Undo).
+- Click **▶ Run scan now** right in the browser.
+
+#### Option B: Set defaults in `config.yaml`
 ```yaml
 project_id: "<YOUR_PROJECT_ID>"
 location: "US"
 ops_dataset: "optimizer_ops"
-dry_run: false
+regions: auto
+asset_scope: "organizations/<YOUR_ORG_ID>"
+jobs_view: "JOBS_BY_ORGANIZATION"   # or "JOBS"
+demo_mode: false
 
 pricing:
-  on_demand_per_tb: 6.25
-  storage_active_logical_gb: 0.02
-  storage_active_physical_gb: 0.04
+  reservation_savings_realization: 1.0
+
+executor:
+  enable_class1: true
+  change_window_utc: [3, 9]
 ```
 
-#### Option B: Pass dynamic CLI parameters on the fly (No YAML editing needed!)
+#### Option C: Pass dynamic CLI parameters on the fly (No YAML editing needed!)
 You can pass flags directly to any CLI command to target specific projects, datasets, or locations:
 ```bash
 # Target a specific dataset directly via -d / --dataset:
@@ -99,19 +110,23 @@ python -m optimizer.cli rules --config /path/to/client_config.yaml
 ## 4. Step 1: Initialize the Control Plane (`optimizer_ops`)
 
 ### What is Happening?
-We create a dedicated, low-cost dataset called `optimizer_ops` inside the customer's project. This stores:
-1. `jobs_events`: Normalized history of query executions (slots, bytes billed, referenced tables).
-2. `change_sets`: The state machine table storing every proposed, approved, and applied change.
-3. `cost_watchdogs`: Registry of monitoring monitors for recurring-cost objects (e.g., Materialized Views).
-4. `v_pending_review`: The live view feeding the review app.
-5. `v_receipts`: The CFO proof receipt view showing Predicted vs. Realized dollar savings.
+We create a dedicated, low-cost dataset called `optimizer_ops` inside the customer's project with **18 persistent tables** and **16 analytical/queue views** (see [`OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md`](./OPTIMIZER_OPS_TABLES_SCHEMA_GUIDE.md)), automatically self-healed on code upgrades by `optimizer/schema_guard.py`:
+1. `jobs_events` & `jobs_hourly_slots`: Multi-region, project/org-wide query history (with hydrated SQL previews) and hourly slot concurrency.
+2. `table_state_daily`, `columns_daily`, `table_partitions_daily`, `dataset_state_daily`, `object_state_raw_daily`: Daily table, column, partition, dataset, reservation, and scheduled-query snapshots across all discovered projects & regions.
+3. `employee_hierarchy` & `service_account_owners` (+ `v_principal_directory`, `v_unmapped_service_accounts`, `v_spend_by_director`): Human & service-account → Director spend attribution.
+4. `regions_seen` & `settings_changes`: Cloud Asset Inventory region discovery (with new-region UI alerts) and append-only audit history for in-app `/#settings` edits.
+5. `change_sets`, `rule_accuracy`, `cost_watchdogs`: Recommendation state machine, `d_history` learning, and Class 2 recurring-cost watchdogs.
+6. `v_reservation_rates`, `v_jobs_costed`, `v_pending_review`, `v_approved_ready`, `v_receipts`: Billing-aware job pricing, Review UI queue, executor queue, and CFO proof receipts.
 
 ### How to Run:
 ```bash
 cd <repo-root>
 
-# 1. Initialize the dataset and tables
+# 1. Initialize the dataset, tables, and views (idempotent)
 python3 -m optimizer.cli init
+
+# 2. Verify read/write permissions & discovered regions
+python3 -m optimizer.cli check
 ```
 
 **Terminal Output:**
@@ -143,12 +158,13 @@ You can execute the collector script on demand with:
 python3 -m optimizer.cli collect
 ```
 *What this does:*
-1. Runs `sql/02_collector_run.sql` against BigQuery `INFORMATION_SCHEMA` to populate query traces into `optimizer_ops.jobs_events`.
-2. Calls the Datasets API to backfill storage billing models and Transfer Configs.
-3. Visits every other BigQuery location on the route (`regions: auto` discovers them with Cloud Asset Inventory): each region's `INFORMATION_SCHEMA` is queried in that region, and the rows are loaded and merged into the same `optimizer_ops` tables. Preview the route with `python3 -m optimizer.cli regions --no-record` (see the README section *Multi-region collection and automatic region discovery*).
+1. Runs `sql/02_collector_run.sql` against BigQuery `INFORMATION_SCHEMA` to populate query traces (`JOBS` or `JOBS_BY_ORGANIZATION`) and host-project snapshots into `optimizer_ops`.
+2. In `JOBS_BY_ORGANIZATION` mode (where BigQuery omits SQL text), step `1b_query_previews` (`optimizer/remote_collector.py`) hydrates normalized 1 KB SQL previews per `(project_id, query_hash)` from per-project `JOBS_BY_PROJECT`.
+3. Calls the Datasets & DTS APIs across discovered projects to backfill storage billing models (`LOGICAL` vs `PHYSICAL`) and scheduled queries.
+4. Visits sibling projects in the home location plus every remote BigQuery location (`regions: auto` discovers locations & projects with Cloud Asset Inventory and records `optimizer_ops.regions_seen`), loading via short-lived 24h `_stg_*` courier tables and `MERGE`ing into `optimizer_ops`. Preview the route with `python3 -m optimizer.cli regions --no-record`, or run `python3 -m optimizer.cli scan` to run `collect` + `rules` in one read-only command.
 
 #### Option B: Automated Nightly Collector (Production)
-In customer production environments, run `python3 -m optimizer.cli collect` nightly (for example at 2:00 AM) as a Cloud Run job triggered by Cloud Scheduler, like the other workers in `terraform/main.tf` (add `collect = { args = ["-m", "optimizer.cli", "collect"], schedule = "0 2 * * *" }` to `locals.jobs`).
+In customer production environments, `scripts/install.sh` automatically deploys `bqopt-nightly-pipeline` as a Cloud Run Job triggered nightly at **`03:00 UTC` (`0 3 * * *`)** by Cloud Scheduler (or, if using `terraform/main.tf` split jobs, add `collect = { args = ["-m", "optimizer.cli", "collect"], schedule = "0 3 * * *" }` to `locals.jobs`).
 
 > **Why not a BigQuery Scheduled Query?** A scheduled query runs in a single location, so scheduling `sql/02_collector_run.sql` directly only collects the home location (where `optimizer_ops` lives). That's fine only if all of your datasets are in one location.
 
@@ -205,8 +221,9 @@ Each recommendation card presents an unambiguous contract:
    ```
 
 ### Taking Action:
+- Operators can filter cards across **Min Value**, **Project**, **Dataset**, **Region** (dropdown or clickable pills in the top `RegionsBar`), **Owner / Director**, **Confidence**, and **Class**, or ask questions in **Ask Gemini** (`gemini-3.8-flash`).
 - When the engineer clicks **"Approve 👍"**:
-  - The control plane **freezes a pre-execution performance baseline** (last 30-day average bytes scanned per query).
+  - The control plane **freezes a pre-execution performance baseline** (last 28/30-day per-family query metrics).
   - Transitions state from `PENDING_REVIEW` $\to$ `APPROVED`.
 
 ---
@@ -214,13 +231,14 @@ Each recommendation card presents an unambiguous contract:
 ## 8. Step 5: Safe Execution with Production Guardrails
 
 ### What is Happening?
-When `execute` is called, the executor processes all `APPROVED` change sets:
-1. **Maintenance Window Check**: Ensures current time is within approved change windows.
+When `execute` is called, the executor processes all `APPROVED` change sets (dispatching DDL in each asset's `target_region`):
+1. **Maintenance Window Check (`change_window_utc`)**: Ensures current UTC hour is inside the approved change window (`03:00–09:00 UTC` by default). If `execute` is invoked outside the window, `OutsideChangeWindow` safely **defers** `APPROVED` cards for the next window rather than failing them.
 2. **Rate Limiting**: Enforces a maximum of 1 structural change per table per 7 days.
 3. **Execution Dispatch**:
-   - **Class 1 (In-Place DDL)**: Runs `ALTER TABLE` DDL directly with **zero downtime**.
+   - **Class 1 (In-Place DDL)**: Runs `ALTER TABLE` / `ALTER SCHEMA` DDL directly with **zero downtime**.
+   - **Class 2 (Additive)**: Creates Smart-Tuned Materialized Views (`max_staleness = INTERVAL '4' HOUR`) or Search Indexes and registers `cost_watchdogs`.
    - **Class 3 (Structural Rebuild)**: Runs the 10-stage Copy-Swap-Rebind state machine (`S0`–`S9`): checks streaming buffer, pauses DTS writers, preserves IAM bindings/RLS policies, validates `FARM_FINGERPRINT` checksums, executes an atomic 3-way table rename, and provides instant rollback.
-   - **Class 4 (Query Refactor)**: Emits a Pull Request payload for upstream dbt or Looker SQL repositories.
+   - **Class 4 (Query Refactor — `pr_handoff.py`)**: Transitions card to `PR_HANDED_OFF` with a Git branch, rewritten SQL file, and `gh pr create` command; clicking **Mark PR merged** in the UI transitions it to `APPLIED` $\to$ `VERIFYING`.
 4. **Active Assist Sync**: Marks the recommendation in Google Cloud Active Assist as `CLAIMED` / `SUCCEEDED`.
 
 ### How to Run:
@@ -287,35 +305,25 @@ To run this continuously in a customer environment without manual terminal inter
 
 ### Architecture for Automation:
 
-#### 🟢 Day 1 (One-Time Setup):
-Run once during initial onboarding to create the `optimizer_ops` dataset, schemas, and views:
+#### 🟢 Day 1 (1-Click Cloud Shell Setup or CLI `init`):
+Click **Open in Cloud Shell** in [`README.md`](../README.md) (which runs `scripts/install.sh` automatically) — or run `python -m optimizer.cli init` manually — to create `optimizer_ops` (**18 tables + 16 views**), deploy the IAP-protected Review UI, and wire the **▶ Run scan now** button on `<app-url>/#settings`.
+
+#### 🔄 Nightly Schedule (Automated on Cloud Scheduler + Cloud Run Jobs):
+`scripts/install.sh` provisions a unified nightly Cloud Run Job (`bqopt-nightly-pipeline`) triggered by Cloud Scheduler (`bqopt-nightly-schedule`) at **`03:00 UTC` (`0 3 * * *`)** — right inside the default `change_window_utc: [3, 9]` (`03:00–09:00 UTC`) maintenance window:
+
 ```bash
-python -m optimizer.cli init
+# Runs sequentially inside bqopt-nightly-pipeline at 03:00 UTC (loads saved /#settings overrides first):
+python -m optimizer.cli pipeline
+#   Step 1/4: collect  (multi-region + multi-project telemetry & hydrated SQL previews)
+#   Step 2/4: rules    (14 infra/billing rules + Tri-Engine Class 4 + money-losing filter)
+#   Step 3/4: execute  (applies human-APPROVED cards inside 03:00-09:00 UTC; Class 4 -> PR_HANDED_OFF)
+#   Step 4/4: verify   (checks Day-14 post-apply receipts + daily MV cost watchdogs)
 ```
 
-#### 🔄 Nightly Schedule (Automated on Cloud Scheduler / Cloud Run Jobs):
-Schedule two automated jobs to run off-peak:
+*(Alternatively, `terraform/main.tf` supports splitting `collect`, `rules`, `execute` (`30 3 * * *`), `verify` (`0 7 * * *`), and `sync-recommender` into separate Cloud Scheduler jobs.)*
 
-1. **Job 1: Nightly Telemetry Collection & Rules Engine (2:00 AM UTC)**:
-   ```bash
-   # 1. Pulls today's query jobs, table sizes, and Google Active Assist recommendations
-   python -m optimizer.cli collect
-   
-   # 2. Runs the Rules Engine & Honest Scoring to populate fresh cards in the Review UI
-   python -m optimizer.cli rules
-   ```
-
-2. **Job 2: Nightly Safe Executor & ROI Verifier (4:00 AM UTC - inside maintenance window)**:
-   ```bash
-   # 1. Safely applies all cards approved by human engineers during the day
-   python -m optimizer.cli execute
-   
-   # 2. Measures post-apply queries and generates verified CFO savings receipts
-   python -m optimizer.cli verify
-   ```
-
-3. **Weekly Review Meeting / Slack Notification**:
-   Engineers and FinOps leads open the Review UI at `http://<internal-iap-url>:8080` to review and approve pending cards.
+3. **Day-to-Day Browser Workflow**:
+   Engineers and FinOps leads open `https://<your-cloud-run-iap-url>` to filter cards by **Project / Dataset / Region / Owner**, tune settings in `/#settings`, trigger on-demand scans, and approve changes.
 
 ---
 

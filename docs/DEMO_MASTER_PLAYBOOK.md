@@ -32,7 +32,7 @@
 | **Class 3 (Structural Rebuild)** | `C3-05` | **Design Doc §5.3 & §9.4** | Cold Data GCS Parquet Export & Drop | `demo_ecommerce.temp_staging_inactive` | `DIRECT_GUARDED` (GCS Export) |
 | **Class 4 (Tri-Engine SQL)** | `C4-01..09` | **Design Doc §5.4 (Engine 1)** | Built-in Python Regex & Heuristic SQL Rewriter (`SELECT *`, `DATE()` wrap, `CROSS JOIN`, `NOT IN`, `ORDER BY`) | `jobs_events` Expensive Queries | `CI_PULL_REQUEST` |
 | **Class 4 (Tri-Engine SQL)** | `C4-AST-*` | **Design Doc §5.4 (Engine 2)** | Bundled Google Official ZetaSQL Java AST `.jar` Structural Analyzer (`Dual-Engine Verified`) | `jobs_events` Structural AST Traps | `CI_PULL_REQUEST` |
-| **Class 4 (Tri-Engine SQL)** | `C4-AI-*` | **Design Doc §5.4 (Engine 3)** | Vertex AI Gemini 2.5 Flash Schema-Aware SQL Judge + Live BigQuery `dry_run=True` Byte-Reduction Verifier | `jobs_events` Complex Semantic Queries | `CI_PULL_REQUEST` |
+| **Class 4 (Tri-Engine SQL)** | `C4-AI-*` | **Design Doc §5.4 (Engine 3)** | Vertex AI Gemini 3.8 Flash (`gemini-3.8-flash`) Schema-Aware SQL Judge + Live BigQuery `dry_run=True` Byte-Reduction Verifier | `jobs_events` Complex Semantic Queries | `CI_PULL_REQUEST` |
 
 ---
 
@@ -119,7 +119,7 @@ Open Chrome and navigate to:
   * **Why We Do It (Real-World Analogy):** Think of this as the dashboard on an airplane cockpit. It gives engineering managers, architects, and FinOps leads a clean visual web portal to see every optimization opportunity, reviewed and stack-ranked, with complete human-in-the-loop governance before anything touches BigQuery.
 
 * **🗣️ What You Say To The Customer (Speaker Notes):**
-  > *"Next, we launch our Web Review Application. In production, this UI is protected by Google IAP and SSO, giving engineering managers and lead architects a single pane of glass for human-in-the-loop governance before any change touches BigQuery."*
+  > *"Next, we launch our Web Review Application. In production, this UI deploys in one click behind Google Direct IAP, giving engineering managers and FinOps leads a single pane of glass — complete with **Project, Dataset, Region, Owner, Confidence, and Class filters**, an in-browser **Settings & Setup Check (`/#settings`)** with **Run scan now**, and an **Ask Gemini** Copilot (`gemini-3.8-flash`) — before any change touches BigQuery."*
 
 ---
 

@@ -413,6 +413,9 @@ exit 0
             self.assertIn("gcloud run jobs deploy bqopt-nightly-pipeline", calls_fresh)
             self.assertIn("@sha256:deadbeef", calls_fresh)
             self.assertIn("gcloud scheduler jobs create http bqopt-nightly-schedule", calls_fresh)
+            self.assertIn("--schedule=0 3 * * *", calls_fresh)
+            lo_hr, hi_hr = gen_cfg["executor"]["change_window_utc"]
+            self.assertTrue(lo_hr <= 3 < hi_hr, f"03:00 UTC schedule must fall inside change_window_utc={gen_cfg['executor']['change_window_utc']}")
 
             # --- 2) Redeploy flow (`service_exists` already true): prepare -> postbuild runs push + finalize ---
             open(log_file, "w", encoding="utf-8").close()
@@ -616,6 +619,54 @@ exit 0
             self.assertIn(f"docker build -t {expected_img} .", calls)
             self.assertIn(f"docker push {expected_img}", calls)
             self.assertIn(f"gcloud run deploy bqopt-review-ui --project=temi-reverse-etl-project --region=us-central1 --image={expected_img}", calls)
+            self.assertIn("--schedule=0 3 * * *", calls)
+
+    def test_execute_outside_change_window_defers_without_marking_failed(self):
+        import datetime as dt
+        from optimizer import cli
+        from optimizer.config import Config
+        from optimizer.executor import router
+
+        c = Config({
+            "project_id": "demo-proj-123",
+            "ops_dataset": "optimizer_ops",
+            "location": "US",
+            "governance": {"finops_approvers": [], "finops_rule_ids": []},
+            "executor": {
+                "enable_class1": True,
+                "enable_class2": False,
+                "enable_class3": False,
+                "change_window_utc": [3, 9],
+                "max_structural_changes_per_table_per_days": 7,
+            },
+        })
+        sample_card = {
+            "change_set_id": "cs-window-1",
+            "apply_class": 1,
+            "rule_ids": ["C1-01"],
+            "target_project": "demo-proj-123",
+            "target_dataset": "analytics",
+            "target_table": "orders",
+            "execution_route": "DIRECT_GUARDED",
+        }
+        transitions: list[tuple] = []
+
+        # 1) Outside window (02:00 UTC): card stays APPROVED (zero FAILED transitions).
+        fake_now_outside = dt.datetime(2026, 11, 2, 2, 5, tzinfo=dt.timezone.utc)
+        with mock.patch("optimizer.store.approved_ready", return_value=[sample_card]), \
+             mock.patch("optimizer.store.transition", side_effect=lambda *a, **kw: transitions.append((a, kw))), \
+             mock.patch("optimizer.executor.router.dt") as mock_dt:
+            mock_dt.datetime.now.return_value = fake_now_outside
+            mock_dt.timezone = dt.timezone
+            cli.cmd_execute(c)
+        self.assertEqual(transitions, [], "Outside change_window_utc must defer APPROVED cards, never mark FAILED")
+
+        # 2) Inside window (03:00 UTC — matching `0 3 * * *` scheduler): check_window succeeds.
+        fake_now_inside = dt.datetime(2026, 11, 2, 3, 2, tzinfo=dt.timezone.utc)
+        with mock.patch("optimizer.executor.router.dt") as mock_dt:
+            mock_dt.datetime.now.return_value = fake_now_inside
+            mock_dt.timezone = dt.timezone
+            router.check_window(c)  # no exception
 
 
 if __name__ == "__main__":

@@ -17,6 +17,10 @@ class Blocked(Exception):
     """Raised when a guardrail refuses an apply; message lands in state_history."""
 
 
+class OutsideChangeWindow(Blocked):
+    """Raised when execute runs outside change_window_utc; cards stay APPROVED for the next window."""
+
+
 def route(c: Config, target_dataset: str | None, finding: dict | None = None) -> tuple[str, str]:
     """Resolves execution route: CI_PULL_REQUEST for managed/code assets, DIRECT_GUARDED otherwise."""
     managed = set(c.get("iac_managed_datasets", []) or [])
@@ -88,7 +92,7 @@ def check_window(c: Config) -> None:
     lo, hi = c["executor"]["change_window_utc"]
     hour = dt.datetime.now(dt.timezone.utc).hour
     if not (lo <= hour < hi):
-        raise Blocked(f"outside change window {lo:02d}:00-{hi:02d}:00 UTC (now {hour:02d}:xx)")
+        raise OutsideChangeWindow(f"outside change window {lo:02d}:00-{hi:02d}:00 UTC (now {hour:02d}:xx)")
 
 
 def check_rate_limit(c: Config, cs: dict) -> None:
