@@ -21,15 +21,15 @@ import datetime as dt
 import re
 from typing import Callable
 
-from . import bq, regions
+from . import bq, regions, security
 from .config import Config
 
 OVERLAP = dt.timedelta(days=1)      # re-read the last day so jobs still RUNNING last time get final numbers
 CHUNK = dt.timedelta(days=1)        # default fetch window (config remote_fetch_chunk_hours); first-run backfills load day by day
 RETENTION_DAYS = 180                # INFORMATION_SCHEMA.JOBS* history limit
 _JOBS_VIEWS = {"JOBS", "JOBS_BY_PROJECT", "JOBS_BY_USER", "JOBS_BY_FOLDER", "JOBS_BY_ORGANIZATION"}
-_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_PROJECT_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+\Z")
+_PROJECT_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}\Z")
 
 
 # ----------------------------------------------------------------------------- pure helpers
@@ -57,22 +57,21 @@ def fetch_start(watermark: dt.datetime | None, now: dt.datetime, backfill_days: 
 
 
 def _src(region: str, project: str | None = None) -> str:
+    reg = security.validate_region(region)
     if project:
-        if not _PROJECT_RE.match(project):
-            raise ValueError(f"invalid project_id {project!r}")
-        return f"`{project}.region-{region}`.INFORMATION_SCHEMA"
-    return f"`region-{region}`.INFORMATION_SCHEMA"
+        proj = security.validate_project_id(project)
+        return f"`{proj}.region-{reg}`.INFORMATION_SCHEMA"
+    return f"`region-{reg}`.INFORMATION_SCHEMA"
 
 
 def _jobs_view(c: Config) -> str:
-    v = str(c.get("jobs_view") or "JOBS").upper()
-    if v not in _JOBS_VIEWS:
-        raise ValueError(f"unsupported jobs_view {v!r}")
-    return v
+    return security.validate_jobs_view(c.get("jobs_view") or "JOBS")
 
 
 def jobs_sql(region: str, jobs_view: str) -> str:
     """Mirror of collector step 1 (job events) for one region; params @start, @end."""
+    region = security.validate_region(region)
+    jobs_view = security.validate_jobs_view(jobs_view)
     org = jobs_view == "JOBS_BY_ORGANIZATION"   # org view has no query text or dml_statistics
     preview = "CAST(NULL AS STRING)" if org else "SUBSTR(query, 1, 1024)"
     dml = (["CAST(NULL AS INT64)"] * 3 if org else
@@ -103,6 +102,8 @@ def jobs_sql(region: str, jobs_view: str) -> str:
 
 def slots_sql(region: str, jobs_view: str) -> str:
     """Mirror of collector step 2 (hourly slot rollup), real values only; params @start, @end."""
+    region = security.validate_region(region)
+    jobs_view = security.validate_jobs_view(jobs_view)
     view = "JOBS_TIMELINE_BY_ORGANIZATION" if jobs_view == "JOBS_BY_ORGANIZATION" else "JOBS_TIMELINE"
     return f"""
       SELECT '{region}' AS region,
@@ -202,6 +203,9 @@ def columns_sql(region: str, project: str | None = None) -> str:
 
 def partitions_sql(region: str, project: str, dataset: str) -> str:
     """Mirror of collector step 5 for one dataset (PARTITIONS is dataset-scoped)."""
+    region = security.validate_region(region)
+    project = security.validate_project_id(project)
+    dataset = security.validate_dataset_id(dataset)
     return f"""
       SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region,
              '{project}' AS project_id, table_schema AS dataset_id, table_name AS table_id,
@@ -214,6 +218,7 @@ def partitions_sql(region: str, project: str, dataset: str) -> str:
 
 def datasets_sql(region: str, project: str | None = None) -> str:
     """Mirror of collector step 6 (storage_billing_model is backfilled by the driver)."""
+    region = security.validate_region(region)
     src = _src(region, project)
     return f"""
       SELECT CURRENT_DATE() AS snapshot_date, '{region}' AS region,
@@ -234,6 +239,7 @@ def datasets_sql(region: str, project: str | None = None) -> str:
 
 def objects_sql(region: str, kind: str, project: str | None = None) -> str:
     """Mirror of collector step 7 (raw-JSON snapshots) for one object kind."""
+    region = security.validate_region(region)
     src = _src(region, project)
     if kind == "TABLE_CONSTRAINT":
         return f"""
@@ -253,6 +259,8 @@ def objects_sql(region: str, kind: str, project: str | None = None) -> str:
 
 def reservations_sql(region: str, admin_project: str, kind: str) -> str:
     """Mirror of collector step 9 for one reservation-admin view."""
+    region = security.validate_region(region)
+    admin_project = security.validate_project_id(admin_project)
     view = {"RESERVATION": "RESERVATIONS", "ASSIGNMENT": "ASSIGNMENTS",
             "CAPACITY_COMMITMENT": "CAPACITY_COMMITMENTS"}[kind]
     return f"""
@@ -263,6 +271,8 @@ def reservations_sql(region: str, admin_project: str, kind: str) -> str:
 
 
 def recommendations_sql(region: str, recs_view: str) -> str:
+    region = security.validate_region(region)
+    recs_view = security.validate_recs_view(recs_view)
     return f"""
       SELECT recommendation_id, '{region}' AS region, recommender, subtype, project_id,
              description, state, last_updated_time,
@@ -273,6 +283,7 @@ def recommendations_sql(region: str, recs_view: str) -> str:
 
 
 def insights_sql(region: str) -> str:
+    region = security.validate_region(region)
     return f"""
       SELECT insight_id, '{region}' AS region, insight_type AS recommender, project_id, state,
              last_updated_time, TO_JSON_STRING(t) AS raw_json

@@ -7,14 +7,22 @@ terraform {
 }
 provider "google" { project = var.project_id }
 
-# --- identities: reader vs executor, never combined -------------------------
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+# --- identities: reader vs executor vs scheduler, strictly separated ---------
 resource "google_service_account" "collector" {
   account_id   = "bqopt-collector"
-  display_name = "bq-optimizer collector (read-only)"
+  display_name = "bq-optimizer collector & rules worker (read-only on customer data)"
 }
 resource "google_service_account" "executor" {
   account_id   = "bqopt-executor"
-  display_name = "bq-optimizer executor (scoped writes)"
+  display_name = "bq-optimizer executor (scoped DDL writes)"
+}
+resource "google_service_account" "scheduler" {
+  account_id   = "bqopt-scheduler"
+  display_name = "bq-optimizer Cloud Scheduler invoker"
 }
 
 locals {
@@ -23,7 +31,7 @@ locals {
     "roles/bigquery.metadataViewer",
     "roles/bigquery.resourceViewer",
     "roles/recommender.bigqueryPartitionClusterViewer",
-    "roles/aiplatform.user", # Required for Engine 3 (Vertex AI Gemini 2.5 Flash SQL Judge)
+    "roles/aiplatform.user", # Required for Engine 3 (Vertex AI Gemini 3.8 Flash SQL Judge)
   ]
 }
 resource "google_project_iam_member" "collector" {
@@ -39,6 +47,13 @@ resource "google_project_iam_member" "executor_jobs" {
   role    = "roles/bigquery.jobUser"
   member  = "serviceAccount:${google_service_account.executor.email}"
 }
+# Grant both collector and executor dataEditor on optimizer_ops dataset once created:
+# resource "google_bigquery_dataset_iam_member" "ops_writers" {
+#   for_each   = toset([google_service_account.collector.email, google_service_account.executor.email])
+#   dataset_id = "optimizer_ops"
+#   role       = "roles/bigquery.dataEditor"
+#   member     = "serviceAccount:${each.value}"
+# }
 # Example per-dataset grant — repeat per dataset the executor may touch:
 # resource "google_bigquery_dataset_iam_member" "executor_sales" {
 #   dataset_id = "sales"
@@ -46,10 +61,10 @@ resource "google_project_iam_member" "executor_jobs" {
 #   member     = "serviceAccount:${google_service_account.executor.email}"
 # }
 
-# --- Cloud Armor Web Application Firewall (WAF) Policy (OWASP Top 10 Protection) ---
+# --- Cloud Armor Web Application Firewall (WAF) Policy (attach to HTTPS LB backend) ---
 resource "google_compute_security_policy" "review_waf_policy" {
   name        = "bqopt-review-waf-policy"
-  description = "Cloud Armor WAF policy protecting Review UI against SQLi, XSS, and LFI"
+  description = "Cloud Armor WAF policy protecting Review UI against SQLi, XSS, and LFI (bind via google_compute_backend_service.security_policy)"
   rule {
     action   = "deny(403)"
     priority = 1000
@@ -71,13 +86,27 @@ resource "google_compute_security_policy" "review_waf_policy" {
   }
 }
 
-# --- review UI (behind IAP — wire an LB + IAP in front) ---------------------
+# --- review UI (behind Direct IAP or HTTPS LB + IAP + review_waf_policy) -----
 resource "google_cloud_run_v2_service" "review" {
   name     = "bqopt-review"
   location = var.region
   template {
-    service_account = google_service_account.executor.email
-    containers { image = var.image }
+    service_account = google_service_account.collector.email
+    containers {
+      image = var.image
+      env {
+        name  = "GOOGLE_CLOUD_PROJECT"
+        value = var.project_id
+      }
+      env {
+        name  = "BQOPT_LOCATION"
+        value = var.ops_location
+      }
+      env {
+        name  = "IAP_AUDIENCE"
+        value = "/projects/${data.google_project.current.number}/locations/${var.region}/services/bqopt-review"
+      }
+    }
   }
   ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
 }
@@ -85,11 +114,12 @@ resource "google_cloud_run_v2_service" "review" {
 # --- workers as Cloud Run jobs on schedules ---------------------------------
 locals {
   jobs = {
-    rules   = { args = ["-m", "optimizer.cli", "rules"],            schedule = "0 6 * * *" }
-    execute = { args = ["-m", "optimizer.cli", "execute"],          schedule = "30 3 * * *" } # inside change window
-    verify  = { args = ["-m", "optimizer.cli", "verify"],           schedule = "0 7 * * *" }
-    driver  = { args = ["-m", "optimizer.cli", "collect-backfill"], schedule = "30 5 * * *" }
-    syncrec = { args = ["-m", "optimizer.cli", "sync-recommender"], schedule = "0 8 * * *" }
+    collect = { args = ["-m", "optimizer.cli", "collect"],          schedule = "0 3 * * *",  writer = false }
+    rules   = { args = ["-m", "optimizer.cli", "rules"],            schedule = "20 3 * * *", writer = false }
+    execute = { args = ["-m", "optimizer.cli", "execute"],          schedule = "40 3 * * *", writer = true  } # inside [3, 9] UTC change window
+    verify  = { args = ["-m", "optimizer.cli", "verify"],           schedule = "0 7 * * *",  writer = false }
+    driver  = { args = ["-m", "optimizer.cli", "collect-backfill"], schedule = "30 5 * * *", writer = false }
+    syncrec = { args = ["-m", "optimizer.cli", "sync-recommender"], schedule = "0 8 * * *",  writer = false }
   }
 }
 resource "google_cloud_run_v2_job" "worker" {
@@ -98,14 +128,30 @@ resource "google_cloud_run_v2_job" "worker" {
   location = var.region
   template {
     template {
-      service_account = google_service_account.executor.email
+      service_account = each.value.writer ? google_service_account.executor.email : google_service_account.collector.email
       containers {
         image   = var.image
         command = ["python"]
         args    = each.value.args
+        env {
+          name  = "GOOGLE_CLOUD_PROJECT"
+          value = var.project_id
+        }
+        env {
+          name  = "BQOPT_LOCATION"
+          value = var.ops_location
+        }
       }
     }
   }
+}
+resource "google_cloud_run_v2_job_iam_member" "scheduler_invoker" {
+  for_each = local.jobs
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_job.worker[each.key].name
+  role     = "roles/run.jobsExecutor"
+  member   = "serviceAccount:${google_service_account.scheduler.email}"
 }
 resource "google_cloud_scheduler_job" "trigger" {
   for_each  = local.jobs
@@ -116,6 +162,6 @@ resource "google_cloud_scheduler_job" "trigger" {
   http_target {
     uri         = "https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/bqopt-${each.key}:run"
     http_method = "POST"
-    oauth_token { service_account_email = google_service_account.executor.email }
+    oauth_token { service_account_email = google_service_account.scheduler.email }
   }
 }

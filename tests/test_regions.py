@@ -161,22 +161,22 @@ class TestConform(unittest.TestCase):
 
 class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
     def test_extract_project_id_ignores_numeric_project_number(self):
-        # Cloud Asset Inventory's `project` field is numeric ("projects/377289738115");
+        # Cloud Asset Inventory's `project` field is numeric ("projects/123456789012");
         # the string project ID must come from `name` or `parentFullResourceName`.
         res_name = {
             "location": "US",
             "name": "//bigquery.googleapis.com/projects/analytics-prod-01/datasets/orders",
             "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/analytics-prod-01",
-            "project": "projects/377289738115",
+            "project": "projects/123456789012",
         }
         self.assertEqual(regions.extract_project_id(res_name), "analytics-prod-01")
         res_parent = {
             "location": "us-east4",
-            "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/altostrat.com:fin-mart",
+            "parentFullResourceName": "//cloudresourcemanager.googleapis.com/projects/example.com:fin-mart",
             "project": "projects/999888777",
         }
-        self.assertEqual(regions.extract_project_id(res_parent), "altostrat.com:fin-mart")
-        self.assertIsNone(regions.extract_project_id({"location": "US", "project": "projects/377289738115"}))
+        self.assertEqual(regions.extract_project_id(res_parent), "example.com:fin-mart")
+        self.assertIsNone(regions.extract_project_id({"location": "US", "project": "projects/123456789012"}))
 
     def test_projects_by_region(self):
         results = [
@@ -207,7 +207,7 @@ class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
         self.assertIn("`region-us-east4`.INFORMATION_SCHEMA.TABLE_STORAGE_BY_ORGANIZATION",
                       rc.org_storage_sql("us-east4"))
         with self.assertRaises(ValueError):
-            rc.table_state_sql("us-east4", True, project="377289738115")  # numeric project number rejected
+            rc.table_state_sql("us-east4", True, project="123456789012")  # numeric project number rejected
 
     def test_projects_for_region_modes_and_fallback(self):
         from unittest import mock
@@ -426,16 +426,17 @@ class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
         fetched_tables = []
 
         def fake_bq_query(_c, q, params=None, location=None):
-            if "INFORMATION_SCHEMA.TABLES" in q:
-                fetched_tables.append((q, params["tbl"]))
-                return [{"ddl": f"CREATE TABLE {params['tbl']} (id INT64);"}]
             if "INFORMATION_SCHEMA.COLUMNS" in q:
                 tbl = params["tbl"]
+                fetched_tables.append((q, tbl))
                 if tbl == "orders":
-                    return [{"column_name": "order_id", "data_type": "INT64"},
-                            {"column_name": "cust_id", "data_type": "INT64"}]
+                    return [{"column_name": "order_id", "data_type": "INT64",
+                             "is_partitioning_column": "NO", "clustering_ordinal_position": 1},
+                            {"column_name": "cust_id", "data_type": "INT64",
+                             "is_partitioning_column": "NO", "clustering_ordinal_position": None}]
                 if tbl == "customers":
-                    return [{"column_name": "id", "data_type": "INT64"}]
+                    return [{"column_name": "id", "data_type": "INT64",
+                             "is_partitioning_column": "NO", "clustering_ordinal_position": None}]
             return []
 
         with mock.patch.object(rules.bq, "query", fake_bq_query):

@@ -9,10 +9,28 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Iterable
 
-from . import bq
+from . import bq, governance
 from .config import Config
 
 Finding = dict[str, Any]
+
+
+class StateConflictError(ValueError):
+    """Raised when a state-machine transition is invalid for the change set's current state."""
+
+
+_ALLOWED_EXTRA_COLS = frozenset({
+    "progress_json",
+    "rollback_plan_json",
+    "verification_plan_json",
+    "verification_result_json",
+    "realized_over_predicted",
+    "applied_at",
+    "snooze_until",
+    "expires_at",
+    "rejection_reason",
+    "rejection_note",
+})
 
 REJECTION_SNOOZE_DAYS = {
     "BREAKS_PIPELINE": 90,
@@ -241,14 +259,39 @@ def insert(c: Config, sets: Iterable[Finding], actor: str = "rules-engine") -> i
 # Transitions
 # ---------------------------------------------------------------------------
 
+_ALLOWED_TRANSITIONS_FOR_ACTION: dict[str, frozenset[str]] = {
+    "approve": frozenset({"PENDING_REVIEW"}),
+    "reject": frozenset({"PENDING_REVIEW", "APPROVED", "PR_HANDED_OFF"}),
+    "unsnooze": frozenset({"REJECTED", "ROLLED_BACK", "FAILED", "EXPIRED"}),
+    "pr_merged": frozenset({"PR_HANDED_OFF"}),
+    "rollback": frozenset({"APPLIED", "VERIFYING", "VERIFIED", "REGRESSED"}),
+}
+
+
+def check_transition_allowed(cs: dict, action: str) -> None:
+    """Validate that `action` is legal for `cs`'s current state; raises StateConflictError if not."""
+    allowed = _ALLOWED_TRANSITIONS_FOR_ACTION.get(action)
+    if not allowed:
+        return
+    cur = str(cs.get("state") or "").strip().upper()
+    if cur not in allowed:
+        raise StateConflictError(
+            f"Action {action!r} is not valid when change set {cs.get('change_set_id')} is in state {cur!r} "
+            f"(allowed states: {', '.join(sorted(allowed))})"
+        )
+
+
 def transition(c: Config, change_set_id: str, new_state: str, actor: str,
-               note: str | None = None, extra: dict[str, Any] | None = None) -> None:
+               note: str | None = None, extra: dict[str, Any] | None = None,
+               *, where_states: Iterable[str] | None = None) -> None:
     sets = ["state = @state",
             ("state_history = ARRAY_CONCAT(state_history, "
              "[STRUCT(@state AS state, CURRENT_TIMESTAMP() AS `at`, @actor AS actor, @note AS note)])")]
     params: dict[str, Any] = {"id": change_set_id, "state": new_state,
                               "actor": actor, "note": note}
     for col, val in (extra or {}).items():
+        if col not in _ALLOWED_EXTRA_COLS:
+            raise ValueError(f"Unsupported change_sets column in transition: {col!r}")
         pname = f"x_{col}"
         if col.endswith("_usd") or col in ("realized_over_predicted",):
             sets.append(f"{col} = CAST(@{pname} AS NUMERIC)")
@@ -257,7 +300,12 @@ def transition(c: Config, change_set_id: str, new_state: str, actor: str,
         else:
             sets.append(f"{col} = @{pname}")
         params[pname] = val
-    bq.execute(c, f"UPDATE {_t(c)} SET {', '.join(sets)} WHERE change_set_id = @id", params)
+    where_clause = "WHERE change_set_id = @id"
+    if where_states is not None:
+        state_list = [str(s) for s in where_states]
+        where_clause += " AND state IN UNNEST(@where_states)"
+        params["where_states"] = state_list
+    bq.execute(c, f"UPDATE {_t(c)} SET {', '.join(sets)} {where_clause}", params)
 
 
 def set_selected_option(c: Config, change_set_id: str, option: int) -> None:
@@ -266,26 +314,45 @@ def set_selected_option(c: Config, change_set_id: str, option: int) -> None:
     cs = get(c, change_set_id)
     if not cs:
         return
+    if str(cs.get("state") or "") != "PENDING_REVIEW":
+        raise StateConflictError(
+            f"Cannot modify selected_option when change set {change_set_id} is in state {cs.get('state')!r}"
+        )
     change = bq.loads(cs.get("proposed_change_json")) or {}
     change["selected_option"] = int(option)
-    bq.execute(c, f"UPDATE {_t(c)} SET proposed_change_json = @p WHERE change_set_id = @id",
+    bq.execute(c, f"UPDATE {_t(c)} SET proposed_change_json = @p WHERE change_set_id = @id AND state = 'PENDING_REVIEW'",
                {"p": bq.dumps(change), "id": change_set_id})
 
 
 def approve(c: Config, change_set_id: str, principal: str, role: str = "approver",
             note: str | None = None) -> str:
     """Records an approval. For Class 3 changes, requires two-person approval per Design Doc §8
-    (Owner + Platform Admin) before transitioning state to APPROVED.
+    (Owner + Platform Admin) with two distinct principals before transitioning state to APPROVED.
     Returns 'APPROVED' if fully approved, or 'PARTIALLY_APPROVED' if awaiting 2nd signature."""
     cs = get(c, change_set_id)
     if not cs:
         raise ValueError(f"Change set {change_set_id} not found")
+    check_transition_allowed(cs, "approve")
 
-    cls = int(cs.get("apply_class") or 1)
+    norm_principal = str(principal or "").strip().lower()
+    if not norm_principal or "@" not in norm_principal:
+        raise ValueError(f"Valid human principal email required to approve {change_set_id}")
+
+    two_person = governance.requires_two_person_approval(cs)
     approvals = cs.get("approvals") or []
+    prior_principals = {
+        str((a or {}).get("principal") or "").strip().lower()
+        for a in approvals
+        if isinstance(a, dict) and str((a or {}).get("principal") or "").strip()
+    }
 
-    # Class 3 two-person approval enforcement
-    if cls == 3 and len(approvals) == 0:
+    if two_person and norm_principal in prior_principals:
+        raise StateConflictError(
+            f"Two-person approval requires two distinct principals; {principal} already signed {change_set_id}"
+        )
+
+    # Class 3 / two-person first signature
+    if two_person and len(prior_principals) == 0:
         actual_role = role if role != "approver" else "owner_approver"
         bq.execute(c, f"""
             UPDATE {_t(c)} SET
@@ -294,11 +361,17 @@ def approve(c: Config, change_set_id: str, principal: str, role: str = "approver
               state_history = ARRAY_CONCAT(state_history,
                   [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @p AS actor,
                           'First approval recorded (1/2). Awaiting platform signoff.' AS note)])
-            WHERE change_set_id = @id AND state = 'PENDING_REVIEW'""",
-            {"id": change_set_id, "p": principal, "role": actual_role})
+            WHERE change_set_id = @id AND state = 'PENDING_REVIEW'
+              AND ARRAY_LENGTH(COALESCE(approvals, [])) = 0""",
+            {"id": change_set_id, "p": norm_principal, "role": actual_role})
         return "PARTIALLY_APPROVED"
 
-    actual_role = role if role != "approver" else ("platform_approver" if cls == 3 else "approver")
+    actual_role = role if role != "approver" else ("platform_approver" if two_person else "approver")
+    distinct_guard = (
+        " AND NOT EXISTS (SELECT 1 FROM UNNEST(COALESCE(approvals, [])) a "
+        "WHERE LOWER(TRIM(a.principal)) = LOWER(TRIM(@p)))"
+        if two_person else ""
+    )
     bq.execute(c, f"""
         UPDATE {_t(c)} SET
           state = 'APPROVED',
@@ -308,22 +381,27 @@ def approve(c: Config, change_set_id: str, principal: str, role: str = "approver
           state_history = ARRAY_CONCAT(state_history,
               [STRUCT('APPROVED' AS state, CURRENT_TIMESTAMP() AS `at`, @p AS actor,
                       @note AS note)])
-        WHERE change_set_id = @id AND state = 'PENDING_REVIEW'""",
-        {"id": change_set_id, "p": principal, "role": actual_role,
-         "ttl": int(c["approval_ttl_days"]), "note": note or f"Approved by {principal}"})
+        WHERE change_set_id = @id AND state = 'PENDING_REVIEW'{distinct_guard}""",
+        {"id": change_set_id, "p": norm_principal, "role": actual_role,
+         "ttl": int(c["approval_ttl_days"]), "note": note or f"Approved by {norm_principal}"})
     return "APPROVED"
 
 
 def reject(c: Config, change_set_id: str, principal: str, reason: str, note: str | None) -> None:
     days = REJECTION_SNOOZE_DAYS.get(reason, 60)
-    transition(c, change_set_id, "REJECTED", principal, note, extra={
-        "rejection_reason": reason, "rejection_note": note,
-        "snooze_until": (dt.datetime.now(dt.timezone.utc)
-                         + dt.timedelta(days=days)).isoformat()})
+    transition(
+        c, change_set_id, "REJECTED", principal, note,
+        extra={
+            "rejection_reason": reason, "rejection_note": note,
+            "snooze_until": (dt.datetime.now(dt.timezone.utc)
+                             + dt.timedelta(days=days)).isoformat(),
+        },
+        where_states=("PENDING_REVIEW", "APPROVED", "PR_HANDED_OFF"),
+    )
 
 
 def unsnooze(c: Config, change_set_id: str, principal: str, note: str | None = None) -> None:
-    """Un-snoozes a rejected or rolled-back change set so it can be re-evaluated in the review queue.
+    """Un-snoozes a rejected, expired, failed, or rolled-back change set so it can be re-evaluated.
     Clears active approvals so the new review cycle requires fresh sign-off while preserving state_history."""
     bq.execute(c, f"""
         UPDATE {_t(c)} SET
@@ -333,7 +411,8 @@ def unsnooze(c: Config, change_set_id: str, principal: str, note: str | None = N
           state_history = ARRAY_CONCAT(state_history,
               [STRUCT('PENDING_REVIEW' AS state, CURRENT_TIMESTAMP() AS `at`, @p AS actor,
                       @note AS note)])
-        WHERE change_set_id = @id""",
+        WHERE change_set_id = @id
+          AND state IN ('REJECTED', 'ROLLED_BACK', 'FAILED', 'EXPIRED')""",
         {"id": change_set_id, "p": principal,
          "note": note or f"Un-snoozed by {principal} for re-evaluation"})
 

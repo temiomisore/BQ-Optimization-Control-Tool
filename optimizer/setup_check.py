@@ -15,13 +15,21 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import datetime as dt
+import re
 import time
 from typing import Any, Callable
 
-from . import bq, regions
+from . import bq, regions, security
 from .config import Config
 
 OK, WARN, FAIL, INFO, SKIP = "ok", "warn", "fail", "info", "skip"
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:\-@/]+\Z")
+_SAFE_TABLE_REF_RE = re.compile(r"^[A-Za-z0-9_.:\-$]+\Z")
+
+
+def _safe_token(v: str, fallback: str = "INVALID") -> str:
+    s = str(v or "").strip()
+    return s if _SAFE_TOKEN_RE.fullmatch(s) else fallback
 
 
 # ----------------------------------------------------------------------------- pure helpers
@@ -51,7 +59,8 @@ def short(err: Any, limit: int = 280) -> str:
 def member(who: str | None) -> str:
     if not who:
         return "serviceAccount:YOUR_SERVICE_ACCOUNT"
-    return ("serviceAccount:" if who.endswith(".gserviceaccount.com") else "user:") + who
+    clean = _safe_token(who, "YOUR_SERVICE_ACCOUNT")
+    return ("serviceAccount:" if clean.endswith(".gserviceaccount.com") else "user:") + clean
 
 
 def scope_kind(c: Config) -> tuple[str, str]:
@@ -70,20 +79,29 @@ def grant(scope: str, sid: str, who: str | None, role: str) -> str:
     """gcloud command that grants `role` to `who` on a project, folder or organization."""
     cmd = {"projects": "gcloud projects", "folders": "gcloud resource-manager folders",
            "organizations": "gcloud organizations"}[scope]
-    return f"{cmd} add-iam-policy-binding {sid} --member={member(who)} --role={role}"
+    safe_sid = _safe_token(sid, "YOUR_ID")
+    safe_role = _safe_token(role, "roles/viewer")
+    return f"{cmd} add-iam-policy-binding {safe_sid} --member={member(who)} --role={safe_role}"
 
 
 def grant_sql(kind: str, fqn: str, who: str | None, role: str) -> str:
     """BigQuery DCL that grants `role` on one dataset (SCHEMA) or TABLE."""
-    return f'GRANT `{role}` ON {kind} `{fqn}` TO "{member(who)}";'
+    if kind not in ("SCHEMA", "TABLE"):
+        raise security.SecurityValidationError(f"Invalid grant target kind: {kind!r}")
+    safe_fqn = str(fqn or "").strip("` ")
+    if not _SAFE_TABLE_REF_RE.fullmatch(safe_fqn):
+        safe_fqn = "INVALID_OBJECT"
+    safe_role = _safe_token(role, "roles/bigquery.dataViewer")
+    return f'GRANT `{safe_role}` ON {kind} `{safe_fqn}` TO "{member(who)}";'
 
 
 def bq_sql(project_id: str, sql: str, location: str | None = None) -> str:
     """Cloud Shell `bq query` command wrapping GoogleSQL in single quotes so Bash
     never evaluates backticks (`project`) or parentheses."""
-    loc = f" --location={location}" if location else ""
+    safe_proj = security.validate_project_id(project_id)
+    loc = f" --location={security.validate_region(location)}" if location else ""
     escaped = sql.replace("'", "'\"'\"'")
-    return f"bq --project_id={project_id}{loc} query --use_legacy_sql=false '{escaped}'"
+    return f"bq --project_id={safe_proj}{loc} query --use_legacy_sql=false '{escaped}'"
 
 
 def result(id: str, title: str, why: str, status: str, detail: str, fix: str | None = None,
@@ -189,7 +207,8 @@ def check_discovery(c: Config, ctx: dict, route: list[str], info: dict) -> dict:
 
 
 def check_query_history(c: Config, ctx: dict, region: str) -> dict:
-    view = str(c.get("jobs_view") or "JOBS").upper()
+    region = security.validate_region(region)
+    view = security.validate_jobs_view(c.get("jobs_view") or "JOBS")
     org = view.endswith("_BY_ORGANIZATION")
     title = f"Query history in {region}"
     why = ("Query history from every project in the organization (JOBS_BY_ORGANIZATION)." if org
@@ -205,33 +224,37 @@ def check_query_history(c: Config, ctx: dict, region: str) -> dict:
 
 
 def check_table_metadata(c: Config, ctx: dict, region: str) -> dict:
+    region = security.validate_region(region)
+    proj = security.validate_project_id(c["project_id"])
     title = f"Table details in {region}"
     why = "Table names, columns, partitioning and clustering power the table-level cards."
-    err = _probe(c, f"SELECT 1 AS ok FROM `{c['project_id']}.region-{region}`.INFORMATION_SCHEMA.TABLES LIMIT 1",
+    err = _probe(c, f"SELECT 1 AS ok FROM `{proj}.region-{region}`.INFORMATION_SCHEMA.TABLES LIMIT 1",
                  location=region)
     if err is None:
         return result(f"table_metadata:{region}", title, why, OK, f"Can read TABLES in {region}.", region=region)
     return result(f"table_metadata:{region}", title, why, FAIL,
                   short(err) + " (Basic Owner/Viewer roles don't include table metadata.)",
-                  grant("projects", c["project_id"], ctx.get("who"), "roles/bigquery.metadataViewer"),
+                  grant("projects", proj, ctx.get("who"), "roles/bigquery.metadataViewer"),
                   region=region)
 
 
 def check_table_storage(c: Config, ctx: dict, region: str) -> dict:
+    region = security.validate_region(region)
+    proj = security.validate_project_id(c["project_id"])
     title = f"Table sizes in {region}"
     why = "Table sizes (TABLE_STORAGE) price the storage cards. Without them the tool keeps going but skips sizes."
-    err = _probe(c, f"SELECT 1 AS ok FROM `{c['project_id']}.region-{region}`.INFORMATION_SCHEMA.TABLE_STORAGE LIMIT 1",
+    err = _probe(c, f"SELECT 1 AS ok FROM `{proj}.region-{region}`.INFORMATION_SCHEMA.TABLE_STORAGE LIMIT 1",
                  location=region)
     if err is None:
         return result(f"table_storage:{region}", title, why, OK, f"TABLE_STORAGE is on in {region}.", region=region)
     if classify(err) == "not_enabled":
         proj_cmd = bq_sql(
-            c["project_id"],
-            f"ALTER PROJECT `{c['project_id']}` SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
+            proj,
+            f"ALTER PROJECT `{proj}` SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
             location=region,
         )
         org_cmd = bq_sql(
-            c["project_id"],
+            proj,
             f"ALTER ORGANIZATION SET OPTIONS (`region-{region}.enable_info_schema_storage` = TRUE);",
             location=region,
         )
@@ -241,11 +264,12 @@ def check_table_storage(c: Config, ctx: dict, region: str) -> dict:
                       f"{proj_cmd}\n# Or for every project in your organization at once:\n# {org_cmd}",
                       region=region)
     return result(f"table_storage:{region}", title, why, WARN, short(err),
-                  grant("projects", c["project_id"], ctx.get("who"), "roles/bigquery.metadataViewer"), region=region)
+                  grant("projects", proj, ctx.get("who"), "roles/bigquery.metadataViewer"), region=region)
 
 
 def check_recommendations(c: Config, ctx: dict, region: str) -> dict:
-    view = str(c.get("recs_view") or "RECOMMENDATIONS").upper()
+    region = security.validate_region(region)
+    view = security.validate_recs_view(c.get("recs_view") or "RECOMMENDATIONS")
     title = f"Google's recommendations in {region}"
     why = "Google's own partition/cluster recommendations are merged into the cards (optional)."
     err = _probe(c, f"SELECT 1 AS ok FROM `region-{region}`.INFORMATION_SCHEMA.{view} LIMIT 1", location=region)
@@ -262,7 +286,8 @@ def check_recommendations(c: Config, ctx: dict, region: str) -> dict:
 
 
 def check_reservations(c: Config, ctx: dict, region: str) -> dict:
-    admin = c.get("reservation_admin_project")
+    region = security.validate_region(region)
+    admin = security.validate_project_id(c.get("reservation_admin_project"))
     title = f"Reservations in {region}"
     why = f"Slot reservations in {admin} price reservation jobs at their edition's slot rate."
     err = _probe(c, f"SELECT 1 AS ok FROM `{admin}.region-{region}`.INFORMATION_SCHEMA.RESERVATIONS LIMIT 1",
@@ -312,7 +337,7 @@ def check_transfers(c: Config, ctx: dict) -> dict:
 
 
 def check_cross_project(c: Config, ctx: dict) -> dict:
-    home = regions.home_region(c)
+    home = security.validate_region(regions.home_region(c))
     title = "Table details across all projects (org)"
     why = ("Reads table sizes across every project in the organization in one query "
            "(optional: falls back to per-project table views automatically).")

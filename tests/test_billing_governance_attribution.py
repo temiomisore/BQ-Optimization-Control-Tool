@@ -310,12 +310,13 @@ class TestVerifierBillingAware(unittest.TestCase):
 # Fix #1: FinOps view + server-side permission check
 # ---------------------------------------------------------------------------
 
-GOV = {"governance": {"finops_approvers": ["Shawn.Stark@example.com", "finops.lead@example.com"],
+GOV = {"governance": {"finops_approvers": ["FinOps.Director@example.com", "finops.lead@example.com"],
                       "trust_client_identity": False}}
 GOV_DEMO = {"governance": dict(GOV["governance"], trust_client_identity=True)}
 W01 = {"rule_ids": ["W-01"], "target_project": "p", "target_dataset": "PROJECT_WIDE_BILLING",
        "target_table": None}
-TABLE_CARD = {"rule_ids": ["C1-01"], "target_project": "p", "target_dataset": "d", "target_table": "t"}
+TABLE_CARD = {"rule_ids": ["C1-01"], "target_project": "p", "target_dataset": "d", "target_table": "t",
+              "owner_principal": "analyst@example.com"}
 
 
 class TestGovernance(unittest.TestCase):
@@ -331,7 +332,7 @@ class TestGovernance(unittest.TestCase):
             {"rule_ids": ["C4-01"], "target_dataset": "queries", "target_table": "h"}, GOV))
 
     def test_finops_viewer_requires_trusted_identity(self):
-        iap = {"email": "shawn.stark@example.com", "source": governance.SOURCE_IAP}
+        iap = {"email": "finops.director@example.com", "source": governance.SOURCE_IAP}
         self.assertTrue(governance.is_finops_viewer(iap, GOV))         # case-insensitive match
         self.assertFalse(governance.is_finops_viewer(dict(iap, email="analyst@example.com"), GOV))
         client = {"email": "finops.lead@example.com", "source": governance.SOURCE_CLIENT}

@@ -18,7 +18,7 @@ if sys.prefix == sys.base_prefix:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from optimizer import bq, store
+from optimizer import bq, security, store
 from optimizer.config import cfg
 
 def create_pr(change_set_id: str, repo: str | None = None) -> None:
@@ -30,12 +30,17 @@ def create_pr(change_set_id: str, repo: str | None = None) -> None:
     ev = bq.loads(cs.get("evidence_json")) or {}
     prop = bq.loads(cs.get("proposed_change_json")) or {}
     
-    q_hash = ev.get("query_hash") or cs.get("target_table") or "query_rewrite"
+    raw_hash = ev.get("query_hash") or cs.get("target_table") or "query_rewrite"
+    q_slug = security.safe_slug(raw_hash, fallback="query_rewrite", max_len=40)
     rule_ids = cs.get("rule_ids") or ["C4-01"]
-    rule_code = rule_ids[0] if isinstance(rule_ids, list) and rule_ids else "C4-01"
+    raw_rule = rule_ids[0] if isinstance(rule_ids, list) and rule_ids else "C4-01"
+    rule_code = security.sanitize_log_value(raw_rule, max_len=32) or "C4-01"
+    ds_slug = security.safe_slug(cs.get("target_dataset") or "queries", fallback="queries", max_len=64)
     
-    branch = f"bq-optimizer/{rule_code.lower()}-{q_hash[:12]}"
-    file_path = f"models/analytics/{cs.get('target_dataset', 'queries')}/{q_hash}.sql"
+    branch = f"bq-optimizer/{security.safe_slug(rule_code, fallback='c4-01', max_len=32)}-{q_slug[:12]}"
+    rel_sub = f"{ds_slug}/{q_slug}.sql"
+    security.ensure_relative_subpath("models/analytics", rel_sub)
+    file_path = f"models/analytics/{rel_sub}"
     
     before_sql = ev.get("sample_preview") or cs.get("current_config_ddl") or "SELECT * FROM dataset.table;"
     after_sql = prop.get("generated_ddl") or ev.get("underlying_sql") or "-- Optimized SQL"

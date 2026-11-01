@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from .. import attribution, store
+from .. import attribution, security, store
 from ..config import Config
 
 
@@ -57,12 +57,14 @@ def resolve_owner(c: Config, finding: dict, sa_owners: dict | None = None) -> tu
     the service-account owner table (sa_owners, see optimizer/attribution.py); an unmapped
     service account is never treated as an owner.
     Returns (owner_principal, owner_source)."""
-    # 1. Table label
+    # 1. Table label (BigQuery label values are [a-z0-9_-]{0,63}, sanitized for defense in depth)
     labels = finding.get("evidence", {}).get("labels") or finding.get("proposed_change", {}).get("labels") or {}
     if isinstance(labels, dict):
         for k in ("owner", "data_owner", "team", "contact"):
             if k in labels and labels[k]:
-                return str(labels[k]), "LABEL"
+                clean_lbl = security.sanitize_log_value(labels[k], max_len=120)
+                if clean_lbl:
+                    return clean_lbl, "LABEL"
 
     # 2. IaC CODEOWNERS (if managed by IaC or Class 4)
     route_name, _ = route(c, finding.get("target_dataset"), finding)

@@ -269,11 +269,11 @@ CREATE TABLE IF NOT EXISTS optimizer_ops.employee_hierarchy (
   updated_at        TIMESTAMP
 );
 
--- Seed default enterprise hierarchy for demonstration and testing if empty
+-- Seed synthetic example hierarchy rows for local evaluation if empty
 MERGE optimizer_ops.employee_hierarchy T
 USING (
-  SELECT 'admin@temiomisore.altostrat.com' AS user_email, 'Temitope Omisore' AS user_name, 'Platform Infrastructure' AS department, 'cameron@google.com' AS manager_email, 'alex.vance@company.com' AS director_email, 'Alex Vance (VP of Data Platform)' AS director_name, 'CC-101' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
-  SELECT 'temiomisore@google.com' AS user_email, 'Temitope Omisore' AS user_name, 'Platform Infrastructure' AS department, 'cameron@google.com' AS manager_email, 'alex.vance@company.com' AS director_email, 'Alex Vance (VP of Data Platform)' AS director_name, 'CC-101' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
+  SELECT 'finops-lead@company.com' AS user_email, ' Morgan Patel' AS user_name, 'Platform FinOps' AS department, 'vp-finance@company.com' AS manager_email, 'alex.vance@company.com' AS director_email, 'Alex Vance (VP of Data Platform)' AS director_name, 'CC-101' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
+  SELECT 'alice-owner@company.com' AS user_email, 'Alice Rivera' AS user_name, 'Platform Infrastructure' AS department, 'vp-infra@company.com' AS manager_email, 'alex.vance@company.com' AS director_email, 'Alex Vance (VP of Data Platform)' AS director_name, 'CC-101' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
   SELECT 'data-eng-lead@company.com' AS user_email, 'Jordan Taylor' AS user_name, 'Data Engineering' AS department, 'vp-data@company.com' AS manager_email, 'vp-data@company.com' AS director_email, 'Riley Chen (Director of Data Engineering)' AS director_name, 'CC-202' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
   SELECT 'platform-eng@company.com' AS user_email, 'Casey Morgan' AS user_name, 'Data Engineering' AS department, 'vp-data@company.com' AS manager_email, 'vp-data@company.com' AS director_email, 'Riley Chen (Director of Data Engineering)' AS director_name, 'CC-202' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL
   SELECT 'marketing-analyst@company.com' AS user_email, 'Jane Doe' AS user_name, 'Marketing Analytics' AS department, 'david.smith@company.com' AS manager_email, 'david.smith@company.com' AS director_email, 'David Smith (Director of Marketing)' AS director_name, 'CC-303' AS cost_center, CURRENT_TIMESTAMP() AS updated_at UNION ALL

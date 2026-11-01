@@ -55,6 +55,9 @@ _DEFAULTS: dict[str, Any] = {
         # Who may change settings from the review UI's Settings page and add / remove editors.
         # Deploy-time only (never editable in the UI). Env BQOPT_SETTINGS_ADMINS adds emails.
         "settings_admins": [],
+        # Who may approve Engineering optimization cards across all tables/datasets.
+        # Deploy-time only. Env BQOPT_ENGINEERING_APPROVERS adds comma-separated emails.
+        "engineering_approvers": [],
     },
     "executor": {
         "enable_class1": True,
@@ -130,6 +133,8 @@ def _set_dotted(d: dict, dotted: str, value: Any) -> None:
 def _finish(merged: dict, overrides: dict) -> dict:
     """Environment variables, keyword overrides, project resolution and normalisation."""
     # Apply environment variable overrides if present
+    if os.environ.get("BQOPT_OPS_DATASET"):
+        merged["ops_dataset"] = os.environ["BQOPT_OPS_DATASET"]
     if os.environ.get("BQOPT_JOBS_VIEW"):
         merged["jobs_view"] = os.environ["BQOPT_JOBS_VIEW"]
     if os.environ.get("BQOPT_RESERVATION_ADMIN_PROJECT"):
@@ -176,6 +181,13 @@ def _finish(merged: dict, overrides: dict) -> dict:
             pass
     if "project_id" not in merged or not merged["project_id"]:
         raise SystemExit("config.yaml (or --project / GOOGLE_CLOUD_PROJECT) must set project_id")
+    from . import governance, security
+    merged["project_id"] = security.validate_project_id(merged["project_id"])
+    merged["ops_dataset"] = security.validate_dataset_id(merged.get("ops_dataset") or "optimizer_ops")
+    if not governance.allow_demo_mode_in_env():
+        merged["demo_mode"] = False
+        if isinstance(merged.get("governance"), dict):
+            merged["governance"] = dict(merged["governance"], trust_client_identity=False)
     # yaml reads risk_weights keys as ints already; normalise anyway
     merged["risk_weights"] = {int(k): float(v) for k, v in merged["risk_weights"].items()}
     return merged
@@ -187,6 +199,14 @@ def cfg(path: str | None = None, *, ui: bool = True, **overrides: Any) -> Config
     if os.path.exists(path):
         with open(path) as f:
             user = yaml.safe_load(f) or {}
+    if os.environ.get("BQOPT_CONFIG_JSON"):
+        try:
+            import json
+            env_base = json.loads(os.environ["BQOPT_CONFIG_JSON"])
+            if isinstance(env_base, dict):
+                user = _merge(user, env_base)
+        except Exception:
+            pass
     merged = _merge(_DEFAULTS, user)
     if ui and _UI_SETTINGS is not None:
         # Find this deployment's project / dataset first, then layer the UI-saved values on top

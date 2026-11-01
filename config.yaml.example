@@ -60,8 +60,10 @@ pricing:
 # FinOps / governance: billing, commitment, reservation and project-level cards are visible
 # to and approvable by these approvers only (server-side 403 + executor re-check).
 governance:
-  finops_approvers: []                     # e.g. [shawn.stark@example.com, finops-team@example.com]
+  finops_approvers: []                     # e.g. [finops.director@example.com, finops-team@example.com]
                                            # empty = nobody (fail closed); env BQOPT_FINOPS_APPROVERS adds more
+  engineering_approvers: []                # optional extra engineering approvers (env BQOPT_ENGINEERING_APPROVERS);
+                                           # card owners/directors, settings editors & admins can also approve engineering cards
   trust_client_identity: false             # keep false in production
   # Put the review app behind IAP and set its audience; only IAP-verified emails are trusted.
   # Cloud Run + IAP: "/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME"

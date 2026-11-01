@@ -292,7 +292,7 @@ Open **`http://localhost:8080`** in your browser.
 * **Ask Gemini FinOps Copilot**: Click **Ask Gemini** in the top header to ask natural-language questions grounded in your live `optimizer_ops` queue and Director spend (`gemini-3.8-flash`).
 
 #### What Each Review Card Displays:
-* **Target Asset & Region Badge**: e.g., `temi-project-408005.temi_telco_demo.fact_network_events` + color-coded `RegionBadge` (`us`, `us-east4 · N. Virginia`, etc.)
+* **Target Asset & Region Badge**: e.g., `my-analytics-project.customer_telco.fact_network_events` + color-coded `RegionBadge` (`us`, `us-east4 · N. Virginia`, etc.)
 * **Recommended Action**: e.g., `REPARTITION (MONTH on event_start_timestamp)` or `SET_CLUSTERING`
 * **Projected Monthly Savings**: Net dollar savings realized after factoring in write churn (e.g., `$30.00 / mo`)
 * **Safety Class & Route**: `Class 1 (In-Place DDL, Zero Downtime)` or `Class 3 (Safe Zero-Copy Rebuild)`
@@ -300,9 +300,9 @@ Open **`http://localhost:8080`** in your browser.
 * **Impacted Team & Query Volume**: e.g., `4 analysts running 145 queries`
 * **⚡ Full Underlying BigQuery DDL / Execution SQL**:
   ```sql
-  CREATE OR REPLACE TABLE `temi-project-408005.temi_telco_demo.fact_network_events`
+  CREATE OR REPLACE TABLE `my-analytics-project.customer_telco.fact_network_events`
   PARTITION BY TIMESTAMP_TRUNC(event_start_timestamp, MONTH)
-  AS SELECT * FROM `temi-project-408005.temi_telco_demo.fact_network_events`;
+  AS SELECT * FROM `my-analytics-project.customer_telco.fact_network_events`;
   ```
   *(Engineers can copy this DDL directly or inspect its syntax before granting approval).*
 

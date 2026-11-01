@@ -44,7 +44,11 @@ _READY: set[tuple] = set()
 
 
 def _key(c: Mapping) -> tuple:
-    return (c["project_id"], c.get("ops_dataset") or "optimizer_ops")
+    from . import security
+    return (
+        security.validate_project_id(c["project_id"]),
+        security.validate_dataset_id(c.get("ops_dataset") or "optimizer_ops"),
+    )
 
 
 def _ops(c: Mapping) -> str:
@@ -86,10 +90,18 @@ def current(c: Mapping, fresh: bool = False) -> dict[str, dict]:
 
 
 def provider(probe: Mapping) -> dict[str, Any]:
-    """For config.use_ui_settings(): saved values of UI-editable settings only, so a row
-    written outside the app can never flip a safety switch."""
-    from .settings_catalog import EDITABLE_KEYS
-    return {k: v["value"] for k, v in current(probe).items() if k in EDITABLE_KEYS}
+    """For config.use_ui_settings(): saved values of UI-editable settings only, re-validated
+    against settings_catalog.validate() so tampered/stale DB rows can never inject unsafe SQL/config."""
+    from .settings_catalog import EDITABLE_KEYS, validate
+    out: dict[str, Any] = {}
+    for k, v in current(probe).items():
+        if k not in EDITABLE_KEYS:
+            continue
+        try:
+            out[k] = validate(k, v["value"], probe)
+        except Exception:
+            continue
+    return out
 
 
 def editors(c: Mapping) -> list[str]:

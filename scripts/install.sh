@@ -18,7 +18,7 @@
 #   4. Writes config.yaml with safe production guardrails & makes YOU Settings Admin
 #   5. Deploys the Web UI to Cloud Run protected by Direct Identity-Aware Proxy (IAP)
 #   6. Deploys the Nightly Pipeline Cloud Run Job + initializes optimizer_ops in BigQuery
-#   7. Schedules automatic nightly scans at 02:00 UTC via Cloud Scheduler
+#   7. Schedules automatic nightly scans at 03:00 UTC via Cloud Scheduler
 #
 # Usage:
 #   ./scripts/install.sh --prompt-project --yes
@@ -46,8 +46,9 @@ SERVICE_NAME="bqopt-review-ui"
 JOB_NAME="bqopt-nightly-pipeline"
 SCHEDULER_NAME="bqopt-nightly-schedule"
 SA_NAME="bqopt-sa"
-ALLOW_DOMAIN="auto"       # auto = allow corporate @domain.com on IAP, skip consumer domains
+ALLOW_DOMAIN="false"      # explicit opt-in via --allow-domain to grant @domain.com IAP access
 ENABLE_IAP="true"
+ALLOW_NO_IAP="false"      # fail closed if --iap fails unless --allow-no-iap is explicitly set
 ASSUME_YES="false"
 PROMPT_PROJECT="false"
 RUN_FIRST_SCAN="false"
@@ -71,7 +72,8 @@ Options:
   --finops=EMAIL[,EMAIL...]        FinOps approver email(s) (default: Settings Admin email)
   --reservation-project=PROJECT    Optional BigQuery reservation admin project ID
   --allow-domain / --no-allow-domain
-                                   Let colleagues in your corporate email domain sign into the UI
+                                   Let colleagues in your corporate email domain sign into the UI (default: off)
+  --allow-no-iap                   Permit fallback to Cloud Run IAM-only if Direct IAP is blocked by org policy
   --run-first-scan                 Kick off the first BigQuery scan automatically after deploy
   --image=IMAGE_URI                Deploy from a pre-built container image instead of source build
   --phase=PHASE                    Lifecycle phase: all (default), prepare, postbuild, precreate, finalize
@@ -98,6 +100,7 @@ for arg in "$@"; do
     --allow-domain)          ALLOW_DOMAIN="true" ;;
     --no-allow-domain)       ALLOW_DOMAIN="false" ;;
     --no-iap)                ENABLE_IAP="false" ;;
+    --allow-no-iap)          ALLOW_NO_IAP="true" ;;
     --run-first-scan)        RUN_FIRST_SCAN="true" ;;
     -y|--yes)                ASSUME_YES="true" ;;
     -h|--help)               usage; exit 0 ;;
@@ -175,6 +178,57 @@ is_consumer_domain() {
   esac
 }
 
+validate_installer_inputs() {
+  PROJECT_ID="$PROJECT_ID" \
+  OPS_DATASET="$OPS_DATASET" \
+  BQ_LOCATION="$BQ_LOCATION" \
+  RUN_REGION="$RUN_REGION" \
+  ADMIN_EMAIL="$ADMIN_EMAIL" \
+  FINOPS_EMAILS="$FINOPS_EMAILS" \
+  RESERVATION_PROJECT="$RESERVATION_PROJECT" \
+  SERVICE_NAME="$SERVICE_NAME" \
+  JOB_NAME="$JOB_NAME" \
+  SCHEDULER_NAME="$SCHEDULER_NAME" \
+  SA_NAME="$SA_NAME" \
+  python3 - <<'PY'
+import os, re, sys
+
+def check(name, val, pat, allow_empty=False):
+    val = (val or "").strip()
+    if not val:
+        if allow_empty:
+            return
+        print(f"❌ Invalid empty value for {name}.", file=sys.stderr)
+        sys.exit(1)
+    if not re.fullmatch(pat, val):
+        print(f"❌ Invalid {name}: {val!r}", file=sys.stderr)
+        sys.exit(1)
+
+proj_re = r"(?:[a-z0-9.-]+:)?[a-z][a-z0-9-]{4,29}"
+ds_re = r"[A-Za-z_][A-Za-z0-9_]{0,1023}"
+loc_re = r"(?:US|EU|us|eu|[a-z]+-[a-z]+[0-9]+)"
+k8s_re = r"[a-z][a-z0-9-]{1,48}[a-z0-9]"
+sa_re = r"[a-z][a-z0-9-]{4,28}[a-z0-9]"
+email_re = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+
+check("PROJECT_ID", os.environ.get("PROJECT_ID"), proj_re)
+check("OPS_DATASET", os.environ.get("OPS_DATASET"), ds_re)
+check("BQ_LOCATION", os.environ.get("BQ_LOCATION"), loc_re)
+check("RUN_REGION", os.environ.get("RUN_REGION"), r"[a-z]+-[a-z]+[0-9]+")
+check("ADMIN_EMAIL", os.environ.get("ADMIN_EMAIL"), email_re)
+check("RESERVATION_PROJECT", os.environ.get("RESERVATION_PROJECT"), proj_re, allow_empty=True)
+check("SERVICE_NAME", os.environ.get("SERVICE_NAME"), k8s_re)
+check("JOB_NAME", os.environ.get("JOB_NAME"), k8s_re)
+check("SCHEDULER_NAME", os.environ.get("SCHEDULER_NAME"), k8s_re)
+check("SA_NAME", os.environ.get("SA_NAME"), sa_re)
+
+for raw_e in os.environ.get("FINOPS_EMAILS", "").split(","):
+    e = raw_e.strip()
+    if e:
+        check("FINOPS_EMAILS entry", e, email_re)
+PY
+}
+
 write_config_yaml() {
   local _iap_aud="$1"
   PROJECT_ID="$PROJECT_ID" \
@@ -187,30 +241,32 @@ write_config_yaml() {
   FINOPS_EMAILS="$FINOPS_EMAILS" \
   IAP_AUDIENCE="$_iap_aud" \
   python3 - <<'PY'
-import os
+import json, os
 
-proj = os.environ["PROJECT_ID"]
-ops_ds = os.environ["OPS_DATASET"]
-loc = os.environ["BQ_LOCATION"]
-scope = os.environ["ASSET_SCOPE"]
-jobs_view = os.environ["JOBS_VIEW"]
+proj = os.environ["PROJECT_ID"].strip()
+ops_ds = os.environ["OPS_DATASET"].strip()
+loc = os.environ["BQ_LOCATION"].strip()
+scope = os.environ["ASSET_SCOPE"].strip()
+jobs_view = os.environ["JOBS_VIEW"].strip()
 res_proj = os.environ.get("RESERVATION_PROJECT", "").strip()
 admin = os.environ["ADMIN_EMAIL"].strip().lower()
-finops = [e.strip().lower() for e in os.environ.get("FINOPS_EMAILS", "").split(",") if e.strip()]
+finops = list(dict.fromkeys(
+    e.strip().lower() for e in os.environ.get("FINOPS_EMAILS", "").split(",") if e.strip()
+))
 iap_aud = os.environ.get("IAP_AUDIENCE", "").strip()
 
-res_yaml = f'"{res_proj}"' if res_proj else "null"
-iap_yaml = f'"{iap_aud}"' if iap_aud else "null"
-finops_lines = "\n".join(f"    - {e}" for e in dict.fromkeys(finops)) if finops else "    []"
+res_yaml = json.dumps(res_proj) if res_proj else "null"
+iap_yaml = json.dumps(iap_aud) if iap_aud else "null"
+finops_lines = "\n".join(f"    - {json.dumps(e)}" for e in finops) if finops else "    []"
 
 content = f"""# Generated by scripts/install.sh — day-to-day settings can be edited in the UI (<app-url>/#settings).
-project_id: "{proj}"
-ops_dataset: "{ops_ds}"
-location: "{loc}"
+project_id: {json.dumps(proj)}
+ops_dataset: {json.dumps(ops_ds)}
+location: {json.dumps(loc)}
 
 regions: auto
-asset_scope: "{scope}"
-jobs_view: "{jobs_view}"
+asset_scope: {json.dumps(scope)}
+jobs_view: {json.dumps(jobs_view)}
 reservation_admin_project: {res_yaml}
 employee_hierarchy_table: null
 service_account_owner_table: null
@@ -218,7 +274,7 @@ min_card_net_monthly_usd: 0
 
 governance:
   settings_admins:
-    - {admin}
+    - {json.dumps(admin)}
   finops_approvers:
 {finops_lines}
   trust_client_identity: false
@@ -234,8 +290,67 @@ executor:
 verify_window_days: 14
 demo_mode: false
 """
-with open("config.yaml", "w", encoding="utf-8") as f:
+fd = os.open("config.yaml", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
     f.write(content)
+os.chmod("config.yaml", 0o600)
+PY
+}
+
+build_config_json() {
+  local _iap_aud="$1"
+  PROJECT_ID="$PROJECT_ID" \
+  OPS_DATASET="$OPS_DATASET" \
+  BQ_LOCATION="$BQ_LOCATION" \
+  ASSET_SCOPE="$ASSET_SCOPE" \
+  JOBS_VIEW="$JOBS_VIEW" \
+  RESERVATION_PROJECT="$RESERVATION_PROJECT" \
+  ADMIN_EMAIL="$ADMIN_EMAIL" \
+  FINOPS_EMAILS="$FINOPS_EMAILS" \
+  IAP_AUDIENCE="$_iap_aud" \
+  python3 - <<'PY'
+import json, os
+
+proj = os.environ["PROJECT_ID"].strip()
+ops_ds = os.environ["OPS_DATASET"].strip()
+loc = os.environ["BQ_LOCATION"].strip()
+scope = os.environ["ASSET_SCOPE"].strip()
+jobs_view = os.environ["JOBS_VIEW"].strip()
+res_proj = os.environ.get("RESERVATION_PROJECT", "").strip() or None
+admin = os.environ["ADMIN_EMAIL"].strip().lower()
+finops = list(dict.fromkeys(
+    e.strip().lower() for e in os.environ.get("FINOPS_EMAILS", "").split(",") if e.strip()
+))
+iap_aud = os.environ.get("IAP_AUDIENCE", "").strip() or None
+
+payload = {
+    "project_id": proj,
+    "ops_dataset": ops_ds,
+    "location": loc,
+    "regions": "auto",
+    "asset_scope": scope,
+    "jobs_view": jobs_view,
+    "reservation_admin_project": res_proj,
+    "employee_hierarchy_table": None,
+    "service_account_owner_table": None,
+    "min_card_net_monthly_usd": 0,
+    "governance": {
+        "settings_admins": [admin],
+        "finops_approvers": finops,
+        "trust_client_identity": False,
+        "iap_audience": iap_aud,
+    },
+    "executor": {
+        "enable_class1": True,
+        "enable_class2": False,
+        "enable_class3": False,
+        "enable_reservation_changes": False,
+        "change_window_utc": [3, 9],
+    },
+    "verify_window_days": 14,
+    "demo_mode": False,
+}
+print(json.dumps(payload, separators=(",", ":")).replace("|", "\\u007c"), end="")
 PY
 }
 
@@ -257,6 +372,7 @@ save_prepared_state() {
   EMAIL_DOMAIN="$EMAIL_DOMAIN" \
   SHARE_WITH_DOMAIN="$SHARE_WITH_DOMAIN" \
   ENABLE_IAP="$ENABLE_IAP" \
+  ALLOW_NO_IAP="$ALLOW_NO_IAP" \
   IAP_AUDIENCE="$IAP_AUDIENCE" \
   SERVICE_NAME="$SERVICE_NAME" \
   JOB_NAME="$JOB_NAME" \
@@ -272,13 +388,16 @@ keys = [
     "EXISTING_BEFORE", "ADMIN_EMAIL", "PROJECT_ID", "PROJECT_NUMBER",
     "RUN_REGION", "BQ_LOCATION", "OPS_DATASET", "ORG_ID", "ORG_IAM_READY",
     "ASSET_SCOPE", "JOBS_VIEW", "RESERVATION_PROJECT", "FINOPS_EMAILS",
-    "EMAIL_DOMAIN", "SHARE_WITH_DOMAIN", "ENABLE_IAP", "IAP_AUDIENCE",
+    "EMAIL_DOMAIN", "SHARE_WITH_DOMAIN", "ENABLE_IAP", "ALLOW_NO_IAP", "IAP_AUDIENCE",
     "SERVICE_NAME", "JOB_NAME", "SCHEDULER_NAME", "SA_NAME", "SA_EMAIL",
     "MISSING_ORG_CMD", "MISSING_RES_CMD",
 ]
-with open(os.environ["STATE_FILE"], "w", encoding="utf-8") as f:
+p = os.environ["STATE_FILE"]
+fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
     for k in keys:
         f.write(f"{k}={shlex.quote(os.environ.get(k, ''))}\n")
+os.chmod(p, 0o600)
 PY
 }
 
@@ -502,13 +621,11 @@ PY
     FINOPS_EMAILS="$ADMIN_EMAIL"
   fi
 
+  validate_installer_inputs
+
   EMAIL_DOMAIN="${ADMIN_EMAIL#*@}"
   SHARE_WITH_DOMAIN="false"
   if [[ "$ALLOW_DOMAIN" == "true" ]]; then
-    if ! is_consumer_domain "$EMAIL_DOMAIN"; then
-      SHARE_WITH_DOMAIN="true"
-    fi
-  elif [[ "$ALLOW_DOMAIN" == "auto" ]]; then
     if ! is_consumer_domain "$EMAIL_DOMAIN"; then
       SHARE_WITH_DOMAIN="true"
     fi
@@ -735,13 +852,23 @@ PY
 
 build_service_env_vars() {
   local _aud="$1"
-  local _vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},BQOPT_PIPELINE_JOB=${JOB_NAME},BQOPT_JOB_REGION=${RUN_REGION}"
+  local _cfg_json
+  _cfg_json="$(build_config_json "$_aud")"
+  local _vars="^|^GOOGLE_CLOUD_PROJECT=${PROJECT_ID}|BQOPT_OPS_DATASET=${OPS_DATASET}|BQOPT_LOCATION=${BQ_LOCATION}|BQOPT_PIPELINE_JOB=${JOB_NAME}|BQOPT_JOB_REGION=${RUN_REGION}|BQOPT_SETTINGS_ADMINS=${ADMIN_EMAIL}|BQOPT_FINOPS_APPROVERS=${FINOPS_EMAILS}|BQOPT_CONFIG_JSON=${_cfg_json}"
   if [[ -n "$_aud" ]]; then
-    _vars="${_vars},IAP_AUDIENCE=${_aud}"
+    _vars="${_vars}|IAP_AUDIENCE=${_aud}"
   else
-    _vars="${_vars},IAP_AUDIENCE="
+    _vars="${_vars}|IAP_AUDIENCE="
   fi
   printf '%s' "$_vars"
+}
+
+build_job_env_vars() {
+  local _aud="$1"
+  local _cfg_json
+  _cfg_json="$(build_config_json "$_aud")"
+  printf '^|^GOOGLE_CLOUD_PROJECT=%s|BQOPT_OPS_DATASET=%s|BQOPT_LOCATION=%s|BQOPT_SETTINGS_ADMINS=%s|BQOPT_FINOPS_APPROVERS=%s|BQOPT_CONFIG_JSON=%s' \
+    "$PROJECT_ID" "$OPS_DATASET" "$BQ_LOCATION" "$ADMIN_EMAIL" "$FINOPS_EMAILS" "$_cfg_json"
 }
 
 run_precreate_step() {
@@ -770,9 +897,9 @@ run_precreate_step() {
 run_finalize_steps() {
   local _deploy_log
   _deploy_log="$(mktemp "${TMPDIR:-/tmp}/bqopt_deploy.XXXXXX")"
-  # Clean up temp log when function returns.
+  # Clean up temp log when function returns or exits.
   # shellcheck disable=SC2064
-  trap "rm -f '$_deploy_log'" RETURN
+  trap "rm -f '$_deploy_log'" EXIT RETURN
 
   local _source_bucket="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
   local _build_sa_resource="projects/${PROJECT_ID}/serviceAccounts/${SA_EMAIL}"
@@ -900,12 +1027,16 @@ is_iap_err = ("iap" in txt) and ("invalid build request" not in txt) and ("stora
 sys.exit(0 if is_iap_err else 1)
 PY
     then
-      warn "Direct --iap flag was rejected by project/org policy; redeploying private service without --iap flag..."
-      IAP_AUDIENCE=""
-      if [[ -z "$PREBUILT_IMAGE" ]]; then
+      if [[ "$ALLOW_NO_IAP" == "true" ]]; then
+        warn "Direct --iap flag was rejected by project/org policy and --allow-no-iap was passed; redeploying private service without --iap flag..."
+        IAP_AUDIENCE=""
         write_config_yaml ""
+        deploy_ui_revision "false" "$(build_service_env_vars "")"
+      else
+        echo "❌ Direct Identity-Aware Proxy (--iap) was rejected by project/org policy." >&2
+        echo "   Refusing to silently downgrade authentication. Resolve the IAP policy or re-run explicitly with --allow-no-iap (behind an IAP Load Balancer)." >&2
+        exit 1
       fi
-      deploy_ui_revision "false" "$(build_service_env_vars "")"
     else
       echo "❌ Cloud Run deployment failed (see error above)." >&2
       exit 1
@@ -986,6 +1117,9 @@ PY
   # ---- Step 6: Nightly Cloud Run Job + BigQuery Schema Init ------------------
   step "[6/7] Creating Nightly Pipeline Job & initializing BigQuery dataset (${OPS_DATASET})..."
 
+  local _job_env_vars
+  _job_env_vars="$(build_job_env_vars "$IAP_AUDIENCE")"
+
   gcloud run jobs deploy "$JOB_NAME" \
     --project="$PROJECT_ID" \
     --region="$RUN_REGION" \
@@ -997,7 +1131,7 @@ PY
     --max-retries=0 \
     --command=python \
     --args="-m,optimizer.cli,pipeline" \
-    --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
+    --set-env-vars="$_job_env_vars" \
     --quiet
 
   # Let the Web UI's "Run scan now" button & Cloud Scheduler invoke this job cleanly.

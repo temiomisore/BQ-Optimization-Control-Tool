@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
+from . import security
 from .config import Config
 
 
@@ -148,6 +149,11 @@ def execute(c: Config, sql: str, params: dict[str, Any] | None = None,
         job.result()
         return job.num_dml_affected_rows or 0
     return _with_reservation_retry(_run)
+
+
+def assert_single_statement_ddl(sql: str, allowed_types: Iterable[str]) -> str:
+    """Verify `sql` is a single statement of one of `allowed_types` before executing DDL."""
+    return security.assert_ddl_statement(sql, allowed_types)
 
 
 def probe_reservation(c: Config, location: str | None = None) -> str | None:

@@ -25,10 +25,10 @@ from .config import Config
 AUTO = "auto"
 ASSET_TYPE = "bigquery.googleapis.com/Dataset"
 _ASSET_URL = "https://cloudasset.googleapis.com/v1/{scope}:searchAllResources"
-_REGION_RE = re.compile(r"^[a-z][a-z0-9-]{1,39}$")
-_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}$")
-_BQ_DS_NAME_RE = re.compile(r"^//bigquery\.googleapis\.com/projects/([^/]+)/datasets/[^/]+$")
-_CRM_PARENT_RE = re.compile(r"^//cloudresourcemanager\.googleapis\.com/projects/([^/]+)$")
+_REGION_RE = re.compile(r"^[a-z][a-z0-9-]{1,39}\Z")
+_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9.:-]{0,62}\Z")
+_BQ_DS_NAME_RE = re.compile(r"^//bigquery\.googleapis\.com/projects/([^/]+)/datasets/[^/]+\Z")
+_CRM_PARENT_RE = re.compile(r"^//cloudresourcemanager\.googleapis\.com/projects/([^/]+)\Z")
 
 REGIONS_SEEN_DDL = """
 CREATE TABLE IF NOT EXISTS `{ops}.regions_seen` (
@@ -107,7 +107,7 @@ def resolve(c: Config, discovered: Iterable[str] | None = None,
 def extract_project_id(res: dict) -> str | None:
     """Extract the string GCP project_id (not numeric project number) from a Cloud Asset row.
 
-    Cloud Asset Inventory's `res["project"]` is numeric (`projects/377289738115`), which BigQuery
+    Cloud Asset Inventory's `res["project"]` is numeric (`projects/123456789012`), which BigQuery
     INFORMATION_SCHEMA rejects; the real string project ID lives in `name` or `parentFullResourceName`.
     """
     m = _BQ_DS_NAME_RE.match(str(res.get("name") or ""))

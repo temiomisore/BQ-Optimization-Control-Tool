@@ -70,13 +70,13 @@ class TestValidate(unittest.TestCase):
 
 class TestAccess(unittest.TestCase):
     def setUp(self):
-        self.c = _cfg(settings_admins=["Sayali@X.com"], finops_approvers=["shawn@x.com"])
+        self.c = _cfg(settings_admins=["Platform.Admin@X.com"], finops_approvers=["finops@x.com"])
 
     def _who(self, email, source=governance.SOURCE_IAP):
         return {"email": email, "source": source}
 
     def test_admin(self):
-        a = sc.access_for(self._who("sayali@x.com"), self.c, [])
+        a = sc.access_for(self._who("platform.admin@x.com"), self.c, [])
         self.assertTrue(a["is_admin"] and a["is_editor"])
         self.assertFalse(a["is_finops"])
         self.assertTrue(sc.can_edit(sc.BY_KEY["regions"], a)[0])
@@ -87,18 +87,18 @@ class TestAccess(unittest.TestCase):
         self.assertFalse(sc.can_edit(sc.BY_KEY["executor.enable_class3"], a)[0])        # safety switch
 
     def test_editor_and_finops(self):
-        a = sc.access_for(self._who("shawn@x.com"), self.c, ["Shawn@x.com"])
+        a = sc.access_for(self._who("finops@x.com"), self.c, ["FinOps@x.com"])
         self.assertTrue(a["is_editor"] and a["is_finops"])
         self.assertFalse(a["is_admin"])
         self.assertTrue(sc.can_edit(sc.BY_KEY["min_card_net_monthly_usd"], a)[0])
         self.assertFalse(sc.can_edit(sc.BY_KEY["verify_window_days"], a)[0])
 
     def test_untrusted_identity_gets_nothing(self):
-        a = sc.access_for(self._who("sayali@x.com", governance.SOURCE_CLIENT), self.c, [])
+        a = sc.access_for(self._who("platform.admin@x.com", governance.SOURCE_CLIENT), self.c, [])
         self.assertFalse(a["is_admin"] or a["is_editor"])
         self.assertFalse(sc.can_edit(sc.BY_KEY["regions"], a)[0])
-        demo = _cfg(settings_admins=["sayali@x.com"], trust_client_identity=True)
-        a = sc.access_for(self._who("sayali@x.com", governance.SOURCE_CLIENT), demo, [])
+        demo = _cfg(settings_admins=["platform.admin@x.com"], trust_client_identity=True)
+        a = sc.access_for(self._who("platform.admin@x.com", governance.SOURCE_CLIENT), demo, [])
         self.assertTrue(a["is_admin"] and a["demo_identity"])
 
     def test_env_admins_and_env_pin(self):

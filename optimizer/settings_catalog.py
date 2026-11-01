@@ -94,7 +94,8 @@ SETTINGS: list[dict] = [
        "Google Cloud project that holds the tool's dataset and runs its queries.",
        env="GOOGLE_CLOUD_PROJECT", default=None),
     _s("ops_dataset", "Tool dataset", "startup", "Where the tool runs",
-       "Dataset where the tool keeps its history, recommendations and audit trail."),
+       "Dataset where the tool keeps its history, recommendations and audit trail.",
+       env="BQOPT_OPS_DATASET"),
     _s("location", "Home location", "startup", "Where the tool runs",
        "BigQuery location of the tool's dataset. Always collected directly; other regions are "
        "fetched where they live and merged here.", env="BQOPT_LOCATION"),
@@ -172,23 +173,23 @@ SETTINGS: list[dict] = [
     _s("employee_hierarchy_table", "HR hierarchy table", "everyday", "Ownership & billing",
        "Employee -> manager -> director table (project.dataset.table), for card owners and spend by "
        "director. Not set = optimizer_ops.employee_hierarchy.", env="BQOPT_EMPLOYEE_HIERARCHY_TABLE",
-       edit="editor", kind="table", nullable=True, applies="owners"),
+       edit="admin", kind="table", nullable=True, applies="owners"),
     _s("employee_hierarchy_columns", "HR table column names", "everyday", "Ownership & billing",
        "Only needed if you select your own HR table above and its column names differ from ours.",
-       edit="editor", kind="map", fields=HIERARCHY_FIELDS, table_key="employee_hierarchy_table",
+       edit="admin", kind="map", fields=HIERARCHY_FIELDS, table_key="employee_hierarchy_table",
        applies="owners"),
     _s("service_account_owner_table", "Service-account owner table", "everyday", "Ownership & billing",
        "Maps service accounts (Power BI, ETL ...) to the person accountable for their spend "
        "(project.dataset.table).", env="BQOPT_SERVICE_ACCOUNT_OWNER_TABLE",
-       edit="editor", kind="table", nullable=True, applies="owners"),
+       edit="admin", kind="table", nullable=True, applies="owners"),
     _s("service_account_owner_columns", "Owner table column names", "everyday", "Ownership & billing",
        "Only needed if you select your own service-account owner table above — map its "
        "service_account and owner columns.",
-       edit="editor", kind="map", fields=SA_OWNER_FIELDS, table_key="service_account_owner_table",
+       edit="admin", kind="map", fields=SA_OWNER_FIELDS, table_key="service_account_owner_table",
        applies="owners"),
     _s("billing_export_table", "Billing export table", "everyday", "Ownership & billing",
        "Optional: your Cloud Billing export table (project.dataset.table).", env="BQOPT_BILLING_EXPORT_TABLE",
-       edit="editor", kind="table", nullable=True, applies="rules"),
+       edit="admin", kind="table", nullable=True, applies="rules"),
     _s("default_owner", "Fallback owner", "everyday", "Ownership & billing",
        "Owner used when a card's owner can't be found. Not set = data-platform-admin@<project>.",
        default=None, edit="editor", kind="email", nullable=True, applies="rules"),
@@ -337,6 +338,10 @@ SETTINGS: list[dict] = [
     _s("governance.finops_approvers", "FinOps approvers", "safety", "Who can approve and edit",
        "People who can see and approve billing, commitment and reservation cards, and change the "
        "savings-math settings. Empty = nobody.", env="BQOPT_FINOPS_APPROVERS"),
+    _s("governance.engineering_approvers", "Engineering approvers", "safety", "Who can approve and edit",
+       "People who can approve and manage Engineering optimization cards across all datasets, in "
+       "addition to settings admins, editors and verified table owners.",
+       env="BQOPT_ENGINEERING_APPROVERS"),
     _s("governance.finops_rule_ids", "FinOps-only rules", "safety", "Who can approve and edit",
        "Rules whose cards only FinOps approvers can see and approve."),
     _s("approval_ttl_days", "Approvals expire after (days)", "safety", "Who can approve and edit",
@@ -379,7 +384,8 @@ OWNER_KEYS = frozenset(s["key"] for s in SETTINGS if s["applies"] == "owners")
 
 # Environment variables optimizer/config.py reads, mapped to the setting they override.
 ENV_VARS = {s["env"]: s["key"] for s in SETTINGS if s["env"]}
-ENV_VARS.update({"GCP_PROJECT": "project_id"})
+ENV_VARS.update({"GCP_PROJECT": "project_id", "BQOPT_ALLOW_DEMO_MODE": "demo_mode",
+                 "BQOPT_CONFIG_JSON": "project_id"})
 
 
 # ----------------------------------------------------------------------------- access
@@ -399,7 +405,7 @@ def access_for(identity: Mapping | None, c: Mapping, editors: list[str] | None =
     email = str(identity.get("email") or "").strip().lower()
     src = identity.get("source")
     demo = governance.trust_client_identity(c)
-    trusted = bool(email) and not (src in (governance.SOURCE_CLIENT, governance.SOURCE_PLACEHOLDER) and not demo)
+    trusted = governance.is_trusted_identity(identity, c)
     admins = settings_admins(c)
     eds = sorted({str(e).strip().lower() for e in (editors or []) if str(e).strip()})
     is_admin = trusted and email in admins
@@ -429,13 +435,13 @@ def can_edit(s: Mapping, access: Mapping) -> tuple[bool, str | None]:
 
 # ----------------------------------------------------------------------------- validation
 
-_SCOPE_RE = re.compile(r"^(organizations|folders|projects)/[A-Za-z0-9_.:\-]+$")
-_TABLE_RE = re.compile(r"^[A-Za-z0-9_.:\-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_\-$]+$")
-_PROJECT_RE = re.compile(r"^[a-z][-a-z0-9:.]{4,62}[a-z0-9]$")
-_DATASET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}$")
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,99}$")
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SCOPE_RE = re.compile(r"^(organizations|folders|projects)/[A-Za-z0-9_.:\-]+\Z")
+_TABLE_RE = re.compile(r"^[A-Za-z0-9_.:\-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_\-$]+\Z")
+_PROJECT_RE = re.compile(r"^[a-z][-a-z0-9:.]{4,62}[a-z0-9]\Z")
+_DATASET_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,1023}\Z")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,99}\Z")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def _blank(v: Any) -> bool:
@@ -507,9 +513,11 @@ def validate(key: str, raw: Any, c: Mapping | None = None) -> Any:
             return {str(k): v for k, v in sorted(w.items())}
         out = {}
         for k, v in m.items():
-            if not _IDENT_RE.match(str(k)) or (v is not None and not _IDENT_RE.match(str(v))):
+            ks = str(k).strip()
+            vs = None if v is None else str(v).strip()
+            if not _IDENT_RE.fullmatch(ks) or (vs is not None and not _IDENT_RE.fullmatch(vs)):
                 raise ValueError(f"'{k}: {v}' isn't a valid column mapping (letters, digits, underscores).")
-            out[str(k)] = None if v is None else str(v)
+            out[ks] = vs
         return out
     if _blank(raw):
         if s["nullable"]:
@@ -552,7 +560,7 @@ def validate(key: str, raw: Any, c: Mapping | None = None) -> Any:
               "model": (_MODEL_RE, "That doesn't look like a model name.")}
     if kind in checks:
         rx, msg = checks[kind]
-        if not rx.match(text.strip("`")):
+        if not rx.fullmatch(text.strip("`")):
             raise ValueError(msg)
         return text.strip("`")
     return text
@@ -592,7 +600,8 @@ def _source(s: dict, raw: dict, saved: Mapping) -> str:
         in_yaml = in_yaml or _dig(raw, "slack_webhook_url") is not _UNSET
         return "config.yaml" if in_yaml else "default"
     if env and os.environ.get(env):
-        if key in ("governance.finops_approvers", "governance.settings_admins") and in_yaml:
+        if key in ("governance.finops_approvers", "governance.settings_admins",
+                   "governance.engineering_approvers") and in_yaml:
             return f"config.yaml + env {env}"     # these env lists are added to the file's list
         return f"env {env}"
     if key in saved:
@@ -607,6 +616,9 @@ def _effective(s: dict, c: Mapping) -> Any:
         return sorted(finops_approvers(c))
     if key == "governance.settings_admins":
         return sorted(settings_admins(c))
+    if key == "governance.engineering_approvers":
+        from .governance import engineering_approvers
+        return sorted(engineering_approvers(c))
     if key == "slack_webhook":
         return os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url") or c.get("slack_webhook")
     v = _dig(c, key)
@@ -631,6 +643,15 @@ def explain(c: Mapping | None = None, path: str | None = None, saved: Mapping | 
     if found:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
+    if os.environ.get("BQOPT_CONFIG_JSON"):
+        try:
+            import json
+            from .config import _merge
+            env_base = json.loads(os.environ["BQOPT_CONFIG_JSON"])
+            if isinstance(env_base, dict):
+                raw = _merge(raw, env_base)
+        except Exception:
+            pass
     c = c if c is not None else cfg(path)
     saved = saved or {}
     items = []

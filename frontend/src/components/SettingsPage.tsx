@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import {
   fetchScanStatus, fetchSettings, fetchSettingsHistory, fetchSettingsOptions, fetchSetupCheck, fetchTableColumns,
-  revertSettingChange, saveSetting, triggerScan, updateSettingsEditors,
+  revertSettingChange, safeHttpUrl, saveSetting, triggerScan, updateSettingsEditors,
   type CheckStatus, type LabeledOption, type RegionOption, type ScanStatus, type SettingChange, type SettingItem,
   type SettingsAccess, type SettingsOptions, type SetupCheck, type TableOption,
 } from "@/lib/api";
@@ -68,10 +68,18 @@ function CheckRow({ x }: { x: SetupCheck }) {
 }
 
 function SetupCheckPanel() {
+  const { email } = useReviewer();
   const [run, setRun] = useState(0);
+  const settingsQ = useQuery({
+    queryKey: ["settings", email],
+    queryFn: () => fetchSettings(email),
+    staleTime: 30 * 1000,
+  });
+  const isEditor = !!settingsQ.data?.access?.is_editor;
   const q = useQuery({
-    queryKey: ["setup-check", run],
-    queryFn: () => fetchSetupCheck(run > 0),
+    queryKey: ["setup-check", email, run],
+    queryFn: () => fetchSetupCheck(run > 0, email),
+    enabled: isEditor,
     staleTime: 5 * 60 * 1000,
   });
   const rep = q.data;
@@ -96,13 +104,20 @@ function SetupCheckPanel() {
             most one row) and anything that fails shows the exact command to fix it.
           </p>
         </div>
-        <Button variant="secondary" size="sm" onClick={() => setRun((n) => n + 1)} loading={q.isFetching}>
-          <RefreshCw className="h-3.5 w-3.5" /> Run again
-        </Button>
+        {isEditor && (
+          <Button variant="secondary" size="sm" onClick={() => setRun((n) => n + 1)} loading={q.isFetching}>
+            <RefreshCw className="h-3.5 w-3.5" /> Run again
+          </Button>
+        )}
       </div>
 
-      {q.isLoading && <Skeleton className="h-40 w-full" />}
-      {q.error && <div className="text-sm text-rose-400">Couldn't run the checks: {(q.error as Error).message}</div>}
+      {(settingsQ.isLoading || (isEditor && q.isLoading)) && <Skeleton className="h-40 w-full" />}
+      {!settingsQ.isLoading && !isEditor && (
+        <div className="inline-flex items-center gap-1.5 text-xs text-zinc-500">
+          <Lock className="h-3.5 w-3.5" /> Permission diagnostics are visible to settings admins and editors.
+        </div>
+      )}
+      {isEditor && q.error && <div className="text-sm text-rose-400">Couldn't run the checks: {(q.error as Error).message}</div>}
 
       {rep && (
         <>
@@ -1191,7 +1206,8 @@ function SettingRow({
 /* --------------------------------------------------------------------------- history */
 
 function HistoryPanel({ labels, canUndo }: { labels: Record<string, SettingItem>; canUndo: (key: string) => boolean }) {
-  const q = useQuery({ queryKey: ["settings-history"], queryFn: () => fetchSettingsHistory(50) });
+  const { email } = useReviewer();
+  const q = useQuery({ queryKey: ["settings-history", email], queryFn: () => fetchSettingsHistory(50, email) });
   const { revert } = useSettingsMutations();
   const [open, setOpen] = useState(true);
   const rows = q.data?.changes || [];
@@ -1286,7 +1302,7 @@ function SettingsPanel() {
               Values pinned by an environment variable, startup settings and safety switches are changed at deploy time.
             </p>
           </div>
-          {data && (
+          {data && isEditor && (
             <div className="flex items-center gap-2">
               <Button variant="secondary" size="sm" onClick={download}>
                 <Download className="h-3.5 w-3.5" /> Download config.yaml
@@ -1335,7 +1351,7 @@ function SettingsPanel() {
           <div className="text-xs text-amber-500">No {data.config_file} found on the server: every value is a built-in default, an environment variable or saved here.</div>
         )}
       </section>
-      {data && <HistoryPanel labels={labels} canUndo={canUndo} />}
+      {data && isEditor && <HistoryPanel labels={labels} canUndo={canUndo} />}
     </>
   );
 }
@@ -1437,6 +1453,7 @@ export function ScanNowPanel({
   const canTrigger = scan ? scan.can_trigger : true;
   const telem = scan?.telemetry;
   const logLines = scan?.log_tail || [];
+  const safeLogUri = safeHttpUrl(scan?.log_uri);
 
   return (
     <section className={cn("panel space-y-3.5 p-5", isRunning && "border-sky-500/40 ring-1 ring-sky-500/20")}>
@@ -1497,7 +1514,7 @@ export function ScanNowPanel({
                 ✓ {telem.jobs_count.toLocaleString()} queries indexed
               </span>
               {telem.last_job_at && <span>· latest query {ago(telem.last_job_at)}</span>}
-              <span>· runs automatically every night (02:00 UTC)</span>
+              <span>· runs automatically every night (03:00 UTC)</span>
             </>
           ) : (
             <span className="text-amber-600 dark:text-amber-300">
@@ -1555,7 +1572,7 @@ export function ScanNowPanel({
       )}
 
       {/* Optional live log output / Cloud Run link */}
-      {(logLines.length > 0 || scan?.log_uri) && (
+      {(logLines.length > 0 || safeLogUri) && (
         <div>
           <div className="flex flex-wrap items-center gap-3 text-xs">
             {logLines.length > 0 && (
@@ -1569,11 +1586,11 @@ export function ScanNowPanel({
                 <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", logsOpen && "rotate-180")} />
               </button>
             )}
-            {scan?.log_uri && (
+            {safeLogUri && (
               <a
-                href={scan.log_uri}
+                href={safeLogUri}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 className="inline-flex items-center gap-1 font-medium text-sky-500 hover:text-sky-400"
               >
                 Open Cloud Run job logs <ExternalLink className="h-3 w-3" />

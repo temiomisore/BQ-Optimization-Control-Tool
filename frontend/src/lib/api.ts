@@ -439,13 +439,32 @@ export const revertSettingChange = (b: { change_id: string; principal?: string }
 export const updateSettingsEditors = (b: { action: "add" | "remove"; email: string; note?: string; principal?: string }) =>
   postJson<{ ok: true; editors: string[] }>("/api/settings/editors", b);
 
-export async function fetchSettingsHistory(limit = 50): Promise<{ changes: SettingChange[] }> {
-  return asJson(await fetch(`/api/settings/history?limit=${limit}`, { headers: { Accept: "application/json" } }));
+export function safeHttpUrl(u?: string | null): string | null {
+  if (!u || typeof u !== "string") return null;
+  try {
+    const parsed = new URL(u.trim());
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.toString();
+    }
+  } catch {
+    /* invalid URL */
+  }
+  return null;
 }
 
-export async function fetchSetupCheck(refresh = false): Promise<SetupCheckResponse> {
+export async function fetchSettingsHistory(limit = 50, principal?: string): Promise<{ changes: SettingChange[] }> {
+  const sp = new URLSearchParams({ limit: String(limit) });
+  if (principal) sp.set("principal", principal);
+  return asJson(await fetch(`/api/settings/history?${sp.toString()}`, { headers: { Accept: "application/json" } }));
+}
+
+export async function fetchSetupCheck(refresh = false, principal?: string): Promise<SetupCheckResponse> {
+  const sp = new URLSearchParams();
+  if (refresh) sp.set("refresh", "1");
+  if (principal) sp.set("principal", principal);
+  const qs = sp.toString();
   return asJson<SetupCheckResponse>(
-    await fetch(`/api/setup-check${refresh ? "?refresh=1" : ""}`, { headers: { Accept: "application/json" } }),
+    await fetch(`/api/setup-check${qs ? `?${qs}` : ""}`, { headers: { Accept: "application/json" } }),
   );
 }
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from . import bq, pricing, store
+from . import bq, pricing, security, store
 from .config import Config
 from .executor import recommender_sync
 
@@ -233,24 +233,34 @@ def check(c: Config, cs: dict) -> str:
 
 
 def _send_webhook_notification(c: Config, event_type: str, cs: dict, detail: str) -> None:
-    """Sends a non-blocking Slack/Teams FinOps alert when SLACK_WEBHOOK_URL is configured."""
+    """Sends a non-blocking Slack/Teams FinOps alert when SLACK_WEBHOOK_URL is configured.
+    Enforces HTTPS + webhook host allowlist + DNS/IP SSRF blocking + Slack mrkdwn escaping."""
     import os
     import urllib.request
-    webhook_url = os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url") or c.get("slack_webhook")
-    if not webhook_url:
+    raw_url = os.environ.get("SLACK_WEBHOOK_URL") or c.get("slack_webhook_url") or c.get("slack_webhook")
+    if not raw_url:
         return
     try:
+        webhook_url = security.validate_webhook_url(raw_url)
         icon = "🚨" if event_type == "REGRESSED" else "✅"
+        ev_clean = security.escape_slack_mrkdwn(event_type, max_len=32)
+        cs_id_clean = security.escape_slack_mrkdwn(str(cs.get("change_set_id") or "")[:10], max_len=16)
+        rules_clean = security.escape_slack_mrkdwn(",".join(str(r) for r in (cs.get("rule_ids") or [])), max_len=80)
+        target_clean = security.escape_slack_mrkdwn(
+            f"{cs.get('target_project')}.{cs.get('target_dataset')}.{cs.get('target_table')}",
+            max_len=180,
+        )
+        detail_clean = security.escape_slack_mrkdwn(detail, max_len=400)
         payload = bq.dumps({
             "text": (
-                f"{icon} *BigQuery FinOps Optimizer [{event_type}]*\n"
-                f"• *Change Set*: `{cs.get('change_set_id', '')[:10]}` (`{','.join(cs.get('rule_ids') or [])}`)\n"
-                f"• *Target*: `{cs.get('target_project')}.{cs.get('target_dataset')}.{cs.get('target_table')}`\n"
-                f"• *Detail*: {detail}"
+                f"{icon} *BigQuery FinOps Optimizer [{ev_clean}]*\n"
+                f"• *Change Set*: `{cs_id_clean}` (`{rules_clean}`)\n"
+                f"• *Target*: `{target_clean}`\n"
+                f"• *Detail*: {detail_clean}"
             )
         }).encode("utf-8")
         req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=3)
+        security.safe_urlopen(req, timeout=3.0)
     except Exception:
         pass
 

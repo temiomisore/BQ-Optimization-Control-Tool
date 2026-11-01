@@ -14,8 +14,8 @@ import argparse
 import datetime as dt
 import sys
 
-from . import (attribution, bq, collector_driver, compiler, governance, rules, scoring, store,
-               verifier)
+from . import (attribution, bq, collector_driver, compiler, governance, rules, scoring, security,
+               store, verifier)
 from .config import cfg
 from .executor import class1, class2, class3, pr_handoff, recommender_sync, router
 
@@ -91,22 +91,25 @@ def cmd_collect(c) -> None:
     remote = [r for r in route if r != home]     # other locations: query there, load + MERGE here
     with open("sql/02_collector_run.sql") as f:
         sql = f.read()
-    regions_list = [f"'{r}'" for r in local]
+    regions_list = [f"'{security.validate_region(r)}'" for r in local]
     sql = re.sub(r"DECLARE regions\s+ARRAY<STRING>\s+DEFAULT\s+\[[^\]]*\];",
                  f"DECLARE regions               ARRAY<STRING> DEFAULT [{', '.join(regions_list)}];", sql)
     if c.get("jobs_view"):
+        jv = security.validate_jobs_view(c["jobs_view"])
         sql = re.sub(r"DECLARE jobs_view\s+STRING\s+DEFAULT\s+'[^']*';",
-                     f"DECLARE jobs_view             STRING DEFAULT '{c['jobs_view']}';", sql)
+                     f"DECLARE jobs_view             STRING DEFAULT '{jv}';", sql)
     recs_view = c.get("recs_view") or (
         "RECOMMENDATIONS_BY_ORGANIZATION"
         if str(c.get("jobs_view") or "").upper() == "JOBS_BY_ORGANIZATION" else None
     )
     if recs_view:
+        rv = security.validate_recs_view(recs_view)
         sql = re.sub(r"DECLARE recs_view\s+STRING\s+DEFAULT\s+'[^']*';",
-                     f"DECLARE recs_view             STRING DEFAULT '{recs_view}';", sql)
+                     f"DECLARE recs_view             STRING DEFAULT '{rv}';", sql)
     if c.get("reservation_admin_project"):
+        rap = security.validate_project_id(c["reservation_admin_project"])
         sql = re.sub(r"DECLARE admin_project\s+STRING\s+DEFAULT\s+NULL;",
-                     f"DECLARE admin_project         STRING DEFAULT '{c['reservation_admin_project']}';", sql)
+                     f"DECLARE admin_project         STRING DEFAULT '{rap}';", sql)
 
     # Smart Auto-Watermark: 180-Day (6-Month) Historical Backfill on 1st Run -> 3-Day Incremental on Daily Runs
     try:
@@ -116,10 +119,10 @@ def cmd_collect(c) -> None:
         existing_cnt = 0
 
     if existing_cnt == 0:
-        effective_days = int(c.get("initial_backfill_days", 180))
+        effective_days = max(1, min(180, int(c.get("initial_backfill_days", 180))))
         print(f"  + First-time historical load detected (0 rows in jobs_events): pulling full {effective_days}-day (6-month) INFORMATION_SCHEMA history...")
     else:
-        effective_days = int(c.get("incremental_lookback_days", 3))
+        effective_days = max(1, min(180, int(c.get("incremental_lookback_days", 3))))
         print(f"  + Existing telemetry found ({existing_cnt:,} jobs): running fast {effective_days}-day daily incremental MERGE...")
 
     sql = re.sub(r"DECLARE lookback_days\s+INT64\s+DEFAULT\s+[^;]+;",
@@ -424,16 +427,24 @@ def cmd_rollback(c, change_set_id: str, reason: str = "Manual 1-Click Rollback v
     cs = store.get(c, change_set_id)
     if not cs:
         sys.exit("no such change set")
+    if cs.get("state") and cs.get("state") != "ROLLING_BACK":
+        store.check_transition_allowed(cs, "rollback")
+    snooze_days = max(1, min(365, int(snooze_days)))
     actor_name = actor or _get_user_actor()
     store.transition(c, change_set_id, "ROLLING_BACK", actor_name, note=reason)
     try:
-        if cs.get("execution_route") == "CI_PULL_REQUEST" or int(cs["apply_class"]) == 4:
+        ac = int(cs["apply_class"])
+        if cs.get("execution_route") == "CI_PULL_REQUEST" or ac == 4:
             # Code change shipped via PR: nothing to undo in BigQuery; the PR must be reverted in git.
             plan = bq.loads(cs.get("rollback_plan_json")) or {}
             print(f"[!] Class 4 code change: revert the PR in git"
                   f"{' (' + plan['pr_url'] + ')' if plan.get('pr_url') else ''}; no BigQuery objects to restore")
+        elif ac == 3:
+            class3.rollback(c, cs)
+        elif ac == 2:
+            class2.rollback(c, cs)
         else:
-            (class3 if int(cs["apply_class"]) == 3 else class1).rollback(c, cs)
+            class1.rollback(c, cs)
     except Exception as e:
         if "Not found" in str(e) or "404" in str(e):
             print(f"[!] Note: backup table already restored or absent ({e}); completing state transition to ROLLED_BACK")

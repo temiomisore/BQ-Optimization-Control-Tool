@@ -330,7 +330,7 @@ if [[ "$*" == *"projects describe"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"projects get-ancestors"* ]]; then
-  echo '[{{"type":"organization","id":"14682041824"}}]'
+  echo '[{{"type":"organization","id":"999888777666"}}]'
   exit 0
 fi
 if [[ "$*" == *"iam service-accounts describe"* ]]; then
@@ -397,7 +397,7 @@ exit 0
             with open(os.path.join(work_repo, "config.yaml"), encoding="utf-8") as f:
                 gen_cfg = yaml.safe_load(f)
             self.assertEqual(gen_cfg["project_id"], "demo-proj-123")
-            self.assertEqual(gen_cfg["asset_scope"], "organizations/14682041824")
+            self.assertEqual(gen_cfg["asset_scope"], "organizations/999888777666")
             self.assertEqual(gen_cfg["jobs_view"], "JOBS_BY_ORGANIZATION")
             self.assertEqual(gen_cfg["governance"]["settings_admins"], ["alice@company.com"])
             self.assertEqual(
@@ -474,7 +474,7 @@ exit 0
 set -euo pipefail
 echo "gcloud $*" >> "{log_file}"
 if [[ "$*" == *"config get-value account"* ]]; then
-  echo "admin@temiomisore.altostrat.com"
+  echo "admin@acme-corp.example.com"
   exit 0
 fi
 if [[ "$*" == *"config get-value project"* ]]; then
@@ -482,7 +482,7 @@ if [[ "$*" == *"config get-value project"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"projects list"* ]]; then
-  printf "alpha-proj\\tAlpha Project\\ntemi-reverse-etl-project\\tReverse ETL\\n"
+  printf "alpha-proj\\tAlpha Project\\nanalytics-etl-project\\tReverse ETL\\n"
   exit 0
 fi
 if [[ "$*" == *"services enable"* ]]; then
@@ -498,7 +498,7 @@ if [[ "$*" == *"projects describe"* ]]; then
   exit 0
 fi
 if [[ "$*" == *"projects get-ancestors"* ]]; then
-  echo '[{{"type":"organization","id":"14682041824"}}]'
+  echo '[{{"type":"organization","id":"999888777666"}}]'
   exit 0
 fi
 if [[ "$*" == *"iam service-accounts describe"* ]]; then
@@ -511,7 +511,7 @@ if [[ "$*" == *"run services describe"* ]]; then
   if [[ "$*" == *"status.url"* ]]; then
     echo "https://bqopt-review-ui-retl-uc.a.run.app"
   elif [[ "$*" == *"containers[0].image"* ]]; then
-    echo "us-central1-docker.pkg.dev/temi-reverse-etl-project/cloud-run-source-deploy/bqopt-review-ui@sha256:cafebabe"
+    echo "us-central1-docker.pkg.dev/analytics-etl-project/cloud-run-source-deploy/bqopt-review-ui@sha256:cafebabe"
   fi
   exit 0
 fi
@@ -577,8 +577,8 @@ exit 0
                             break
                         output_chunks.append(chunk)
                         joined = b"".join(output_chunks)
-                        if (not sent_keys) and b"temi-reverse-etl-project" in joined:
-                            # Press Down-arrow (`\x1b[B`) to move from `alpha-proj` -> `temi-reverse-etl-project`, then Enter!
+                        if (not sent_keys) and b"analytics-etl-project" in joined:
+                            # Press Down-arrow (`\x1b[B`) to move from `alpha-proj` -> `analytics-etl-project`, then Enter!
                             os.write(master_fd, b"\x1b[B\r")
                             sent_keys = True
                     if proc.poll() is not None:
@@ -609,16 +609,16 @@ exit 0
 
             with open(os.path.join(work_repo, "config.yaml"), encoding="utf-8") as f:
                 gen_cfg = yaml.safe_load(f)
-            self.assertEqual(gen_cfg["project_id"], "temi-reverse-etl-project")
+            self.assertEqual(gen_cfg["project_id"], "analytics-etl-project")
 
             with open(log_file, encoding="utf-8") as f:
                 calls = f.read()
             self.assertNotIn("services list", calls)
             self.assertIn("gcloud artifacts repositories create cloud-run-source-deploy", calls)
-            expected_img = "us-central1-docker.pkg.dev/temi-reverse-etl-project/cloud-run-source-deploy/bqopt-review-ui:latest"
+            expected_img = "us-central1-docker.pkg.dev/analytics-etl-project/cloud-run-source-deploy/bqopt-review-ui:latest"
             self.assertIn(f"docker build -t {expected_img} .", calls)
             self.assertIn(f"docker push {expected_img}", calls)
-            self.assertIn(f"gcloud run deploy bqopt-review-ui --project=temi-reverse-etl-project --region=us-central1 --image={expected_img}", calls)
+            self.assertIn(f"gcloud run deploy bqopt-review-ui --project=analytics-etl-project --region=us-central1 --image={expected_img}", calls)
             self.assertIn("--schedule=0 3 * * *", calls)
 
     def test_execute_outside_change_window_defers_without_marking_failed(self):

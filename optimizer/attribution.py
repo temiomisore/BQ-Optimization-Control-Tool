@@ -44,8 +44,8 @@ SA_COLUMNS = {             # canonical output column -> config key
 SA_REQUIRED = ("service_account", "owner")
 
 # project (may be domain-scoped, e.g. example.com:proj) . dataset . table
-_TABLE_RE = re.compile(r"^[A-Za-z0-9_.:\-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_\-$]+$")
-_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TABLE_RE = re.compile(r"^[A-Za-z0-9_.:\-]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_\-$]+\Z")
+_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 class AttributionConfigError(ValueError):
@@ -58,7 +58,7 @@ def is_service_account(email: str | None) -> bool:
 
 def _table(name: Any, key: str) -> str:
     s = str(name or "").strip().strip("`")
-    if not _TABLE_RE.match(s):
+    if not _TABLE_RE.fullmatch(s) or ".." in s:
         raise AttributionConfigError(
             f"{key} must be a fully qualified table 'project.dataset.table', got {name!r}")
     return s
@@ -66,7 +66,7 @@ def _table(name: Any, key: str) -> str:
 
 def _col(name: Any, key: str) -> str:
     s = str(name or "").strip().strip("`")
-    if not _COL_RE.match(s):
+    if not _COL_RE.fullmatch(s):
         raise AttributionConfigError(f"{key}: invalid column name {name!r}")
     return s
 

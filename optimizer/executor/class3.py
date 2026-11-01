@@ -24,13 +24,16 @@ import datetime as dt
 import re
 import time
 
-from .. import bq
+from .. import bq, security
 from ..config import Config
 from .router import Blocked
 
 
 def _fq(cs: dict) -> str:
-    return f"{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}"
+    p = security.validate_project_id(cs["target_project"])
+    d = security.validate_dataset_id(cs["target_dataset"])
+    t = security.validate_table_id(cs["target_table"])
+    return f"{p}.{d}.{t}"
 
 
 def _progress(c: Config, cs: dict, step: str, data: dict) -> dict:
@@ -44,12 +47,12 @@ def _progress(c: Config, cs: dict, step: str, data: dict) -> dict:
 
 
 def _partition_expr(change: dict, col_type: str) -> str:
-    col = change["partition_column"]
-    gran = change.get("granularity", "DAY").upper()
+    qcol = security.quote_ident(change["partition_column"])
+    gran = security.validate_partition_granularity(change.get("granularity", "DAY"))
     if col_type in ("TIMESTAMP", "DATETIME"):
-        return f"{'DATE' if gran == 'DAY' else 'TIMESTAMP_TRUNC'}({col}"        \
+        return f"{'DATE' if gran == 'DAY' else 'TIMESTAMP_TRUNC'}({qcol}"        \
                + (")" if gran == "DAY" else f", {gran})")
-    return col  # DATE column partitions directly
+    return qcol  # DATE column partitions directly
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +78,8 @@ def capacity_plan(c: Config, cs: dict, change: dict) -> dict:
     """Pure: resolve the approved option into concrete reservation parameters.
     Option precedence: env BQOPT_RESERVATION_OPTION > change.selected_option > 1."""
     import os
-    proj = cs["target_project"]
-    region = (cs.get("target_region") or c.get("location", "US")).lower()
+    proj = security.validate_project_id(cs["target_project"])
+    region = security.validate_region(cs.get("target_region") or c.get("location", "US"))
     raw = os.environ.get("BQOPT_RESERVATION_OPTION") or change.get("selected_option") or 1
     try:
         opt = 2 if int(raw) == 2 else 1
@@ -171,8 +174,9 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
     dropped = []
     rloc = bq.location_for(plan.get("region") or _region_of(plan.get("reservation_fq")))
     if plan.get("assignment_fq"):
-        bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{plan['assignment_fq']}`", location=rloc)
-        dropped.append(plan["assignment_fq"])
+        afq = security.validate_assignment_fq(plan["assignment_fq"])
+        bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{afq}`", location=rloc)
+        dropped.append(afq)
     # Keep the reservation alive until routing has propagated back to on-demand; dropping it
     # immediately makes queries fail for a few minutes ("project does not have the reservation").
     res_short = (plan.get("reservation_fq") or "").split(".")[-1]
@@ -184,10 +188,11 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
             break
         time.sleep(10)
     if plan.get("created_reservation") and plan.get("reservation_fq"):
+        rfq = security.validate_reservation_fq(plan["reservation_fq"])
         for attempt in range(6):
             try:
-                bq.execute(c, f"DROP RESERVATION IF EXISTS `{plan['reservation_fq']}`", location=rloc)
-                dropped.append(plan["reservation_fq"])
+                bq.execute(c, f"DROP RESERVATION IF EXISTS `{rfq}`", location=rloc)
+                dropped.append(rfq)
                 break
             except Exception:
                 if attempt == 5:
@@ -213,12 +218,15 @@ def run(c: Config, cs: dict) -> dict:
 
     cli = bq.client(c)
     loc = bq.location_for(cs.get("target_region"))   # every statement on the target runs in its region
-    fq = _fq(cs)
+    proj = security.validate_project_id(cs["target_project"])
+    ds_id = security.validate_dataset_id(cs["target_dataset"])
+    tbl_id = security.validate_table_id(cs["target_table"])
+    fq = f"{proj}.{ds_id}.{tbl_id}"
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M")
-    new_name = f"{cs['target_table']}__bqopt_new"
-    bak_name = f"{cs['target_table']}__bqopt_bak_{ts}"
-    fq_new = f"{cs['target_project']}.{cs['target_dataset']}.{new_name}"
-    fq_bak = f"{cs['target_project']}.{cs['target_dataset']}.{bak_name}"
+    new_name = security.validate_table_id(f"{tbl_id}__bqopt_new")
+    bak_name = security.validate_table_id(f"{tbl_id}__bqopt_bak_{ts}")
+    fq_new = f"{proj}.{ds_id}.{new_name}"
+    fq_bak = f"{proj}.{ds_id}.{bak_name}"
     paused_transfers: list[str] = []
 
     def abort(reason: str) -> None:
@@ -266,8 +274,8 @@ def run(c: Config, cs: dict) -> dict:
 
     # ---- S1 CAPTURE -------------------------------------------------------
     ddl = bq.query(c, f"""
-        SELECT ddl FROM `{cs['target_project']}.{cs['target_dataset']}.INFORMATION_SCHEMA.TABLES`
-        WHERE table_name = @t""", {"t": cs["target_table"]}, location=loc)[0]["ddl"]
+        SELECT ddl FROM `{proj}.{ds_id}.INFORMATION_SCHEMA.TABLES`
+        WHERE table_name = @t""", {"t": tbl_id}, location=loc)[0]["ddl"]
     iam_policy = cli.get_iam_policy(table).to_api_repr()
     row_policies = []
     try:
@@ -279,7 +287,7 @@ def run(c: Config, cs: dict) -> dict:
                                      "filter_predicate": rp.filter_predicate})
         else:
             try:
-                rls_rows = bq.query(c, f"SELECT * FROM `{cs['target_project']}.{cs['target_dataset']}.INFORMATION_SCHEMA.ROW_ACCESS_POLICIES` WHERE table_name = @t", {"t": cs["target_table"]}, location=loc)
+                rls_rows = bq.query(c, f"SELECT * FROM `{proj}.{ds_id}.INFORMATION_SCHEMA.ROW_ACCESS_POLICIES` WHERE table_name = @t", {"t": tbl_id}, location=loc)
                 for rp in rls_rows:
                     row_policies.append({"policy_id": rp.get("row_access_policy_id"),
                                          "grantees": list(rp.get("grantees") or []),
@@ -288,9 +296,11 @@ def run(c: Config, cs: dict) -> dict:
                 row_policies = []
     except Exception as e:
         abort(f"could not enumerate row access policies ({e}) — will not risk dropping RLS")
-    snap = f"{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}__bqopt_snap_{ts}"
+    snap_tbl = security.validate_table_id(f"{tbl_id}__bqopt_snap_{ts}")
+    snap = f"{proj}.{ds_id}.{snap_tbl}"
+    hold_days = max(1, min(365, int(c["executor"]["backup_hold_days"])))
     bq.execute(c, f"""CREATE SNAPSHOT TABLE `{snap}` CLONE `{fq}`
-        OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {int(c['executor']['backup_hold_days'])} DAY))""", location=loc)
+        OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold_days} DAY))""", location=loc)
     rollback_plan = {"snapshot": snap, "backup": fq_bak, "iam_policy": iam_policy,
                      "row_policies": row_policies, "original_ddl": ddl,
                      "labels": dict(table.labels or {})}
@@ -303,10 +313,10 @@ def run(c: Config, cs: dict) -> dict:
     try:
         from google.cloud import bigquery_datatransfer_v1 as dts
         dcli = dts.DataTransferServiceClient()
-        parent = f"projects/{cs['target_project']}"
+        parent = f"projects/{proj}"
         for tc in dcli.list_transfer_configs(parent=parent):
             dest = (tc.destination_dataset_id or "")
-            if dest == cs["target_dataset"] and cs["target_table"] in str(tc.params):
+            if dest == ds_id and tbl_id in str(tc.params):
                 tc.disabled = True
                 dcli.update_transfer_config(transfer_config=tc, update_mask={"paths": ["disabled"]})
                 paused_transfers.append(tc.name)
@@ -322,8 +332,18 @@ def run(c: Config, cs: dict) -> dict:
     # ---- S3 BUILD ---------------------------------------------------------
     part_expr = _partition_expr(change, col_types[pcol])
     cluster_sql = ""
-    if change.get("cluster_columns"):
-        cluster_sql = "CLUSTER BY " + ", ".join(change["cluster_columns"])
+    raw_clusters = change.get("cluster_columns") or []
+    if raw_clusters:
+        if not isinstance(raw_clusters, list) or len(raw_clusters) > 4:
+            abort("cluster_columns must be a list of at most 4 column names")
+        try:
+            qclusters = [
+                security.quote_ident(security.validate_column_name(col, col_types.keys()))
+                for col in raw_clusters
+            ]
+        except security.SecurityValidationError as e:
+            abort(f"invalid cluster_columns: {e}")
+        cluster_sql = "CLUSTER BY " + ", ".join(qclusters)
     try:
         bq.execute(c, f"""
             CREATE TABLE `{fq_new}`
@@ -339,9 +359,10 @@ def run(c: Config, cs: dict) -> dict:
     delta_col = change.get("delta_column")
     if delta_col:
         try:
+            qdelta = security.quote_ident(security.validate_column_name(delta_col, col_types.keys()))
             n = bq.execute(c, f"""
                 INSERT INTO `{fq_new}`
-                SELECT * FROM `{fq}` WHERE {delta_col} > @b""",
+                SELECT * FROM `{fq}` WHERE {qdelta} > @b""",
                 {"b": build_start.isoformat()}, location=loc)
         except Exception as e:
             abort(f"delta sync failed: {e}")
@@ -365,9 +386,9 @@ def run(c: Config, cs: dict) -> dict:
     # ---- S6 SWAP ----------------------------------------------------------
     bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{bak_name}`", location=loc)
     try:
-        bq.execute(c, f"ALTER TABLE `{fq_new}` RENAME TO `{cs['target_table']}`", location=loc)
+        bq.execute(c, f"ALTER TABLE `{fq_new}` RENAME TO `{tbl_id}`", location=loc)
     except Exception as e:
-        bq.execute(c, f"ALTER TABLE `{fq_bak}` RENAME TO `{cs['target_table']}`", location=loc)
+        bq.execute(c, f"ALTER TABLE `{fq_bak}` RENAME TO `{tbl_id}`", location=loc)
         _resume_transfers(paused_transfers)
         _progress(c, cs, "SWAP_REVERTED", {"error": str(e)})
         raise Blocked(f"swap failed and was reverted: {e}") from e
@@ -385,10 +406,18 @@ def run(c: Config, cs: dict) -> dict:
         except Exception as e:
             _progress(c, cs, "S7_IAM_WARNING", {"warning": f"could not rebind IAM policy: {e}"})
     for rp in row_policies:
-        grantees = ", ".join(f'"{g}"' for g in rp["grantees"])
-        bq.execute(c, f"""
-            CREATE ROW ACCESS POLICY `{rp['policy_id']}` ON `{fq}`
-            GRANT TO ({grantees}) FILTER USING ({rp['filter_predicate']})""", location=loc)
+        pid = security.validate_rls_policy_id(rp["policy_id"])
+        validated_grantees = [security.validate_iam_grantee(g) for g in (rp.get("grantees") or [])]
+        if not validated_grantees:
+            raise Blocked(f"row access policy {pid!r} has no valid IAM grantees")
+        grantees = ", ".join(f'"{g}"' for g in validated_grantees)
+        pred = str(rp.get("filter_predicate") or "").strip()
+        rls_sql = (
+            f"CREATE ROW ACCESS POLICY `{pid}` ON `{fq}` "
+            f"GRANT TO ({grantees}) FILTER USING ({pred})"
+        )
+        bq.assert_single_statement_ddl(rls_sql, ("CREATE_ROW_ACCESS_POLICY",))
+        bq.execute(c, rls_sql, location=loc)
     if rollback_plan["labels"]:
         new_table.labels = rollback_plan["labels"]
         cli.update_table(new_table, ["labels"])
@@ -405,15 +434,16 @@ def run(c: Config, cs: dict) -> dict:
 
     # ---- S8 POSTCHECK -----------------------------------------------------
     time.sleep(2)
+    qpcol = security.quote_ident(pcol)
     canary = bq.query(c, f"SELECT COUNT(*) AS n FROM `{fq}` "
-                         f"WHERE {pcol} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
+                         f"WHERE {qpcol} >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
                       if col_types[pcol] != "DATE" else
                       f"SELECT COUNT(*) AS n FROM `{fq}` "
-                      f"WHERE {pcol} >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)", location=loc)[0]
+                      f"WHERE {qpcol} >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)", location=loc)[0]
     _progress(c, cs, "S8_POSTCHECK", {"recent_rows": int(canary["n"])})
 
     # ---- S9 HOLD ----------------------------------------------------------
-    hold = int(c["executor"]["backup_hold_days"])
+    hold = max(1, min(365, int(c["executor"]["backup_hold_days"])))
     bq.execute(c, f"""ALTER TABLE `{fq_bak}` SET OPTIONS (
         expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))""", location=loc)
     _progress(c, cs, "S9_HOLD", {"backup_expires_days": hold,
@@ -426,16 +456,21 @@ def rollback(c: Config, cs: dict) -> None:
     plan = bq.loads(cs.get("rollback_plan_json")) or {}
     if plan.get("action") == "CAPACITY_PRICING_MIGRATION":
         return _rollback_capacity_migration(c, cs, plan)
-    fq = _fq(cs)
-    bak = plan.get("backup")
-    if not bak:
+    proj = security.validate_project_id(cs["target_project"])
+    ds_id = security.validate_dataset_id(cs["target_dataset"])
+    tbl_id = security.validate_table_id(cs["target_table"])
+    fq = f"{proj}.{ds_id}.{tbl_id}"
+    raw_bak = plan.get("backup")
+    if not raw_bak:
         raise Blocked("no backup recorded; restore from snapshot " + str(plan.get("snapshot")))
+    bp, bd, bt = security.validate_fqn(raw_bak)
+    bak = f"{bp}.{bd}.{bt}"
     cli = bq.client(c)
     loc = bq.location_for(cs.get("target_region"))
-    hold = int(c["executor"]["backup_hold_days"])
+    hold = max(1, min(365, int(c["executor"]["backup_hold_days"])))
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M")
-    regressed_name = f"{cs['target_table']}__bqopt_regressed_{ts}"
-    regressed = f"{fq}__bqopt_regressed_{ts}"
+    regressed_name = security.validate_table_id(f"{tbl_id}__bqopt_regressed_{ts}")
+    regressed = f"{proj}.{ds_id}.{regressed_name}"
 
     try:
         cli.get_table(bak)
@@ -445,7 +480,7 @@ def rollback(c: Config, cs: dict) -> None:
 
     if bak_exists:
         bq.execute(c, f"ALTER TABLE `{fq}` RENAME TO `{regressed_name}`", location=loc)
-        bq.execute(c, f"ALTER TABLE `{bak}` RENAME TO `{cs['target_table']}`", location=loc)
+        bq.execute(c, f"ALTER TABLE `{bak}` RENAME TO `{tbl_id}`", location=loc)
         bq.execute(c, f"ALTER TABLE `{fq}` SET OPTIONS (expiration_timestamp = NULL)", location=loc)
         bq.execute(c, f"ALTER TABLE `{regressed}` SET OPTIONS (expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {hold} DAY))", location=loc)
     else:

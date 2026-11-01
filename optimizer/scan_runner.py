@@ -14,14 +14,24 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import sys
 import threading
 import time
 import uuid
 from typing import Any, Callable
 
-from . import bq, schema_guard
+from . import bq, schema_guard, security
 from .config import Config, cfg
+
+_EXEC_NAME_RE = re.compile(
+    r"^projects/[a-z][a-z0-9.:-]{0,62}/locations/[a-z][a-z0-9-]{1,39}"
+    r"/jobs/[a-zA-Z0-9_-]{1,63}/executions/[a-zA-Z0-9_-]{1,63}\Z"
+)
+_JOB_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
+_WAITERS_LOCK = threading.Lock()
+_ACTIVE_WAITERS = 0
+_MAX_CONCURRENT_WAITERS = 8
 
 _LOCK = threading.Lock()
 _COND = threading.Condition(_LOCK)
@@ -114,10 +124,26 @@ def _authed_session():
     return AuthorizedSession(creds)
 
 
+def _safe_log_uri(uri: Any) -> str | None:
+    if not uri:
+        return None
+    try:
+        s = security.validate_http_url(uri, max_len=1024, require_https=True)
+        if "console.cloud.google.com" in s:
+            return s
+    except security.SecurityValidationError:
+        pass
+    return None
+
+
 def _trigger_cloud_run_job(project_id: str, region: str, job_name: str) -> dict[str, Any]:
     """Trigger `python -m optimizer.cli scan` on the configured Cloud Run v2 Job."""
+    proj = security.validate_project_id(project_id)
+    reg = security.validate_region(region)
+    if not _JOB_NAME_RE.fullmatch(str(job_name or "")):
+        raise security.SecurityValidationError(f"Invalid Cloud Run job name: {job_name!r}")
     sess = _authed_session()
-    url = f"https://run.googleapis.com/v2/projects/{project_id}/locations/{region}/jobs/{job_name}:run"
+    url = f"https://run.googleapis.com/v2/projects/{proj}/locations/{reg}/jobs/{job_name}:run"
     body = {
         "overrides": {
             "containerOverrides": [
@@ -127,17 +153,20 @@ def _trigger_cloud_run_job(project_id: str, region: str, job_name: str) -> dict[
     }
     resp = sess.post(url, json=body, timeout=20)
     if resp.status_code >= 400:
-        raise RuntimeError(f"Cloud Run job {job_name} returned HTTP {resp.status_code}: {resp.text[:240]}")
+        raise RuntimeError(f"Cloud Run job {job_name} returned HTTP {resp.status_code}")
     payload = resp.json() if resp.content else {}
     # Long-running Operation metadata/response holds the Execution resource name.
     meta = payload.get("metadata") or {}
     response_obj = payload.get("response") or {}
-    exec_name = (
+    raw_exec = (
         meta.get("name")
         or response_obj.get("name")
         or (payload.get("name") if "/executions/" in str(payload.get("name") or "") else None)
     )
-    log_uri = meta.get("logUri") or response_obj.get("logUri")
+    exec_name = str(raw_exec).lstrip("/") if raw_exec else None
+    if exec_name and not _EXEC_NAME_RE.fullmatch(exec_name):
+        exec_name = None
+    log_uri = _safe_log_uri(meta.get("logUri") or response_obj.get("logUri"))
     return {"execution_name": exec_name, "log_uri": log_uri}
 
 
@@ -148,11 +177,11 @@ def _poll_cloud_run_execution() -> None:
             return
         exec_name = _STATE.get("execution_name")
         cbs = list(_ON_FINISH_CBS)
-    if not exec_name:
+    if not exec_name or not _EXEC_NAME_RE.fullmatch(str(exec_name).lstrip("/")):
         return
     try:
         sess = _authed_session()
-        resp = sess.get(f"https://run.googleapis.com/v2/{exec_name.lstrip('/')}", timeout=10)
+        resp = sess.get(f"https://run.googleapis.com/v2/{str(exec_name).lstrip('/')}", timeout=10)
         if resp.status_code >= 400:
             return
         ex = resp.json()
@@ -163,7 +192,7 @@ def _poll_cloud_run_execution() -> None:
     failed = int(ex.get("failedCount") or 0)
     cancelled = int(ex.get("cancelledCount") or 0)
     completion_time = ex.get("completionTime")
-    log_uri = ex.get("logUri")
+    log_uri = _safe_log_uri(ex.get("logUri"))
 
     finished_now = False
     with _LOCK:
@@ -358,19 +387,30 @@ def start_scan(
 
 def get_status(c: Config, *, wait_since_seq: int | None = None, wait_sec: float = 0.0) -> dict[str, Any]:
     """Return current scan status; optionally hold open briefly while an in-process scan runs."""
+    global _ACTIVE_WAITERS
     _poll_cloud_run_execution()
     if wait_sec > 0 and wait_since_seq is not None:
-        deadline = time.monotonic() + min(wait_sec, 15.0)
-        with _LOCK:
-            while (
-                _STATE["state"] == "running"
-                and _STATE["mode"] == "in_process"
-                and int(_STATE.get("seq") or 0) <= wait_since_seq
-            ):
-                rem = deadline - time.monotonic()
-                if rem <= 0:
-                    break
-                _COND.wait(timeout=rem)
+        can_wait = False
+        with _WAITERS_LOCK:
+            if _ACTIVE_WAITERS < _MAX_CONCURRENT_WAITERS:
+                _ACTIVE_WAITERS += 1
+                can_wait = True
+        if can_wait:
+            try:
+                deadline = time.monotonic() + min(wait_sec, 12.0)
+                with _LOCK:
+                    while (
+                        _STATE["state"] == "running"
+                        and _STATE["mode"] == "in_process"
+                        and int(_STATE.get("seq") or 0) <= wait_since_seq
+                    ):
+                        rem = deadline - time.monotonic()
+                        if rem <= 0:
+                            break
+                        _COND.wait(timeout=rem)
+            finally:
+                with _WAITERS_LOCK:
+                    _ACTIVE_WAITERS = max(0, _ACTIVE_WAITERS - 1)
 
     with _LOCK:
         snap = copy_state = {

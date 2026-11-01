@@ -10,13 +10,22 @@ from __future__ import annotations
 
 import datetime as dt
 
-from .. import bq
+from .. import bq, security
 from ..config import Config
 from .router import Blocked
 
 
 def _table_ref(cs: dict) -> str:
-    return f"{cs['target_project']}.{cs['target_dataset']}.{cs['target_table']}"
+    p = security.validate_project_id(cs["target_project"])
+    d = security.validate_dataset_id(cs["target_dataset"])
+    t = security.validate_table_id(cs["target_table"])
+    return f"{p}.{d}.{t}"
+
+
+def _dataset_ref(cs: dict) -> str:
+    p = security.validate_project_id(cs["target_project"])
+    d = security.validate_dataset_id(cs["target_dataset"])
+    return f"{p}.{d}"
 
 
 def _fresh_would_break_count(c: Config, cs: dict, pcol: str) -> int:
@@ -68,18 +77,24 @@ def apply(c: Config, cs: dict) -> dict:
         return {"action": action, "prior_expires": prior}
 
     if action == "SET_DATASET_DEFAULT_EXPIRATION":
-        ds = cli.get_dataset(f"{cs['target_project']}.{cs['target_dataset']}")
+        ds = cli.get_dataset(_dataset_ref(cs))
         prior = ds.default_table_expiration_ms
-        ds.default_table_expiration_ms = int(change["days"]) * 24 * 3600 * 1000
+        days = int(change["days"])
+        if not (1 <= days <= 36500):
+            raise ValueError(f"default expiration days out of bounds: {days}")
+        ds.default_table_expiration_ms = days * 24 * 3600 * 1000
         cli.update_dataset(ds, ["default_table_expiration_ms"])
         return {"action": action, "prior_default_expiration_ms": prior,
                 "note": "Applies to NEW tables; existing tables untouched by design."}
 
     if action == "SET_STORAGE_BILLING_MODEL":
-        ds = cli.get_dataset(f"{cs['target_project']}.{cs['target_dataset']}")
+        ds = cli.get_dataset(_dataset_ref(cs))
         prior = getattr(ds, "storage_billing_model", None)
+        model = str(change.get("model") or "").strip().upper()
+        if model not in ("PHYSICAL", "LOGICAL"):
+            raise ValueError(f"invalid storage_billing_model {model!r}")
         try:
-            ds.storage_billing_model = change["model"]
+            ds.storage_billing_model = model
             cli.update_dataset(ds, ["storage_billing_model"])
         except Exception as e:
             raise Blocked(f"client library could not set storage_billing_model: {e}. "
@@ -88,18 +103,20 @@ def apply(c: Config, cs: dict) -> dict:
                 "note": "Takes effect within ~24h; 14-day lock before switching back."}
 
     if action in ("ARCHIVE_AND_DROP_TABLE", "ARCHIVE_TO_GCS_PARQUET"):
-        proj = cs["target_project"]
-        ds_id = cs["target_dataset"]
-        tbl_id = cs["target_table"]
+        proj = security.validate_project_id(cs["target_project"])
+        ds_id = security.validate_dataset_id(cs["target_dataset"])
+        tbl_id = security.validate_table_id(cs["target_table"])
         target_fqn = f"`{proj}.{ds_id}.{tbl_id}`"
-        backup_fqn = f"`{proj}.{ds_id}.{tbl_id}__bqopt_backup`"
-        bucket_name = change.get("bucket_name") or f"{proj}-bq-archive"
-        archive_uri = change.get("archive_uri") or f"gs://{bucket_name}/{ds_id}/{tbl_id}/*.parquet"
+        backup_tbl = security.validate_table_id(f"{tbl_id}__bqopt_backup")
+        backup_fqn = f"`{proj}.{ds_id}.{backup_tbl}`"
+        bucket_name = str(change.get("bucket_name") or f"{proj}-bq-archive").strip()
+        raw_uri = change.get("archive_uri") or f"gs://{bucket_name}/{ds_id}/{tbl_id}/*.parquet"
+        archive_uri = security.validate_gcs_uri(raw_uri)
 
         # 1. Create a zero-copy clone backup first for safety
         bq.execute(c, f"CREATE OR REPLACE TABLE {backup_fqn} CLONE {target_fqn}", location=loc)
 
-        # 2. Export table data to Cloud Storage Parquet
+        # 2. Export table data to Cloud Storage Parquet (archive_uri strictly validated by validate_gcs_uri)
         export_sql = f"EXPORT DATA OPTIONS(uri='{archive_uri}', format='PARQUET') AS SELECT * FROM {target_fqn}"
         bq.execute(c, export_sql, location=loc)
 
@@ -110,24 +127,29 @@ def apply(c: Config, cs: dict) -> dict:
         return {
             "action": action,
             "archive_uri": archive_uri,
-            "backup_table": f"{proj}.{ds_id}.{tbl_id}__bqopt_backup",
+            "backup_table": f"{proj}.{ds_id}.{backup_tbl}",
             "dropped": action == "ARCHIVE_AND_DROP_TABLE",
             "note": f"Archived to {archive_uri}. Backup clone retained as {backup_fqn}."
         }
     if action == "SET_TIME_TRAVEL_WINDOW":
-        ds = cli.get_dataset(f"{cs['target_project']}.{cs['target_dataset']}")
+        ds_ref = _dataset_ref(cs)
+        ds = cli.get_dataset(ds_ref)
         prior = getattr(ds, "max_time_travel_hours", 168)
         hours = int(change.get("hours", 48))
-        bq.execute(c, f"ALTER SCHEMA `{cs['target_project']}.{cs['target_dataset']}` SET OPTIONS(max_time_travel_hours = {hours});", location=loc)
+        if not (48 <= hours <= 168):
+            raise ValueError(f"max_time_travel_hours must be between 48 and 168, got {hours}")
+        bq.execute(c, f"ALTER SCHEMA `{ds_ref}` SET OPTIONS(max_time_travel_hours = {hours});", location=loc)
         return {"action": action, "prior_hours": prior, "note": f"Time-travel window reduced to {hours}h."}
 
     if action == "ENABLE_ADAPTIVE_OPTIMIZATION":
-        proj = cs["target_project"]
+        proj = security.validate_project_id(cs["target_project"])
         bq.execute(c, f"ALTER PROJECT `{proj}` SET OPTIONS(default_query_optimizer_options = 'adaptive=on');")
         return {"action": action, "note": "Adaptive query optimization enabled at project level."}
 
     if action == "ADD_PK_FK_CONSTRAINT":
-        ddl = change.get("generated_ddl") or f"ALTER TABLE `{_table_ref(cs)}` ADD PRIMARY KEY (id) NOT ENFORCED;"
+        tref = _table_ref(cs)
+        ddl = change.get("generated_ddl") or f"ALTER TABLE `{tref}` ADD PRIMARY KEY (id) NOT ENFORCED;"
+        bq.assert_single_statement_ddl(ddl, ("ALTER_TABLE_CONSTRAINT",))
         bq.execute(c, ddl, location=loc)
         return {"action": action, "applied_ddl": ddl, "note": "Unenforced constraint added for join elimination."}
 
@@ -161,7 +183,7 @@ def rollback(c: Config, cs: dict) -> None:
         table.require_partition_filter = bool(plan.get("prior"))
         cli.update_table(table, ["require_partition_filter"])
     elif action == "SET_DATASET_DEFAULT_EXPIRATION":
-        ds = cli.get_dataset(f"{cs['target_project']}.{cs['target_dataset']}")
+        ds = cli.get_dataset(_dataset_ref(cs))
         ds.default_table_expiration_ms = plan.get("prior_default_expiration_ms")
         cli.update_dataset(ds, ["default_table_expiration_ms"])
     elif action == "SET_STORAGE_BILLING_MODEL":
@@ -169,8 +191,13 @@ def rollback(c: Config, cs: dict) -> None:
     elif action in ("ARCHIVE_AND_DROP_TABLE", "ARCHIVE_TO_GCS_PARQUET"):
         if plan.get("dropped") and plan.get("backup_table"):
             target_fqn = f"`{_table_ref(cs)}`"
-            backup_fqn = f"`{plan['backup_table']}`"
+            bp, bd, bt = security.validate_fqn(plan["backup_table"])
+            backup_fqn = f"`{bp}.{bd}.{bt}`"
             bq.execute(c, f"CREATE OR REPLACE TABLE {target_fqn} CLONE {backup_fqn}", location=loc)
+    elif action == "SET_TIME_TRAVEL_WINDOW":
+        prior_h = int(plan.get("prior_hours", 168))
+        if 48 <= prior_h <= 168:
+            bq.execute(c, f"ALTER SCHEMA `{_dataset_ref(cs)}` SET OPTIONS(max_time_travel_hours = {prior_h});", location=loc)
     elif action == "APPLY_HUMAN_COST_GUARDRAIL":
         return
 

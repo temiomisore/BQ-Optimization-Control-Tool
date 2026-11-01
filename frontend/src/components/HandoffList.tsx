@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { ChevronDown, GitBranch, GitMerge, GitPullRequest, FileCode2 } from "lucide-react";
-import type { ChangeSet, RegionsInfo } from "@/lib/api";
+import { safeHttpUrl, type ChangeSet, type RegionsInfo } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import { ago, cn, fmtDate, targetLabel, usd } from "@/lib/utils";
 import { Badge, Button, Dialog, Empty } from "./ui";
@@ -25,7 +25,7 @@ export function HandoffList({ cards, regions }: { cards: ChangeSet[]; regions?: 
     );
   }
 
-  const validUrl = !prUrl.trim() || /^https?:\/\//.test(prUrl.trim());
+  const validUrl = !prUrl.trim() || safeHttpUrl(prUrl) !== null;
 
   return (
     <div className="space-y-3">
