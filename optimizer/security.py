@@ -74,6 +74,30 @@ def validate_table_id(table_id: Any) -> str:
     return s
 
 
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,63}\Z")
+_COL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,299}\Z")
+
+
+def validate_bq_identifier(value: Any, *, kind: str = "identifier") -> str:
+    """Validate a BigQuery dataset, table, or column identifier strictly against SQL injection."""
+    if kind in ("dataset", "target_dataset", "ops_dataset"):
+        return validate_dataset_id(value)
+    if kind in ("table", "target_table"):
+        return validate_table_id(value)
+    s = str(value or "").strip().strip("`")
+    if not s or not _COL_RE.fullmatch(s):
+        raise SecurityValidationError(f"Invalid BigQuery {kind}: {value!r}")
+    return s
+
+
+def validate_email(email: Any) -> str:
+    """Validate and normalize a human or service-account email address."""
+    s = str(email or "").strip().lower()
+    if not s or len(s) > 254 or ".." in s or not _EMAIL_RE.fullmatch(s):
+        raise SecurityValidationError(f"Invalid email address: {email!r}")
+    return s
+
+
 def validate_region(region: Any) -> str:
     s = str(region or "").strip().lower()
     if s.startswith("region-"):

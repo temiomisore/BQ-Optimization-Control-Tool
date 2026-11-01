@@ -449,6 +449,23 @@ class TestSqlValidationExecutorAndPrHandoff(unittest.TestCase):
             security.validate_gcs_uri("gs://my-archive-bucket/analytics/orders/*.parquet"),
             "gs://my-archive-bucket/analytics/orders/*.parquet",
         )
+        self.assertEqual(security.validate_bq_identifier("analytics", kind="target_dataset"), "analytics")
+        self.assertEqual(security.validate_bq_identifier("orders_2026", kind="target_table"), "orders_2026")
+        self.assertEqual(security.validate_bq_identifier("order_ts", kind="partition_column"), "order_ts")
+        self.assertEqual(security.validate_email("Alice.Admin@Company.com"), "alice.admin@company.com")
+        for bad_email in ("not-an-email", "a@b", "alice@company.com\nBCC:evil@x.com"):
+            with self.assertRaises(security.SecurityValidationError):
+                security.validate_email(bad_email)
+
+        cs_repart = {
+            "target_project": "sec-proj-01",
+            "target_dataset": "analytics",
+            "target_table": "orders",
+            "proposed": {"action": "REPARTITION", "partition_column": "created_at", "granularity": "DAY"},
+            "evidence": {},
+        }
+        review_main._enrich_repartition(cs_repart)
+        self.assertIn("PARTITION BY DATE(created_at)", cs_repart["proposed"]["generated_ddl"])
 
     def test_assert_ddl_statement_blocks_multistatement_and_dangerous_keywords(self):
         ok_alter = "ALTER TABLE `my-proj.analytics.orders` SET OPTIONS (require_partition_filter = TRUE);"
