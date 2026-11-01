@@ -1,0 +1,7 @@
+{
+  "title": "BigQuery Optimization Control Plane",
+  "name": "bq-optimization-control-tool",
+  "duration": 4,
+  "collect_project": false,
+  "collect_region": false
+}

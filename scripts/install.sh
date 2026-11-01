@@ -4,14 +4,16 @@
 # ==============================================================================
 # Designed for Google Cloud Shell (zero local installs or copy-pasting required).
 #
-# Supports BOTH:
-#   - Automatic zero-paste launch via Google's official `gcr.io/cloudrun/button`
-#     (`app.json` lifecycle hooks: --phase=prepare|postbuild|precreate|finalize)
+# Supports ALL THREE launch modes:
+#   - Automatic zero-paste launch via Google Cloud Shell's certified, pre-cached
+#     `gcr.io/ds-artifacts-cloudshell/deploystack_custom_image` (`.deploystack/scripts/preinstall.sh`)
+#   - `app.json` lifecycle hooks (`--phase=prepare|postbuild|precreate|finalize`)
 #   - Standalone manual CLI execution (`./scripts/install.sh --yes`)
 #
 # What this script sets up automatically:
-#   1. Auto-detects your Google login, GCP Project, Project Number & Organization
-#   2. Enables required Google Cloud APIs
+#   1. Auto-detects your Google login, interactively asks which GCP Project to deploy into
+#      (when `--prompt-project` or unset), and reads Project Number & Organization
+#   2. Enables required Google Cloud APIs via `BatchEnable` (zero `Services.List` quota calls)
 #   3. Creates a dedicated Service Account (bqopt-sa) & grants BigQuery / AI roles
 #   4. Writes config.yaml with safe production guardrails & makes YOU Settings Admin
 #   5. Deploys the Web UI to Cloud Run protected by Direct Identity-Aware Proxy (IAP)
@@ -19,6 +21,7 @@
 #   7. Schedules automatic nightly scans at 02:00 UTC via Cloud Scheduler
 #
 # Usage:
+#   ./scripts/install.sh --prompt-project --yes
 #   ./scripts/install.sh --yes
 #   ./scripts/install.sh --project=my-gcp-project --finops=finops@company.com --yes
 # ==============================================================================
@@ -46,6 +49,7 @@ SA_NAME="bqopt-sa"
 ALLOW_DOMAIN="auto"       # auto = allow corporate @domain.com on IAP, skip consumer domains
 ENABLE_IAP="true"
 ASSUME_YES="false"
+PROMPT_PROJECT="false"
 RUN_FIRST_SCAN="false"
 PHASE="all"               # all | prepare | postbuild | precreate | finalize
 PREBUILT_IMAGE="${IMAGE_URL:-}"
@@ -59,6 +63,7 @@ Usage: ./scripts/install.sh [options]
 
 Options:
   --project=PROJECT_ID             GCP project to host the app & optimizer_ops dataset
+  --prompt-project                 Always ask interactively which GCP project to deploy into
   --region=REGION                  Cloud Run & Scheduler region (default: us-central1)
   --bq-location=LOCATION           BigQuery home location for optimizer_ops (default: US)
   --ops-dataset=DATASET            BigQuery ops dataset name (default: optimizer_ops)
@@ -78,6 +83,7 @@ EOF
 for arg in "$@"; do
   case "$arg" in
     --project=*)             PROJECT_ID="${arg#*=}"; EXPLICIT_PROJECT="true" ;;
+    --prompt-project)        PROMPT_PROJECT="true" ;;
     --region=*)              RUN_REGION="${arg#*=}"; EXPLICIT_REGION="true" ;;
     --bq-location=*)         BQ_LOCATION="${arg#*=}" ;;
     --ops-dataset=*)         OPS_DATASET="${arg#*=}" ;;
@@ -292,49 +298,197 @@ run_prepare_steps() {
   # ---- Step 1: Detect identity, project, number & organization ---------------
   step "[1/7] Detecting your Google Cloud account & project..."
 
+  local _has_tty="false"
+  if [[ -t 0 ]]; then
+    _has_tty="true"
+  elif [[ "${BQOPT_NO_TTY:-0}" != "1" && -c /dev/tty ]] && { true </dev/tty; } 2>/dev/null; then
+    _has_tty="true"
+  fi
+
   if [[ -z "$ADMIN_EMAIL" ]]; then
     ADMIN_EMAIL="$(gcloud config get-value account 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  if [[ -z "$ADMIN_EMAIL" || "$ADMIN_EMAIL" != *"@"* ]]; then
+    if [[ "$_has_tty" == "true" && "${BQOPT_NO_TTY:-0}" != "1" ]]; then
+      warn "Cloud Shell opened without your Google login (this happens if 'Trust repo' wasn't checked)."
+      warn "Sign in below to continue, OR re-click 'Open in Cloud Shell' and check 'Trust repo':"
+      CLOUDSDK_CORE_DISABLE_PROMPTS=0 gcloud auth login </dev/tty >/dev/tty 2>/dev/tty || true
+      ADMIN_EMAIL="$(gcloud config get-value account 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
   fi
   if [[ -z "$ADMIN_EMAIL" || "$ADMIN_EMAIL" != *"@"* ]]; then
     echo "❌ No active Google Cloud login detected. Run: gcloud auth login" >&2
     exit 1
   fi
 
-  if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" || "$PROJECT_ID" == "<walkthrough-project-id/>" ]]; then
-    PROJECT_ID=""
-    _ACTIVE_PROJ="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ -n "$_ACTIVE_PROJ" && "$_ACTIVE_PROJ" != "(unset)" && "$_ACTIVE_PROJ" != "{}" ]]; then
-      PROJECT_ID="$_ACTIVE_PROJ"
-    fi
+  local _active_proj=""
+  _active_proj="$(gcloud config get-value project 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$_active_proj" == "(unset)" || "$_active_proj" == "{}" || "$_active_proj" == "<walkthrough-project-id/>" ]]; then
+    _active_proj=""
   fi
-  if [[ -z "$PROJECT_ID" && -t 0 ]]; then
+
+  if [[ "$PROMPT_PROJECT" == "true" && "$EXPLICIT_PROJECT" == "false" ]]; then
+    PROJECT_ID=""
+  elif [[ -z "$PROJECT_ID" || "$PROJECT_ID" == "(unset)" || "$PROJECT_ID" == "<walkthrough-project-id/>" ]]; then
+    PROJECT_ID="$_active_proj"
+  fi
+
+  if [[ -z "$PROJECT_ID" && "$_has_tty" == "true" ]]; then
     echo ""
     echo "  Fetching your Google Cloud projects..."
-    _PROJ_IDS=()
-    _PROJ_NAMES=()
-    while IFS=$'\t' read -r _pid _pname; do
-      [[ -z "$_pid" ]] && continue
-      _PROJ_IDS+=("$_pid")
-      _PROJ_NAMES+=("${_pname:-$_pid}")
-    done < <(gcloud projects list --sort-by=projectId --limit=30 --format="value(projectId,name)" --quiet 2>/dev/null || true)
+    local _proj_tsv=""
+    _proj_tsv="$(gcloud projects list --sort-by=projectId --limit=100 --format="value(projectId,name)" --quiet 2>/dev/null || true)"
 
-    if [[ "${#_PROJ_IDS[@]}" -gt 0 ]]; then
-      echo "  Which Google Cloud project should host the app & ${OPS_DATASET} dataset?"
-      echo ""
-      for _i in "${!_PROJ_IDS[@]}"; do
-        printf "    [%d] %-34s (%s)\n" "$((_i + 1))" "${_PROJ_IDS[$_i]}" "${_PROJ_NAMES[$_i]}"
-      done
-      echo ""
-      read -r -p "  Enter a number [1-${#_PROJ_IDS[@]}] or type a Project ID: " _CHOICE
-      _CHOICE="$(printf '%s' "$_CHOICE" | tr -d '[:space:]')"
-      if [[ "$_CHOICE" =~ ^[0-9]+$ ]] && (( _CHOICE >= 1 && _CHOICE <= ${#_PROJ_IDS[@]} )); then
-        PROJECT_ID="${_PROJ_IDS[$((_CHOICE - 1))]}"
-      else
-        PROJECT_ID="$_CHOICE"
+    if [[ -n "$_proj_tsv" && "${BQOPT_NO_TTY:-0}" != "1" && "${BQOPT_SIMPLE_PICKER:-0}" != "1" && -c /dev/tty ]] && { true </dev/tty >/dev/tty; } 2>/dev/null; then
+      local _pick_rc=0
+      PROJECT_ID="$(PROJ_TSV="$_proj_tsv" DEFAULT_PROJ="$_active_proj" OPS_DATASET="$OPS_DATASET" python3 - <<'PY'
+import os, select, sys, termios, tty
+
+rows = []
+for raw in os.environ.get("PROJ_TSV", "").splitlines():
+    if not raw.strip():
+        continue
+    parts = raw.split("\t", 1)
+    pid = parts[0].strip()
+    pname = (parts[1].strip() if len(parts) > 1 and parts[1].strip() else pid)
+    if pid:
+        rows.append((pid, pname))
+
+if not rows:
+    sys.exit(2)
+
+default_proj = os.environ.get("DEFAULT_PROJ", "").strip()
+ops_ds = os.environ.get("OPS_DATASET", "optimizer_ops")
+idx = next((i for i, (pid, _) in enumerate(rows) if pid == default_proj), 0)
+items = rows + [("__MANUAL__", "Enter a Project ID manually...")]
+win = min(10, len(items))
+top = max(0, min(idx - win // 2, len(items) - win))
+
+tty_r = open("/dev/tty", "rb", buffering=0)
+tty_w = open("/dev/tty", "w", encoding="utf-8", buffering=1)
+fd = tty_r.fileno()
+old_attrs = termios.tcgetattr(fd)
+drawn = 0
+
+def render():
+    global drawn, top
+    if idx < top:
+        top = idx
+    elif idx >= top + win:
+        top = idx - win + 1
+    out = []
+    if drawn > 0:
+        out.append(f"\033[{drawn}A")
+    header = f"  \033[1;36m?\033[0m \033[1mChoose a GCP project for the app & {ops_ds}\033[0m \033[2m(↑/↓ arrows, Enter to select)\033[0m"
+    out.append("\r\033[2K" + header + "\n")
+    lines = 1
+    for pos in range(top, top + win):
+        pid, pname = items[pos]
+        sel = (pos == idx)
+        if pid == "__MANUAL__":
+            label = f"✎ {pname}"
+        else:
+            label = f"{pid:<34} ({pname})"
+        if sel:
+            out.append(f"\r\033[2K    \033[1;36m❯ {label}\033[0m\n")
+        else:
+            out.append(f"\r\033[2K      {label}\n")
+        lines += 1
+    if len(items) > win:
+        hint = f"      \033[2mShowing {top + 1}-{top + win} of {len(items) - 1} projects\033[0m"
+        out.append("\r\033[2K" + hint + "\n")
+        lines += 1
+    tty_w.write("".join(out))
+    tty_w.flush()
+    drawn = lines
+
+chosen = None
+try:
+    tty_w.write("\033[?25l")
+    tty_w.flush()
+    tty.setraw(fd)
+    render()
+    while True:
+        ch = os.read(fd, 1)
+        if not ch:
+            break
+        if ch == b"\x03":  # Ctrl+C
+            chosen = "__ABORT__"
+            break
+        if ch in (b"\r", b"\n"):
+            chosen = items[idx][0]
+            break
+        if ch in (b"k", b"K"):
+            idx = (idx - 1) % len(items)
+            render()
+        elif ch in (b"j", b"J"):
+            idx = (idx + 1) % len(items)
+            render()
+        elif ch == b"\x1b":
+            if select.select([fd], [], [], 0.05)[0]:
+                seq = os.read(fd, 2)
+                if seq in (b"[A", b"OA"):
+                    idx = (idx - 1) % len(items)
+                    render()
+                elif seq in (b"[B", b"OB"):
+                    idx = (idx + 1) % len(items)
+                    render()
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+    tty_w.write("\033[?25h")
+    tty_w.flush()
+
+if chosen == "__ABORT__":
+    tty_w.write("\n")
+    tty_w.flush()
+    sys.exit(130)
+
+if chosen == "__MANUAL__":
+    tty_w.write("  Enter the GCP Project ID to install into: ")
+    tty_w.flush()
+    line = tty_r.readline().decode("utf-8", errors="ignore").strip()
+    chosen = "".join(line.split())
+
+tty_r.close()
+tty_w.close()
+if chosen:
+    print(chosen)
+PY
+)" || _pick_rc=$?
+      if (( _pick_rc == 130 )); then
+        echo "❌ Setup cancelled." >&2
+        exit 130
       fi
-    else
-      read -r -p "  Enter the GCP Project ID to install into: " PROJECT_ID
-      PROJECT_ID="$(printf '%s' "$PROJECT_ID" | tr -d '[:space:]')"
+    fi
+
+    # Fallback numbered picker (for non-raw TTYs or automated piped tests)
+    if [[ -z "$PROJECT_ID" ]]; then
+      _PROJ_IDS=()
+      _PROJ_NAMES=()
+      while IFS=$'\t' read -r _pid _pname; do
+        [[ -z "$_pid" ]] && continue
+        _PROJ_IDS+=("$_pid")
+        _PROJ_NAMES+=("${_pname:-$_pid}")
+      done <<< "$_proj_tsv"
+
+      if [[ "${#_PROJ_IDS[@]}" -gt 0 ]]; then
+        echo "  Which Google Cloud project should host the app & ${OPS_DATASET} dataset?"
+        echo ""
+        for _i in "${!_PROJ_IDS[@]}"; do
+          printf "    [%d] %-34s (%s)\n" "$((_i + 1))" "${_PROJ_IDS[$_i]}" "${_PROJ_NAMES[$_i]}"
+        done
+        echo ""
+        read -r -p "  Enter a number [1-${#_PROJ_IDS[@]}] or type a Project ID: " _CHOICE
+        _CHOICE="$(printf '%s' "$_CHOICE" | tr -d '[:space:]')"
+        if [[ "$_CHOICE" =~ ^[0-9]+$ ]] && (( _CHOICE >= 1 && _CHOICE <= ${#_PROJ_IDS[@]} )); then
+          PROJECT_ID="${_PROJ_IDS[$((_CHOICE - 1))]}"
+        else
+          PROJECT_ID="$_CHOICE"
+        fi
+      else
+        read -r -p "  Enter the GCP Project ID to install into: " PROJECT_ID
+        PROJECT_ID="$(printf '%s' "$PROJECT_ID" | tr -d '[:space:]')"
+      fi
     fi
   fi
   if [[ -z "$PROJECT_ID" ]]; then
@@ -374,25 +528,48 @@ run_prepare_steps() {
     read -r -p "  Press Enter to set everything up automatically (or Ctrl+C to cancel)... " _
   fi
 
-  # Enable APIs first so project number, ancestry, Cloud Run, Build, IAP & Scheduler work cleanly.
+  # Enable APIs via BatchEnable (never calls serviceusage.Services.List, avoiding Cloud Shell's
+  # shared 618104708054 List quota limit). Includes automatic backoff if transient 429 occurs.
   step "[2/7] Enabling required Google Cloud APIs (~30-60s on a fresh project)..."
-  gcloud services enable \
-    cloudresourcemanager.googleapis.com \
-    serviceusage.googleapis.com \
-    iam.googleapis.com \
-    bigquery.googleapis.com \
-    bigquerydatatransfer.googleapis.com \
-    bigquerystorage.googleapis.com \
-    bigqueryreservation.googleapis.com \
-    recommender.googleapis.com \
-    cloudasset.googleapis.com \
-    run.googleapis.com \
-    cloudbuild.googleapis.com \
-    artifactregistry.googleapis.com \
-    cloudscheduler.googleapis.com \
-    iap.googleapis.com \
-    aiplatform.googleapis.com \
-    --project="$PROJECT_ID" --quiet
+  local -a _req_apis=(
+    cloudresourcemanager.googleapis.com
+    serviceusage.googleapis.com
+    iam.googleapis.com
+    bigquery.googleapis.com
+    bigquerydatatransfer.googleapis.com
+    bigquerystorage.googleapis.com
+    bigqueryreservation.googleapis.com
+    recommender.googleapis.com
+    cloudasset.googleapis.com
+    run.googleapis.com
+    cloudbuild.googleapis.com
+    artifactregistry.googleapis.com
+    cloudscheduler.googleapis.com
+    iap.googleapis.com
+    aiplatform.googleapis.com
+  )
+  local _api_log
+  _api_log="$(mktemp "${TMPDIR:-/tmp}/bqopt_apis.XXXXXX")"
+  if ! gcloud services enable "${_req_apis[@]}" --project="$PROJECT_ID" --quiet 2>"$_api_log"; then
+    local _api_ok="false"
+    if grep -qiE "429|RESOURCE_EXHAUSTED|rateLimitExceeded|Quota exceeded" "$_api_log"; then
+      for _api_wait in 10 20; do
+        warn "Service Usage API rate-limited; retrying in ${_api_wait}s..."
+        sleep "${BQOPT_API_RETRY_SLEEP_SECONDS:-$_api_wait}"
+        if gcloud services enable "${_req_apis[@]}" --project="$PROJECT_ID" --billing-project="$PROJECT_ID" --quiet 2>"$_api_log" \
+           || gcloud services enable "${_req_apis[@]}" --project="$PROJECT_ID" --quiet 2>"$_api_log"; then
+          _api_ok="true"
+          break
+        fi
+      done
+    fi
+    if [[ "$_api_ok" != "true" ]]; then
+      cat "$_api_log" >&2
+      rm -f "$_api_log"
+      exit 1
+    fi
+  fi
+  rm -f "$_api_log"
   ok "All required Google Cloud APIs enabled."
 
   EXISTING_BEFORE="false"
@@ -465,17 +642,26 @@ PY
       --quiet >/dev/null
   done
 
+  # Detect whether a local Docker daemon is available (standard in Cloud Shell) so we can build &
+  # push directly with user credentials, skipping Cloud Build gs://run-sources IAM cache delays.
+  local _has_local_docker="false"
+  if [[ -z "$PREBUILT_IMAGE" && "${BQOPT_SKIP_LOCAL_DOCKER:-0}" != "1" ]] \
+     && command -v docker >/dev/null 2>&1 \
+     && docker info >/dev/null 2>&1; then
+    _has_local_docker="true"
+  fi
+
   # If Cloud Run's source staging bucket already exists (standalone `--source=.` installs),
   # bind storage.objectViewer directly on the bucket so GCS refreshes its bucket IAM etag immediately.
   SOURCE_BUCKET="gs://run-sources-${PROJECT_ID}-${RUN_REGION}"
-  if [[ -z "$PREBUILT_IMAGE" ]] && gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+  if [[ -z "$PREBUILT_IMAGE" && "$_has_local_docker" == "false" ]] && gcloud storage buckets describe "$SOURCE_BUCKET" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
     gcloud storage buckets add-iam-policy-binding "$SOURCE_BUCKET" \
       --member="serviceAccount:${SA_EMAIL}" \
       --role="roles/storage.objectViewer" \
       --quiet >/dev/null 2>&1 || true
   fi
 
-  if [[ -z "$PREBUILT_IMAGE" && "$HAD_RUN_BUILDER" == "false" ]]; then
+  if [[ -z "$PREBUILT_IMAGE" && "$_has_local_docker" == "false" && "$HAD_RUN_BUILDER" == "false" ]]; then
     ok "Granted project-level Cloud Run Builder, Storage, BigQuery, Recommender & Vertex AI roles (waiting ${BQOPT_IAM_SLEEP_SECONDS:-15}s for IAM propagation)..."
     sleep "${BQOPT_IAM_SLEEP_SECONDS:-15}"
   else
@@ -671,6 +857,27 @@ PY
   # ---- Step 5: Deploy Cloud Run Web UI (+ Direct IAP) ------------------------
   if [[ -n "$PREBUILT_IMAGE" ]]; then
     step "[5/7] Configuring Web UI on Cloud Run & enabling Direct Identity-Aware Proxy (IAP)..."
+  elif [[ "${BQOPT_SKIP_LOCAL_DOCKER:-0}" != "1" ]] \
+       && command -v docker >/dev/null 2>&1 \
+       && docker info >/dev/null 2>&1; then
+    step "[5/7] Building container image locally in Cloud Shell & deploying Web UI (~2-3 minutes)..."
+    local _ar_repo="cloud-run-source-deploy"
+    local _local_img="${RUN_REGION}-docker.pkg.dev/${PROJECT_ID}/${_ar_repo}/${SERVICE_NAME}:latest"
+    if ! gcloud artifacts repositories describe "$_ar_repo" --project="$PROJECT_ID" --location="$RUN_REGION" --quiet >/dev/null 2>&1; then
+      gcloud artifacts repositories create "$_ar_repo" \
+        --project="$PROJECT_ID" \
+        --location="$RUN_REGION" \
+        --repository-format=docker \
+        --description="Cloud Run source deployments" \
+        --quiet >/dev/null 2>&1 || true
+    fi
+    gcloud auth configure-docker "${RUN_REGION}-docker.pkg.dev" --quiet >/dev/null 2>&1 || true
+    if docker build -t "$_local_img" . && docker push "$_local_img"; then
+      PREBUILT_IMAGE="$_local_img"
+      ok "Built & pushed container image ${_local_img}."
+    else
+      warn "Local Docker build/push did not finish cleanly — falling back to Cloud Run source build..."
+    fi
   else
     step "[5/7] Building & deploying the Web UI to Cloud Run (~2-3 minutes)..."
   fi

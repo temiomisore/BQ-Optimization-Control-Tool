@@ -195,24 +195,52 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         script = os.path.join(repo_root, "scripts", "install.sh")
         app_json_path = os.path.join(repo_root, "app.json")
+        ds_json_path = os.path.join(repo_root, ".deploystack", "deploystack.json")
+        ds_desc_path = os.path.join(repo_root, ".deploystack", "messages", "description.txt")
+        ds_pre_path = os.path.join(repo_root, ".deploystack", "scripts", "preinstall.sh")
+        root_pre_path = os.path.join(repo_root, "scripts", "preinstall.sh")
         tutorial = os.path.join(repo_root, "docs", "INSTALL.md")
         welcome = os.path.join(repo_root, "docs", "cloudshell_welcome.txt")
         readme = os.path.join(repo_root, "README.md")
 
         self.assertTrue(os.path.isfile(script))
         self.assertTrue(os.path.isfile(app_json_path))
+        self.assertTrue(os.path.isfile(ds_json_path))
+        self.assertTrue(os.path.isfile(ds_desc_path))
+        self.assertTrue(os.path.isfile(ds_pre_path))
+        self.assertTrue(os.path.isfile(root_pre_path))
+        self.assertTrue(os.access(ds_pre_path, os.X_OK))
+        self.assertTrue(os.access(root_pre_path, os.X_OK))
         self.assertTrue(os.path.isfile(tutorial))
         self.assertTrue(os.path.isfile(welcome))
 
         syn = subprocess.run(["bash", "-n", script], capture_output=True, text=True)
         self.assertEqual(syn.returncode, 0, syn.stderr)
+        for p_sh in (ds_pre_path, root_pre_path):
+            syn_pre = subprocess.run(["sh", "-n", p_sh], capture_output=True, text=True)
+            self.assertEqual(syn_pre.returncode, 0, syn_pre.stderr)
 
         hlp = subprocess.run(["bash", script, "--help"], capture_output=True, text=True)
         self.assertEqual(hlp.returncode, 0, hlp.stderr)
         self.assertIn("--project=PROJECT_ID", hlp.stdout)
+        self.assertIn("--prompt-project", hlp.stdout)
         self.assertIn("--ops-dataset=DATASET", hlp.stdout)
         self.assertIn("--phase=PHASE", hlp.stdout)
         self.assertIn("--image=IMAGE_URI", hlp.stdout)
+
+        with open(ds_json_path, encoding="utf-8") as f:
+            ds_cfg = json.load(f)
+        self.assertEqual(ds_cfg.get("name"), "bq-optimization-control-tool")
+        self.assertIs(ds_cfg.get("collect_project"), False)
+        self.assertIs(ds_cfg.get("collect_region"), False)
+        # Keep path_* unset so `dsexec -verify` resolves `terraform|.deploystack/messages|.deploystack/scripts`
+        for forbidden_key in ("path_terraform", "path_messages", "path_scripts"):
+            self.assertNotIn(forbidden_key, ds_cfg)
+
+        with open(ds_pre_path, encoding="utf-8") as f:
+            pre_text = f.read()
+        self.assertIn("./scripts/install.sh --prompt-project --yes", pre_text)
+        self.assertIn("exit ", pre_text)
 
         with open(script, encoding="utf-8") as f:
             script_text = f.read()
@@ -255,15 +283,15 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
             rd_text = f.read()
         self.assertIn(
             "https://console.cloud.google.com/cloudshell/editor?shellonly=true"
-            "&cloudshell_image=gcr.io/cloudrun/button"
+            "&cloudshell_image=gcr.io/ds-artifacts-cloudshell/deploystack_custom_image"
             "&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool"
             "&cloudshell_git_branch=main",
             rd_text,
         )
-        # gcr.io/cloudrun/button's /bin/cloudshell_open only defines --repo_url,
-        # --git_branch, --dir, --context, --page, and --force_new_clone; passing
-        # cloudshell_print or cloudshell_tutorial would cause flag.Parse warnings
-        # or cross-origin Incognito iframe failures.
+        # Never use gcr.io/cloudrun/button in README: its /bin/cloudshell_open calls
+        # un-scoped serviceusage.Services.List against Cloud Shell's shared project
+        # 618104708054 (`SU_ALLOCATE_QUOTA_RESOURCE_EXHAUSTED` HTTP 429).
+        self.assertNotIn("cloudshell_image=gcr.io/cloudrun/button", rd_text)
         self.assertNotIn("cloudshell_print=", rd_text)
         self.assertNotIn("cloudshell_tutorial=", rd_text)
         self.assertNotIn("https://shell.cloud.google.com/cloudshell/editor", rd_text)
@@ -411,6 +439,183 @@ exit 0
             with open(log_file, encoding="utf-8") as f:
                 calls_fail = f.read()
             self.assertIn(f"docker rmi -f {img_url}", calls_fail)
+
+    def test_deploystack_preinstall_prompt_project_and_local_docker(self):
+        import pty
+        import select
+        import shutil
+        import tempfile
+        import yaml
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        orig_script = os.path.join(repo_root, "scripts", "install.sh")
+        orig_pre = os.path.join(repo_root, ".deploystack", "scripts", "preinstall.sh")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work_repo = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(work_repo, "scripts"), exist_ok=True)
+            os.makedirs(os.path.join(work_repo, ".deploystack", "scripts"), exist_ok=True)
+            shutil.copy2(orig_script, os.path.join(work_repo, "scripts", "install.sh"))
+            shutil.copy2(orig_pre, os.path.join(work_repo, ".deploystack", "scripts", "preinstall.sh"))
+            os.chmod(os.path.join(work_repo, "scripts", "install.sh"), 0o755)
+            os.chmod(os.path.join(work_repo, ".deploystack", "scripts", "preinstall.sh"), 0o755)
+
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            log_file = os.path.join(tmp, "calls.log")
+            api_attempt_file = os.path.join(tmp, "api_attempt")
+
+            fake_gcloud = os.path.join(bin_dir, "gcloud")
+            with open(fake_gcloud, "w", encoding="utf-8") as f:
+                f.write(f"""#!/usr/bin/env bash
+set -euo pipefail
+echo "gcloud $*" >> "{log_file}"
+if [[ "$*" == *"config get-value account"* ]]; then
+  echo "admin@temiomisore.altostrat.com"
+  exit 0
+fi
+if [[ "$*" == *"config get-value project"* ]]; then
+  echo "alpha-proj"
+  exit 0
+fi
+if [[ "$*" == *"projects list"* ]]; then
+  printf "alpha-proj\\tAlpha Project\\ntemi-reverse-etl-project\\tReverse ETL\\n"
+  exit 0
+fi
+if [[ "$*" == *"services enable"* ]]; then
+  if [[ ! -f "{api_attempt_file}" ]]; then
+    touch "{api_attempt_file}"
+    echo "Error 429: RESOURCE_EXHAUSTED rateLimitExceeded" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [[ "$*" == *"projects describe"* ]]; then
+  echo "555666777"
+  exit 0
+fi
+if [[ "$*" == *"projects get-ancestors"* ]]; then
+  echo '[{{"type":"organization","id":"14682041824"}}]'
+  exit 0
+fi
+if [[ "$*" == *"iam service-accounts describe"* ]]; then
+  exit 1
+fi
+if [[ "$*" == *"artifacts repositories describe"* ]]; then
+  exit 1
+fi
+if [[ "$*" == *"run services describe"* ]]; then
+  if [[ "$*" == *"status.url"* ]]; then
+    echo "https://bqopt-review-ui-retl-uc.a.run.app"
+  elif [[ "$*" == *"containers[0].image"* ]]; then
+    echo "us-central1-docker.pkg.dev/temi-reverse-etl-project/cloud-run-source-deploy/bqopt-review-ui@sha256:cafebabe"
+  fi
+  exit 0
+fi
+if [[ "$*" == *"asset search-all-resources"* ]]; then
+  printf "US\\n"
+  exit 0
+fi
+if [[ "$*" == *"scheduler jobs describe"* ]]; then
+  exit 1
+fi
+exit 0
+""")
+            os.chmod(fake_gcloud, 0o755)
+
+            for tool in ("bq", "docker"):
+                p = os.path.join(bin_dir, tool)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(f'#!/usr/bin/env bash\necho "{tool} $*" >> "{log_file}"\nexit 0\n')
+                os.chmod(p, 0o755)
+
+            # Simulate `/usr/local/bin/deploystack install` sourcing `.deploystack/scripts/preinstall.sh`:
+            # `exit` inside `preinstall.sh` must exit the wrapper before reaching `AFTER_PREINSTALL`.
+            wrapper = os.path.join(tmp, "fake_deploystack.sh")
+            with open(wrapper, "w", encoding="utf-8") as f:
+                f.write("#!/bin/bash\n. .deploystack/scripts/preinstall.sh\necho AFTER_PREINSTALL_MUST_NOT_RUN\nexit 99\n")
+            os.chmod(wrapper, 0o755)
+
+            env = dict(os.environ)
+            env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+            env["GOOGLE_CLOUD_PROJECT"] = "alpha-proj"
+            env["BQOPT_SA_SLEEP_SECONDS"] = "0"
+            env["BQOPT_IAM_SLEEP_SECONDS"] = "0"
+            env["BQOPT_IAP_SLEEP_SECONDS"] = "0"
+            env["BQOPT_API_RETRY_SLEEP_SECONDS"] = "0"
+            env.pop("BQOPT_NO_TTY", None)
+            env.pop("BQOPT_SIMPLE_PICKER", None)
+
+            master_fd, slave_fd = pty.openpty()
+            proc = subprocess.Popen(
+                ["bash", wrapper],
+                cwd=work_repo,
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+
+            output_chunks: list[bytes] = []
+            sent_keys = False
+            deadline = time.time() + 15.0
+            try:
+                while time.time() < deadline:
+                    rlist, _, _ = select.select([master_fd], [], [], 0.1)
+                    if rlist:
+                        try:
+                            chunk = os.read(master_fd, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        output_chunks.append(chunk)
+                        joined = b"".join(output_chunks)
+                        if (not sent_keys) and b"temi-reverse-etl-project" in joined:
+                            # Press Down-arrow (`\x1b[B`) to move from `alpha-proj` -> `temi-reverse-etl-project`, then Enter!
+                            os.write(master_fd, b"\x1b[B\r")
+                            sent_keys = True
+                    if proc.poll() is not None:
+                        # Drain any remaining buffered bytes
+                        while True:
+                            r2, _, _ = select.select([master_fd], [], [], 0.05)
+                            if not r2:
+                                break
+                            try:
+                                c2 = os.read(master_fd, 4096)
+                                if not c2:
+                                    break
+                                output_chunks.append(c2)
+                            except OSError:
+                                break
+                        break
+            finally:
+                os.close(master_fd)
+                if proc.poll() is None:
+                    proc.kill()
+                rc = proc.wait(timeout=5)
+
+            full_out = b"".join(output_chunks).decode("utf-8", errors="replace")
+            self.assertTrue(sent_keys, f"Arrow-key picker never rendered:\n{full_out}")
+            self.assertEqual(rc, 0, f"deploystack preinstall failed (rc={rc}):\n{full_out}")
+            self.assertNotIn("AFTER_PREINSTALL_MUST_NOT_RUN", full_out)
+            self.assertIn("https://bqopt-review-ui-retl-uc.a.run.app/#settings", full_out)
+
+            with open(os.path.join(work_repo, "config.yaml"), encoding="utf-8") as f:
+                gen_cfg = yaml.safe_load(f)
+            self.assertEqual(gen_cfg["project_id"], "temi-reverse-etl-project")
+
+            with open(log_file, encoding="utf-8") as f:
+                calls = f.read()
+            self.assertNotIn("services list", calls)
+            self.assertIn("gcloud artifacts repositories create cloud-run-source-deploy", calls)
+            expected_img = "us-central1-docker.pkg.dev/temi-reverse-etl-project/cloud-run-source-deploy/bqopt-review-ui:latest"
+            self.assertIn(f"docker build -t {expected_img} .", calls)
+            self.assertIn(f"docker push {expected_img}", calls)
+            self.assertIn(f"gcloud run deploy bqopt-review-ui --project=temi-reverse-etl-project --region=us-central1 --image={expected_img}", calls)
 
 
 if __name__ == "__main__":

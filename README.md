@@ -21,12 +21,12 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 
 Click below to launch the **fully automated** setup in **Google Cloud Shell** (runs entirely in your browser — nothing to type or paste):
 
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_image=gcr.io/cloudrun/button&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_image=gcr.io/ds-artifacts-cloudshell/deploystack_custom_image&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main)
 
 > **How it works (zero pasting):**
 > 1. On the Cloud Shell prompt, check **Trust repo** and click **Confirm** *(press **Authorize** if Google asks)*.
-> 2. Setup starts **automatically** — use your **`↑` / `↓` arrow keys + `Enter`** when asked **which GCP project** (and Cloud Run region, default `us-central1`) to deploy into.
-> 3. Sit back for ~4 minutes until you see **`🎉 Setup Complete — Your App Is Live!`**, then click your `https://bqopt-review-ui-.../#settings` link!
+> 2. Setup starts **automatically** — use your **`↑` / `↓` arrow keys + `Enter`** to select **which GCP project** to deploy into.
+> 3. Everything else runs automatically (~4 minutes) until you see **`🎉 Setup Complete — Your App Is Live!`**, then click your `https://bqopt-review-ui-.../#settings` link!
 >
 > <details><summary>Optional: manual CLI command if you already have a regular Cloud Shell terminal open</summary>
 >
@@ -70,7 +70,7 @@ What `scripts/install.sh` sets up automatically (~4 minutes):
 | `notebooks/BigQuery_Optimization_Notebook.ipynb` | Interactive Jupyter Notebook for Customer Demo 1 in BigQuery Studio |
 | `notebooks/BigQuery_Optimization_Notebook_2.ipynb` | Interactive Jupyter Notebook for Customer Demo 2 in BigQuery Studio |
 | `scripts/demo_git_pr.py` | Renders the Class-4 CI pull-request (simulated PR output for demos) |
-| `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (interactive project/region picker via `gcr.io/cloudrun/button`, APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
+| `.deploystack/`, `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (auto-launch via `gcr.io/ds-artifacts-cloudshell/deploystack_custom_image`, interactive `↑`/`↓` project picker, `BatchEnable` APIs, `bqopt-sa`, Direct Cloud Run `--iap`, `optimizer_ops` init, nightly Cloud Run Job + Scheduler) |
 | `optimizer/scan_runner.py` | On-demand **Run scan now** engine triggered from the Review UI (Cloud Run Job execution with automatic in-process fallback) |
 | `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, bundled OpenJDK + ZetaSQL `.jar`, multi-worker Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
 | `tests/` | Pure-logic unit tests (no GCP needed): `python -m unittest discover -s tests` |

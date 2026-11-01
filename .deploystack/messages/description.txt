@@ -1,0 +1,1 @@
+BigQuery Optimization Control Plane — 1-Click Automated Cloud Shell Setup

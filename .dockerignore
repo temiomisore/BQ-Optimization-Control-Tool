@@ -1,5 +1,6 @@
 .git
 .venv
+.deploystack
 .bqopt_*
 __pycache__
 *.pyc
