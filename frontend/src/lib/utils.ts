@@ -61,7 +61,7 @@ export function regionOf(c: Pick<ChangeSet, "target_region">): string | null {
   return r && r !== "none" && r !== "null" ? r : null;
 }
 
-/** Plain-English names for common BigQuery locations (tooltips, detail panel, search). */
+/** Plain-English names for common BigQuery locations (tooltips, detail panel, search, region filter). */
 const REGION_NAMES: Record<string, string> = {
   us: "US multi-region",
   eu: "EU multi-region",
@@ -76,13 +76,36 @@ const REGION_NAMES: Record<string, string> = {
   "us-west4": "Las Vegas",
   "northamerica-northeast1": "Montréal",
   "northamerica-northeast2": "Toronto",
+  "northamerica-south1": "Mexico",
+  "southamerica-east1": "São Paulo",
+  "southamerica-west1": "Santiago",
+  "europe-central2": "Warsaw",
+  "europe-north1": "Finland",
+  "europe-southwest1": "Madrid",
   "europe-west1": "Belgium",
   "europe-west2": "London",
   "europe-west3": "Frankfurt",
   "europe-west4": "Netherlands",
+  "europe-west6": "Zürich",
+  "europe-west8": "Milan",
+  "europe-west9": "Paris",
+  "europe-west10": "Berlin",
+  "europe-west12": "Turin",
+  "asia-east1": "Taiwan",
+  "asia-east2": "Hong Kong",
   "asia-northeast1": "Tokyo",
+  "asia-northeast2": "Osaka",
+  "asia-northeast3": "Seoul",
+  "asia-south1": "Mumbai",
+  "asia-south2": "Delhi",
   "asia-southeast1": "Singapore",
+  "asia-southeast2": "Jakarta",
   "australia-southeast1": "Sydney",
+  "australia-southeast2": "Melbourne",
+  "me-central1": "Doha",
+  "me-central2": "Dammam",
+  "me-west1": "Tel Aviv",
+  "africa-south1": "Johannesburg",
 };
 export const regionName = (r?: string | null) => (r && REGION_NAMES[r]) || "";
 

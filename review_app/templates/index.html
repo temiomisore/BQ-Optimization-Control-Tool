@@ -1628,6 +1628,7 @@ function selectReservationOption(cardId, optNum, btnEl) {
 // Search & Multi-Dimensional Filtering + Sorting
 let activeCategory = 'queue';
 let filterMinSavings = 0;
+let filterRegion = '';
 let filterProject = '';
 let filterDataset = '';
 let filterDirector = '';
@@ -1652,6 +1653,7 @@ function filterByCategory(cat, btn) {
 
 function onControlFilterChange() {
   const savEl = document.getElementById('filterSavingsSelect');
+  const regEl = document.getElementById('filterRegionSelect');
   const projEl = document.getElementById('filterProjectSelect');
   const dsEl = document.getElementById('filterDatasetSelect');
   const dirEl = document.getElementById('filterDirectorSelect');
@@ -1659,6 +1661,7 @@ function onControlFilterChange() {
   const sortEl = document.getElementById('sortOrderSelect');
 
   filterMinSavings = savEl ? parseFloat(savEl.value || '0') : 0;
+  filterRegion = regEl ? regEl.value : '';
   filterProject = projEl ? projEl.value : '';
   filterDataset = dsEl ? dsEl.value : '';
   filterDirector = dirEl ? dirEl.value : '';
@@ -1670,6 +1673,7 @@ function onControlFilterChange() {
 
 function resetAllFilters() {
   const savEl = document.getElementById('filterSavingsSelect');
+  const regEl = document.getElementById('filterRegionSelect');
   const projEl = document.getElementById('filterProjectSelect');
   const dsEl = document.getElementById('filterDatasetSelect');
   const dirEl = document.getElementById('filterDirectorSelect');
@@ -1678,6 +1682,7 @@ function resetAllFilters() {
   const searchEl = document.getElementById('cardSearchInput');
 
   if (savEl) savEl.value = '0';
+  if (regEl) regEl.value = '';
   if (projEl) projEl.value = '';
   if (dsEl) dsEl.value = '';
   if (dirEl) dirEl.value = '';
@@ -1686,6 +1691,7 @@ function resetAllFilters() {
   if (searchEl) searchEl.value = '';
 
   filterMinSavings = 0;
+  filterRegion = '';
   filterProject = '';
   filterDataset = '';
   filterDirector = '';
@@ -1779,12 +1785,14 @@ function applyFilters() {
 
     const sav = parseFloat(card.dataset.savings || '0');
     const conf = parseFloat(card.dataset.confidence || '0');
+    const reg = (card.dataset.region || '').toLowerCase();
     const proj = card.dataset.project || '';
     const ds = card.dataset.dataset || '';
     const dir = card.dataset.director || '';
     const twoPerson = card.dataset.twoperson === 'true';
 
     const matchesSav = sav >= filterMinSavings;
+    const matchesReg = !filterRegion || reg === filterRegion.toLowerCase();
     const matchesProj = !filterProject || proj === filterProject;
     const matchesDs = !filterDataset || ds === filterDataset;
     const matchesDir = !filterDirector || dir === filterDirector;
@@ -1794,7 +1802,7 @@ function applyFilters() {
     else if (filterConfidence === 'med') matchesConf = (conf >= 0.50 && conf < 0.80);
     else if (filterConfidence === 'twoperson') matchesConf = twoPerson;
 
-    if (matchesCat && matchesSav && matchesProj && matchesDs && matchesDir && matchesConf && matchesSearch) {
+    if (matchesCat && matchesSav && matchesReg && matchesProj && matchesDs && matchesDir && matchesConf && matchesSearch) {
       card.style.display = '';
       visibleCount++;
     } else {
@@ -2439,6 +2447,16 @@ function sendCopilotQuestion(questionText) {
     </div>
 
     <div class="filter-select-group">
+      <span class="filter-select-label">🌐 Region:</span>
+      <select id="filterRegionSelect" class="filter-select" onchange="onControlFilterChange()">
+        <option value="" selected>All Regions ({{ (target_regions or [])|length }})</option>
+        {% for r in (target_regions or []) %}
+        <option value="{{ r }}">{{ r }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="filter-select-group">
       <span class="filter-select-label">☁️ Project:</span>
       <select id="filterProjectSelect" class="filter-select" onchange="onControlFilterChange()">
         <option value="" selected>All Projects ({{ projects|length }})</option>
@@ -2576,7 +2594,7 @@ function sendCopilotQuestion(questionText) {
 <!-- Review Cards List -->
 <div id="cardsListContainer">
 {% for c in cards %}
-<section class="card review-card-item" data-class="{{ c.apply_class }}" data-director="{{ c.director_name or '' }}" data-project="{{ c.target_project or '' }}" data-dataset="{{ c.target_dataset or '' }}" data-table="{{ c.target_table or '' }}" data-savings="{{ c.net_monthly_value_usd or 0 }}" data-confidence="{{ c.confidence or 0 }}" data-twoperson="{{ 'true' if (c.risk_notes and 'REQUIRES_TWO_PERSON_APPROVAL' in c.risk_notes) or c.apply_class == 3 else 'false' }}" data-blocked="false">
+<section class="card review-card-item" data-class="{{ c.apply_class }}" data-region="{{ (c.target_region or '')|lower|replace('region-', '') }}" data-director="{{ c.director_name or '' }}" data-project="{{ c.target_project or '' }}" data-dataset="{{ c.target_dataset or '' }}" data-table="{{ c.target_table or '' }}" data-savings="{{ c.net_monthly_value_usd or 0 }}" data-confidence="{{ c.confidence or 0 }}" data-twoperson="{{ 'true' if (c.risk_notes and 'REQUIRES_TWO_PERSON_APPROVAL' in c.risk_notes) or c.apply_class == 3 else 'false' }}" data-blocked="false">
   <div class="card-strip">
     <div class="card-money-box">
       <span class="card-index-pill" title="Recommendation {{ loop.index }} of {{ cards|length }}">#{{ loop.index }}</span>

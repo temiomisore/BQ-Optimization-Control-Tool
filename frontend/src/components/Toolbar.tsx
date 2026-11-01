@@ -1,12 +1,13 @@
 import { Search, X } from "lucide-react";
 import type { ChangeSet, Dashboard } from "@/lib/api";
 import { NativeSelect } from "./ui";
-import { cn, CLASS_META } from "@/lib/utils";
+import { cn, CLASS_META, regionName, regionOf } from "@/lib/utils";
 
 export interface Filters {
   q: string;
   cls: number | 0;
   minSavings: number;
+  region: string;
   project: string;
   dataset: string;
   director: string;
@@ -15,7 +16,7 @@ export interface Filters {
 }
 
 export const DEFAULT_FILTERS: Filters = {
-  q: "", cls: 0, minSavings: 0, project: "", dataset: "", director: "", confidence: "", sort: "savings_desc",
+  q: "", cls: 0, minSavings: 0, region: "", project: "", dataset: "", director: "", confidence: "", sort: "savings_desc",
 };
 
 export function Toolbar({
@@ -35,7 +36,27 @@ export function Toolbar({
   total: number;
 }) {
   const counts: Record<number, number> = {};
-  for (const c of cards) counts[Number(c.apply_class || 1)] = (counts[Number(c.apply_class || 1)] || 0) + 1;
+  const regionCounts: Record<string, number> = {};
+  for (const c of cards) {
+    counts[Number(c.apply_class || 1)] = (counts[Number(c.apply_class || 1)] || 0) + 1;
+    const r = regionOf(c);
+    if (r) regionCounts[r] = (regionCounts[r] || 0) + 1;
+  }
+  const homeReg = (data.regions?.home || "").trim().toLowerCase();
+  const regionSet = new Set<string>((data.target_regions || []).map((r) => r.trim().toLowerCase()).filter(Boolean));
+  for (const r of data.regions?.regions || []) {
+    if (r.region) regionSet.add(r.region.trim().toLowerCase());
+  }
+  for (const list of [data.cards, data.blocked_cards, data.regressed_cards, data.rolled_back_cards, data.handoff_cards]) {
+    for (const c of list || []) {
+      const r = regionOf(c);
+      if (r) regionSet.add(r);
+    }
+  }
+  if (f.region) regionSet.add(f.region);
+  const regionOptions = Array.from(regionSet).sort(
+    (a, b) => (a === homeReg ? 0 : 1) - (b === homeReg ? 0 : 1) || a.localeCompare(b),
+  );
   const dirty = JSON.stringify(f) !== JSON.stringify(DEFAULT_FILTERS);
   // Cards that cost more to run than they save. The rules engine no longer creates them, but
   // older or approved ones can still exist: say they're hidden instead of silently dropping them.
@@ -74,7 +95,7 @@ export function Toolbar({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-7">
         <NativeSelect label="Min value" value={String(f.minSavings)} onChange={(v) => setF({ minSavings: Number(v) })}>
           <option value="0">Any savings</option>
           <option value="50">$50+ / mo</option>
@@ -82,6 +103,17 @@ export function Toolbar({
           <option value="500">$500+ / mo</option>
           <option value="1000">$1,000+ / mo</option>
           <option value="-Infinity">Incl. money-losing</option>
+        </NativeSelect>
+        <NativeSelect label="Region" value={f.region} onChange={(v) => setF({ region: v })}>
+          <option value="">All regions ({regionOptions.length})</option>
+          {regionOptions.map((r) => {
+            const name = regionName(r);
+            return (
+              <option key={r} value={r}>
+                {name ? `${r} · ${name}` : r} ({regionCounts[r] || 0})
+              </option>
+            );
+          })}
         </NativeSelect>
         <NativeSelect label="Project" value={f.project} onChange={(v) => setF({ project: v })}>
           <option value="">All projects ({data.projects.length})</option>

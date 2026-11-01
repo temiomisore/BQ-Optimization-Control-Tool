@@ -518,11 +518,29 @@ def _summaries(c, data: dict) -> dict:
         "class_pcts": {k: int(round((v / denom) * 100)) for k, v in class_savings.items()},
         "class_counts": class_counts,
     }
+    watched_regions = {
+        r for r in (
+            regions.normalize(info.get("region"))
+            for info in ((data.get("regions") or {}).get("regions") or [])
+            if isinstance(info, dict)
+        )
+        if r
+    }
+    card_regions = {
+        r for r in (regions.normalize(x.get("target_region")) for x in all_items)
+        if r
+    }
+    home_reg = regions.home_region(c)
+    target_regions = sorted(
+        watched_regions | card_regions,
+        key=lambda r: (0 if r == home_reg else 1, r),
+    )
     return dict(
         kpis=kpis,
         directors=sorted(directors_set),
         projects=sorted({x.get("target_project") for x in all_items if x.get("target_project")}),
         datasets=sorted({x.get("target_dataset") for x in all_items if x.get("target_dataset")}),
+        target_regions=target_regions,
     )
 
 

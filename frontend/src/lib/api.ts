@@ -206,6 +206,7 @@ export interface Dashboard {
   directors: string[];
   projects: string[];
   datasets: string[];
+  target_regions?: string[];
 }
 
 export type DecisionAction = "approve" | "reject" | "reset" | "unsnooze" | "rollback" | "pr_merged";

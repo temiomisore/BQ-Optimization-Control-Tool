@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
-import { AlertTriangle, Inbox, Landmark, Lock, RefreshCw } from "lucide-react";
+import { AlertTriangle, Globe2, Inbox, Landmark, Lock, RefreshCw, X } from "lucide-react";
 import { fetchDashboard, type ChangeSet, type Dashboard } from "@/lib/api";
 import { ReviewerProvider, useReviewer } from "@/lib/store";
 import { cn, fullPath, needsTwo, regionName, regionOf } from "@/lib/utils";
@@ -43,6 +43,7 @@ function applyFilters(cards: ChangeSet[], f: Filters) {
   const out = cards.filter((c) => {
     if (f.cls && c.apply_class !== f.cls) return false;
     if (Number(c.net_monthly_value_usd || 0) < f.minSavings) return false;
+    if (f.region && regionOf(c) !== f.region) return false;
     if (f.project && c.target_project !== f.project) return false;
     if (f.dataset && c.target_dataset !== f.dataset) return false;
     if (f.director && c.director_name !== f.director) return false;
@@ -92,6 +93,14 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
   const engCards = useMemo(() => allCards.filter((c) => c.governance_scope !== "FINOPS"), [allCards]);
   const cards = tab === "finops" ? finopsCards : engCards;
   const shown = useMemo(() => applyFilters(cards, f), [cards, f]);
+  const byRegion = useCallback(
+    (list: ChangeSet[]) => (f.region ? list.filter((c) => regionOf(c) === f.region) : list),
+    [f.region],
+  );
+  const handoffCards = useMemo(() => byRegion(data?.handoff_cards || []), [byRegion, data?.handoff_cards]);
+  const blockedCards = useMemo(() => byRegion(data?.blocked_cards || []), [byRegion, data?.blocked_cards]);
+  const regressedCards = useMemo(() => byRegion(data?.regressed_cards || []), [byRegion, data?.regressed_cards]);
+  const rolledBackCards = useMemo(() => byRegion(data?.rolled_back_cards || []), [byRegion, data?.rolled_back_cards]);
   const selected = shown.find((c) => c.change_set_id === selectedId) || cards.find((c) => c.change_set_id === selectedId) || null;
   const hiddenFinops = data?.viewer?.hidden_finops_items || 0;
   useEffect(() => {
@@ -145,7 +154,16 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
 
         {data && <RegressedBanner cards={data.regressed_cards} regions={data.regions} />}
 
-        {data && <RegionsBar info={data.regions} />}
+        {data && (
+          <RegionsBar
+            info={data.regions}
+            selectedRegion={f.region}
+            onSelectRegion={(r) => {
+              setSelectedId(null);
+              setF({ region: f.region === r ? "" : r });
+            }}
+          />
+        )}
 
         <KpiCards data={data} onTab={(t) => { setTab(t); setSelectedId(null); }} />
 
@@ -245,10 +263,27 @@ function Shell({ data, isLoading, error, refetch, isFetching }: {
           </>
         )}
 
-        {data && tab === "handoffs" && <HandoffList cards={data.handoff_cards || []} regions={data.regions} />}
-        {data && tab === "blocked" && <BlockedList cards={data.blocked_cards} data={data} />}
-        {data && tab === "regressed" && <RegressedList cards={data.regressed_cards} regions={data.regions} />}
-        {data && tab === "rolled_back" && <RolledBackList cards={data.rolled_back_cards} regions={data.regions} />}
+        {data && f.region && (tab === "handoffs" || tab === "blocked" || tab === "regressed" || tab === "rolled_back") && (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-sky-500/30 bg-sky-500/5 px-4 py-2 text-xs text-zinc-600 dark:text-zinc-300">
+            <span className="flex items-center gap-2">
+              <Globe2 className="h-3.5 w-3.5 text-sky-400" />
+              Showing items in region <b className="font-mono">{f.region}</b>
+              {regionName(f.region) ? ` (${regionName(f.region)})` : ""}
+            </span>
+            <button
+              type="button"
+              onClick={() => setF({ region: "" })}
+              className="inline-flex items-center gap-1 font-medium text-sky-500 hover:text-sky-400"
+            >
+              <X className="h-3.5 w-3.5" /> Show all regions
+            </button>
+          </div>
+        )}
+
+        {data && tab === "handoffs" && <HandoffList cards={handoffCards} regions={data.regions} />}
+        {data && tab === "blocked" && <BlockedList cards={blockedCards} data={data} />}
+        {data && tab === "regressed" && <RegressedList cards={regressedCards} regions={data.regions} />}
+        {data && tab === "rolled_back" && <RolledBackList cards={rolledBackCards} regions={data.regions} />}
         {data && tab === "receipts" && <ReceiptsTable receipts={data.receipts} />}
       </main>
 

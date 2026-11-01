@@ -475,6 +475,39 @@ class TestCrossProjectDiscoveryAndCollection(unittest.TestCase):
             ok_bad, _ = rules._dry_run_sql(c, "SELECT FROM WHERE", default_project="billing-proj")
         self.assertFalse(ok_bad)
 
+    def test_dashboard_summaries_target_regions_combines_watched_and_cards(self):
+        from review_app import main as review_main
+
+        c = cfg(location="US")
+        data = {
+            "cards": [
+                {"apply_class": 1, "net_monthly_value_usd": 42.0, "target_project": "p1",
+                 "target_dataset": "d1", "target_region": "US"},
+                {"apply_class": 2, "net_monthly_value_usd": 18.0, "target_project": "p1",
+                 "target_dataset": "d2", "target_region": "region-us-east4"},
+            ],
+            "blocked_cards": [
+                {"apply_class": 3, "net_monthly_value_usd": 10.0, "target_project": "p2",
+                 "target_dataset": "d3", "target_region": "europe-west1"},
+            ],
+            "regressed_cards": [],
+            "rolled_back_cards": [],
+            "handoff_cards": [],
+            "receipts": [],
+            "regions": {
+                "mode": "auto",
+                "home": "us",
+                "discovered": True,
+                "regions": [
+                    {"region": "us", "home": True, "dataset_count": 35},
+                    {"region": "us-central1", "home": False, "dataset_count": 5},
+                ],
+                "alerts": [],
+            },
+        }
+        out = review_main._summaries(c, data)
+        self.assertEqual(out["target_regions"], ["us", "europe-west1", "us-central1", "us-east4"])
+
 
 if __name__ == "__main__":
     unittest.main()
