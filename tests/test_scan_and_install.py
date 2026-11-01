@@ -225,7 +225,10 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
             rd_text = f.read()
         self.assertIn("https://console.cloud.google.com/cloudshell/editor?shellonly=true", rd_text)
         self.assertIn("cloudshell_print=docs/cloudshell_welcome.txt", rd_text)
-        self.assertIn("cloudshell_tutorial=docs/INSTALL.md", rd_text)
+        # Omit cloudshell_tutorial so Cloud Shell opens full-screen terminal
+        # without the cross-origin walkthroughs.googleusercontent.com iframe
+        # that Chrome Incognito blocks via third-party cookie restrictions.
+        self.assertNotIn("cloudshell_tutorial=", rd_text)
         self.assertNotIn("https://shell.cloud.google.com/cloudshell/editor", rd_text)
 
 

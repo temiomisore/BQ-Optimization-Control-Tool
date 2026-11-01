@@ -21,7 +21,7 @@ collector (SQL + driver) ─▶ rules engine ─▶ scoring ─▶ plan compiler
 
 Click below to open a clean **terminal-only** guided setup in **Google Cloud Shell** (runs entirely in your browser):
 
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_print=docs/cloudshell_welcome.txt&cloudshell_tutorial=docs/INSTALL.md)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?shellonly=true&cloudshell_git_repo=https://github.com/temiomisore/BQ-Optimization-Control-Tool&cloudshell_git_branch=main&cloudshell_print=docs/cloudshell_welcome.txt)
 
 > **Tip:** On the Cloud Shell prompt, check **Trust repo** before clicking **Confirm**, then run `./scripts/install.sh --yes`.
 >
