@@ -263,7 +263,8 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
         })
         with mock.patch.object(so.bq, "query", fake_query), \
                 mock.patch.object(so.bq, "client", lambda *_a, **_k: _FakeClient()), \
-                mock.patch.object(so, "_probe_ancestry", lambda *_a: ["folders/77", "organizations/99"]):
+                mock.patch.object(so, "_probe_ancestry", lambda *_a: ["folders/77", "organizations/99"]), \
+                mock.patch.object(so, "_probe_iam_users", lambda *_a: ["iam-teammate@x.com"]):
             opts = so.discover_options(c, editors=["ed@x.com"])
 
         self.assertFalse(opts["restricted"])
@@ -285,11 +286,120 @@ class TestDropdownOptionsAndPresets(unittest.TestCase):
         emails = [e["value"] for e in opts["emails"]]
         labels_by_email = {e["value"]: e["label"] for e in opts["emails"]}
         for expected in ("admin@x.com", "ed@x.com", "fin@x.com", "alice@x.com",
-                         "mgr@x.com", "vp@x.com", "bob@x.com", "bi-vp@x.com", "sayali@x.com"):
+                         "mgr@x.com", "vp@x.com", "bob@x.com", "bi-vp@x.com",
+                         "sayali@x.com", "iam-teammate@x.com"):
             self.assertIn(expected, emails)
         self.assertIn("Active BQ user (42 queries/30d)", labels_by_email["sayali@x.com"])
+        self.assertIn("GCP IAM member", labels_by_email["iam-teammate@x.com"])
         self.assertTrue(labels_by_email["alice@x.com"].startswith("alice@x.com — Alice · Eng"))
         self.assertTrue(all(not e.endswith(".gserviceaccount.com") for e in emails))
+
+    def test_probe_people_hides_company_com_unless_demo_mode(self):
+        from optimizer import settings_options as so
+
+        seeded_hr = [
+            {"user_email": "alice-owner@company.com", "user_name": "Alice Rivera",
+             "department": "Platform Infrastructure", "manager_email": None,
+             "director_email": "alex.vance@company.com", "director_name": "Alex Vance"},
+            {"user_email": "finance-analyst@company.com", "user_name": "Bob Johnson",
+             "department": "Financial Planning", "manager_email": "david.smith@company.com",
+             "director_email": "finops-lead@company.com", "director_name": "FinOps Lead"},
+            {"user_email": "real-analyst@x.com", "user_name": "Real Analyst",
+             "department": "Analytics", "manager_email": None,
+             "director_email": "real-vp@x.com", "director_name": "Real VP"},
+        ]
+
+        def fake_query(_c, sql, params=None, location=None):
+            if "v_employee_hierarchy_src" in sql:
+                return seeded_hr
+            if "jobs_events" in sql and "user_email" in sql:
+                return [{"user_email": "real-runner@x.com", "job_count": 7},
+                        {"user_email": "data-eng-lead@company.com", "job_count": 12}]
+            return []
+
+        # 1. Production / fresh install (demo_mode=False, trust_client_identity=False): hide @company.com
+        c_prod = config.Config({
+            "project_id": "p", "ops_dataset": "optimizer_ops", "location": "US",
+            "demo_mode": False,
+            "governance": {"settings_admins": ["admin@x.com"], "trust_client_identity": False},
+        })
+        with mock.patch.object(so.bq, "query", fake_query):
+            prod_emails = [p["value"] for p in so._probe_people(
+                c_prod, editors=[], iam_users=["iam-user@x.com", "ghost@company.com"]
+            )]
+        self.assertTrue(all(not e.endswith("@company.com") for e in prod_emails), prod_emails)
+        for real_e in ("admin@x.com", "real-analyst@x.com", "real-vp@x.com",
+                       "real-runner@x.com", "iam-user@x.com"):
+            self.assertIn(real_e, prod_emails)
+
+        # 2. Demo Mode ON via demo_mode=True (local / BQOPT_ALLOW_DEMO_MODE=true): keep @company.com
+        c_demo = config.Config({
+            "project_id": "p", "ops_dataset": "optimizer_ops", "location": "US",
+            "demo_mode": True,
+            "governance": {"settings_admins": ["admin@x.com"], "trust_client_identity": False},
+        })
+        with mock.patch.object(so.bq, "query", fake_query), \
+                mock.patch.dict("os.environ", {}, clear=False):
+            demo_emails = [p["value"] for p in so._probe_people(c_demo, editors=[])]
+        for demo_e in ("alice-owner@company.com", "alex.vance@company.com",
+                       "finance-analyst@company.com", "finops-lead@company.com",
+                       "david.smith@company.com", "data-eng-lead@company.com"):
+            self.assertIn(demo_e, demo_emails)
+
+        # 3. Demo sandbox persona picker ON via trust_client_identity=True: keep @company.com
+        c_sandbox = config.Config({
+            "project_id": "p", "ops_dataset": "optimizer_ops", "location": "US",
+            "demo_mode": False,
+            "governance": {"settings_admins": ["admin@x.com"], "trust_client_identity": True},
+        })
+        with mock.patch.object(so.bq, "query", fake_query), \
+                mock.patch.dict("os.environ", {"K_SERVICE": "demo-review-ui", "BQOPT_ALLOW_DEMO_MODE": "true"}):
+            sandbox_emails = [p["value"] for p in so._probe_people(c_sandbox, editors=[])]
+        self.assertIn("alice-owner@company.com", sandbox_emails)
+        self.assertIn("finops-lead@company.com", sandbox_emails)
+
+        # 4. Cloud Run WITHOUT BQOPT_ALLOW_DEMO_MODE: fail-closed even if config asks for demo_mode
+        with mock.patch.object(so.bq, "query", fake_query), \
+                mock.patch.dict("os.environ", {"K_SERVICE": "bqopt-review-ui", "BQOPT_ALLOW_DEMO_MODE": ""}):
+            locked_emails = [p["value"] for p in so._probe_people(c_demo, editors=[])]
+        self.assertTrue(all(not e.endswith("@company.com") for e in locked_emails), locked_emails)
+
+    def test_probe_people_day1_falls_back_to_live_information_schema_and_iam(self):
+        from optimizer import settings_options as so
+
+        seen_sqls = []
+
+        def fake_query(_c, sql, params=None, location=None):
+            seen_sqls.append((sql, location))
+            if "v_employee_hierarchy_src" in sql:
+                # Fresh install seeded with sql/01_ops_schema.sql @company.com rows only
+                return [{"user_email": "alice-owner@company.com", "user_name": "Alice",
+                         "department": "Infra", "manager_email": None,
+                         "director_email": "alex.vance@company.com", "director_name": "Alex"}]
+            if "jobs_events" in sql:
+                return []  # Empty before first scan runs
+            if "INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION" in sql:
+                raise RuntimeError("403 Access Denied: org-level resourceViewer not granted")
+            if "INFORMATION_SCHEMA.JOBS" in sql:
+                return [{"user_email": "teammate1@x.com", "job_count": 15},
+                        {"user_email": "ci-bot@p.iam.gserviceaccount.com", "job_count": 90},
+                        {"user_email": "demo-seed@company.com", "job_count": 3}]
+            return []
+
+        c = config.Config({
+            "project_id": "p", "ops_dataset": "optimizer_ops", "location": "US",
+            "jobs_view": "JOBS_BY_ORGANIZATION", "demo_mode": False,
+            "governance": {"settings_admins": ["installer@x.com"], "trust_client_identity": False},
+        })
+        with mock.patch.object(so.bq, "query", fake_query):
+            ppl = so._probe_people(c, editors=[], iam_users=["iam-colleague@x.com", "sa@p.iam.gserviceaccount.com"])
+
+        by_email = {p["value"]: p["label"] for p in ppl}
+        self.assertEqual(set(by_email), {"installer@x.com", "teammate1@x.com", "iam-colleague@x.com"})
+        self.assertIn("Active BQ user (15 queries/30d)", by_email["teammate1@x.com"])
+        self.assertIn("GCP IAM member", by_email["iam-colleague@x.com"])
+        self.assertTrue(any("INFORMATION_SCHEMA.JOBS_BY_ORGANIZATION" in s and loc == "us" for s, loc in seen_sqls))
+        self.assertTrue(any("INFORMATION_SCHEMA.JOBS" in s and loc == "us" for s, loc in seen_sqls))
 
     def test_probe_people_falls_back_when_src_views_missing(self):
         from optimizer import settings_options as so

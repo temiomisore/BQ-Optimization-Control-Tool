@@ -9,7 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Mapping
 
-from . import attribution, bq, governance, regions, settings_catalog as sc
+from . import attribution, bq, governance, regions, security, settings_catalog as sc
 from .config import cfg
 
 # Official BigQuery multi-regions and regional locations, grouped for <optgroup> dropdowns.
@@ -64,6 +64,8 @@ BQ_LOCATIONS: list[dict[str, str]] = [
 ]
 
 _CRM_ANCESTRY_URL = "https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}:getAncestry"
+_ASSET_IAM_URL = "https://cloudasset.googleapis.com/v1/{scope}:searchAllIamPolicies"
+_DEMO_EMAIL_DOMAIN = "@company.com"
 
 _DEFAULT_TABLES = {
     "employee_hierarchy_columns": "employee_hierarchy",
@@ -251,16 +253,93 @@ def _probe_tables(c: Any) -> list[dict[str, str]]:
     return [seen[k] for k in sorted(seen)]
 
 
-def _probe_people(c: Any, editors: Iterable[str]) -> list[dict[str, str]]:
-    roles: dict[str, list[str]] = {}
+def _is_demo_mode(c: Any) -> bool:
+    """True only when Demo Mode is explicitly enabled (and permitted by environment)."""
+    return (bool(c.get("demo_mode")) and governance.allow_demo_mode_in_env()) or governance.trust_client_identity(c)
 
-    def add(raw_email: Any, tag: str | None = None) -> None:
+
+def _probe_iam_users(c: Any) -> list[str]:
+    """Human `user:<email>` principals from Cloud Asset IAM policy bindings on asset_scope / home project."""
+    try:
+        from google.auth.transport.requests import AuthorizedSession
+        creds = regions._credentials(c)
+        session = AuthorizedSession(creds)
+        headers: dict[str, str] = {}
+        try:
+            from google.oauth2.credentials import Credentials as UserCredentials
+            if isinstance(creds, UserCredentials):
+                headers["x-goog-user-project"] = c["project_id"]
+        except Exception:
+            pass
+        proj_scope = f"projects/{c['project_id']}"
+        cfg_scope = str(c.get("asset_scope") or "").strip()
+        scopes: list[str] = []
+        if cfg_scope and sc._SCOPE_RE.match(cfg_scope):
+            scopes.append(cfg_scope)
+        if proj_scope not in scopes and sc._SCOPE_RE.match(proj_scope):
+            scopes.append(proj_scope)
+        for scope in scopes:
+            resp = session.get(
+                _ASSET_IAM_URL.format(scope=scope),
+                params={"query": "memberTypes:user", "pageSize": "100"},
+                headers=headers,
+                timeout=3,
+            )
+            if resp.status_code != 200:
+                continue
+            users: set[str] = set()
+            for row in (resp.json() or {}).get("results") or []:
+                for binding in ((row.get("policy") or {}).get("bindings") or []):
+                    for member in (binding.get("members") or []):
+                        if isinstance(member, str) and member.startswith("user:"):
+                            e = member[5:].strip().lower()
+                            if e and "@" in e and not attribution.is_service_account(e):
+                                users.add(e)
+            return sorted(users)
+        return []
+    except Exception:
+        return []
+
+
+def _probe_live_bq_users(c: Any) -> list[dict[str, Any]]:
+    """Day-1 live INFORMATION_SCHEMA fallback before the first scan fills optimizer_ops.jobs_events."""
+    try:
+        home = security.validate_region(regions.home_region(c))
+        cfg_view = security.validate_jobs_view(c.get("jobs_view") or "JOBS")
+    except Exception:
+        return []
+    views = [cfg_view] if cfg_view == "JOBS" else [cfg_view, "JOBS"]
+    for view in views:
+        try:
+            sql = f"""
+                SELECT LOWER(TRIM(user_email)) AS user_email, COUNT(*) AS job_count
+                FROM `region-{home}`.INFORMATION_SCHEMA.{view}
+                WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+                  AND user_email IS NOT NULL
+                  AND NOT ENDS_WITH(LOWER(TRIM(user_email)), '.gserviceaccount.com')
+                GROUP BY 1
+                ORDER BY job_count DESC
+                LIMIT 150"""
+            return bq.query(c, sql, location=home) or []
+        except Exception:
+            continue
+    return []
+
+
+def _probe_people(c: Any, editors: Iterable[str], iam_users: Any = None) -> list[dict[str, str]]:
+    roles: dict[str, list[str]] = {}
+    demo_active = _is_demo_mode(c)
+
+    def add(raw_email: Any, tag: str | None = None) -> bool:
         e = str(raw_email or "").strip().lower()
         if not e or "@" not in e or attribution.is_service_account(e):
-            return
+            return False
+        if not demo_active and e.endswith(_DEMO_EMAIL_DOMAIN):
+            return False
         tags = roles.setdefault(e, [])
         if tag and tag not in tags:
             tags.append(tag)
+        return True
 
     def _query_first(*sqls: str) -> list[dict[str, Any]]:
         for sql in sqls:
@@ -315,7 +394,9 @@ def _probe_people(c: Any, editors: Iterable[str]) -> list[dict[str, str]]:
             add(r.get("director_email"), d_name or "Director")
 
     # Day-1 auto-discovery before any HR table is connected: surface real human teammates
-    # who ran BigQuery queries in the last 30 days (zero extra APIs or IAM permissions).
+    # who ran BigQuery queries in the last 30 days (falling back to live INFORMATION_SCHEMA
+    # when optimizer_ops.jobs_events is still empty before the first scan).
+    added_from_jobs = 0
     try:
         job_rows = bq.query(c, f"""
             SELECT LOWER(TRIM(user_email)) AS user_email, COUNT(*) AS job_count
@@ -329,9 +410,24 @@ def _probe_people(c: Any, editors: Iterable[str]) -> list[dict[str, str]]:
         for r in job_rows or []:
             cnt = int(r.get("job_count") or 0)
             tag = f"Active BQ user ({cnt} {'query' if cnt == 1 else 'queries'}/30d)" if cnt > 0 else "Active BQ user"
-            add(r.get("user_email"), tag)
+            if add(r.get("user_email"), tag):
+                added_from_jobs += 1
     except Exception:
         pass
+
+    if added_from_jobs == 0:
+        for r in _probe_live_bq_users(c):
+            cnt = int(r.get("job_count") or 0)
+            tag = f"Active BQ user ({cnt} {'query' if cnt == 1 else 'queries'}/30d)" if cnt > 0 else "Active BQ user"
+            add(r.get("user_email"), tag)
+
+    if iam_users is not None:
+        try:
+            resolved_iam = iam_users.result() if hasattr(iam_users, "result") else iam_users
+            for iam_email in resolved_iam or []:
+                add(iam_email, "GCP IAM member")
+        except Exception:
+            pass
 
     out: list[dict[str, str]] = []
     for email in sorted(roles):
@@ -386,11 +482,12 @@ def _build_scopes(c: Any, ancestry: list[str], projects: list[str]) -> list[dict
 def discover_options(c: Any, editors: Iterable[str] | None = None) -> dict[str, Any]:
     """Live & static choices for Settings dropdowns (runs read-only probes in parallel)."""
     eds = list(editors or [])
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_iam = pool.submit(_probe_iam_users, c)
         f_reg = pool.submit(_probe_regions, c)
         f_ds_proj = pool.submit(_probe_datasets_and_projects, c)
         f_tbl = pool.submit(_probe_tables, c)
-        f_ppl = pool.submit(_probe_people, c, eds)
+        f_ppl = pool.submit(_probe_people, c, eds, f_iam)
         f_anc = pool.submit(_probe_ancestry, c)
 
         reg_list = f_reg.result()
