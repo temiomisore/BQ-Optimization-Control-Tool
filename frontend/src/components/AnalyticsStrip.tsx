@@ -202,7 +202,7 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
                     : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
                 )}
               >
-                Why slots
+                Slot usage
               </button>
               <button
                 type="button"

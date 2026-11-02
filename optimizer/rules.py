@@ -913,6 +913,186 @@ def _query_in_region(c: Config, sql: str, params: dict | None, region: str) -> l
     return bq.query(c, sql, params, location=bq.location_for(reg_norm))
 
 
+def slot_usage_timeline(c: Config, proj: str, region: str, days: int = 30, *,
+                        reservation_id: str | None = None) -> list[dict]:
+    """Chronological slot-demand series (~60 buckets across the active window) for UI charting.
+
+    Each bucket reports `demand` = MAX per-minute slot usage inside that bucket (since BigQuery
+    autoscaling scales in 50-slot steps for >=60s bursts), `med_busy` = median busy-minute slots,
+    and `busy_mins` = active query minutes in the bucket. Falls back to `jobs_hourly_slots` if
+    `INFORMATION_SCHEMA.JOBS_TIMELINE` is unreadable."""
+    d = max(7, min(180, int(days)))
+    min_d = min(d, 30)
+    try:
+        reg = security.validate_region(region)
+        vproj = security.validate_project_id(proj)
+    except Exception:
+        return []
+
+    sources: list[tuple[str, dict | None, str]] = []
+    if reservation_id:
+        res_clause = "LOWER(reservation_id) = @res_id"
+        params: dict | None = {"res_id": reservation_id.strip().lower()}
+        if str(c.get("jobs_view") or "").strip().upper() == "JOBS_BY_ORGANIZATION":
+            sources.append((
+                f"`region-{reg}`.INFORMATION_SCHEMA.JOBS_TIMELINE_BY_ORGANIZATION",
+                params,
+                res_clause,
+            ))
+        sources.append((
+            f"`{vproj}.region-{reg}.INFORMATION_SCHEMA.JOBS_TIMELINE`",
+            params,
+            res_clause,
+        ))
+    else:
+        sources.append((
+            f"`{vproj}.region-{reg}.INFORMATION_SCHEMA.JOBS_TIMELINE`",
+            None,
+            "reservation_id IS NULL",
+        ))
+
+    def _normalize_points(raw: list[dict] | None) -> list[dict]:
+        if not raw or not isinstance(raw[0], dict) or not raw[0].get("t"):
+            return []
+        pts: list[dict] = []
+        for x in raw:
+            t_val = x.get("t")
+            if not t_val:
+                continue
+            pts.append({
+                "t": str(t_val),
+                "demand": round(float(x.get("demand") or 0.0), 1),
+                "med_busy": round(float(x.get("med_busy") or 0.0), 1),
+                "busy_mins": int(float(x.get("busy_mins") or 0)),
+            })
+        return pts
+
+    for from_view, qparams, res_clause in sources:
+        try:
+            cand = _query_in_region(c, f"""
+              WITH busy AS (
+                SELECT TIMESTAMP_TRUNC(period_start, MINUTE) AS minute,
+                       SUM(period_slot_ms) / 60000.0       AS slots
+                FROM {from_view}
+                WHERE job_creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d + 1} DAY)
+                  AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+                  AND job_type = 'QUERY'
+                  AND (statement_type IS NULL OR statement_type != 'SCRIPT')
+                  AND {res_clause}
+                GROUP BY 1
+              ),
+              bounds AS (
+                SELECT GREATEST(
+                         TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY), HOUR),
+                         LEAST(
+                           TIMESTAMP_TRUNC(COALESCE((SELECT MIN(minute) FROM busy), CURRENT_TIMESTAMP()), HOUR),
+                           TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {min_d} DAY), HOUR)
+                         )
+                       ) AS win_start,
+                       TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR) AS win_end
+              ),
+              cfg AS (
+                SELECT win_start, win_end,
+                       GREATEST(CAST(CEIL(GREATEST(TIMESTAMP_DIFF(win_end, win_start, HOUR), 24) / 60.0) AS INT64), 1) AS step_h
+                FROM bounds
+              ),
+              grid AS (
+                SELECT idx,
+                       TIMESTAMP_ADD(cfg.win_start, INTERVAL idx * cfg.step_h HOUR) AS bucket_ts,
+                       cfg.step_h
+                FROM cfg,
+                     UNNEST(GENERATE_ARRAY(0, CAST(DIV(TIMESTAMP_DIFF(cfg.win_end, cfg.win_start, HOUR), cfg.step_h) AS INT64))) AS idx
+              ),
+              agg AS (
+                SELECT CAST(DIV(TIMESTAMP_DIFF(b.minute, cfg.win_start, MINUTE), cfg.step_h * 60) AS INT64) AS idx,
+                       MAX(b.slots) AS peak_slots,
+                       APPROX_QUANTILES(b.slots, 100)[OFFSET(50)] AS med_busy_slots,
+                       COUNT(*) AS busy_mins
+                FROM busy b CROSS JOIN cfg
+                WHERE b.minute >= cfg.win_start
+                GROUP BY 1
+              )
+              SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', g.bucket_ts, 'UTC') AS t,
+                     ROUND(COALESCE(a.peak_slots, 0), 1) AS demand,
+                     ROUND(COALESCE(a.med_busy_slots, 0), 1) AS med_busy,
+                     COALESCE(a.busy_mins, 0) AS busy_mins
+              FROM grid g
+              LEFT JOIN agg a USING (idx)
+              ORDER BY g.idx
+            """, qparams, reg)
+            pts = _normalize_points(cand)
+            if pts and any(p["demand"] > 0 for p in pts):
+                return pts
+            if pts and reservation_id:
+                return pts
+        except Exception:
+            continue
+
+    if c.get("project_id") and c.get("ops_dataset"):
+        try:
+            if reservation_id:
+                h_clause = "LOWER(reservation_id) = @res_id"
+                h_params = {"reg": reg.lower(), "res_id": reservation_id.strip().lower()}
+            else:
+                h_clause = "LOWER(COALESCE(reservation_id, '(on-demand)')) = '(on-demand)' AND LOWER(project_id) = @proj"
+                h_params = {"reg": reg.lower(), "proj": vproj.lower()}
+            h_rows = bq.query(c, f"""
+              WITH busy AS (
+                SELECT hour_ts,
+                       SUM(total_slot_ms) / 3600000.0 AS slots
+                FROM `{c.ops}.jobs_hourly_slots`
+                WHERE LOWER(region) = @reg
+                  AND {h_clause}
+                  AND hour_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+                GROUP BY 1
+              ),
+              bounds AS (
+                SELECT GREATEST(
+                         TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY), HOUR),
+                         LEAST(
+                           TIMESTAMP_TRUNC(COALESCE((SELECT MIN(hour_ts) FROM busy), CURRENT_TIMESTAMP()), HOUR),
+                           TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {min_d} DAY), HOUR)
+                         )
+                       ) AS win_start,
+                       TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR) AS win_end
+              ),
+              cfg AS (
+                SELECT win_start, win_end,
+                       GREATEST(CAST(CEIL(GREATEST(TIMESTAMP_DIFF(win_end, win_start, HOUR), 24) / 60.0) AS INT64), 1) AS step_h
+                FROM bounds
+              ),
+              grid AS (
+                SELECT idx,
+                       TIMESTAMP_ADD(cfg.win_start, INTERVAL idx * cfg.step_h HOUR) AS bucket_ts,
+                       cfg.step_h
+                FROM cfg,
+                     UNNEST(GENERATE_ARRAY(0, CAST(DIV(TIMESTAMP_DIFF(cfg.win_end, cfg.win_start, HOUR), cfg.step_h) AS INT64))) AS idx
+              ),
+              agg AS (
+                SELECT CAST(DIV(TIMESTAMP_DIFF(b.hour_ts, cfg.win_start, HOUR), cfg.step_h) AS INT64) AS idx,
+                       MAX(b.slots) AS peak_slots,
+                       APPROX_QUANTILES(b.slots, 100)[OFFSET(50)] AS med_busy_slots,
+                       COUNT(*) * 60 AS busy_mins
+                FROM busy b CROSS JOIN cfg
+                WHERE b.hour_ts >= cfg.win_start
+                GROUP BY 1
+              )
+              SELECT FORMAT_TIMESTAMP('%Y-%m-%d %H:%M', g.bucket_ts, 'UTC') AS t,
+                     ROUND(COALESCE(a.peak_slots, 0), 1) AS demand,
+                     ROUND(COALESCE(a.med_busy_slots, 0), 1) AS med_busy,
+                     COALESCE(a.busy_mins, 0) AS busy_mins
+              FROM grid g
+              LEFT JOIN agg a USING (idx)
+              ORDER BY g.idx
+            """, h_params)
+            pts = _normalize_points(h_rows)
+            if pts:
+                return pts
+        except Exception:
+            pass
+    return []
+
+
 def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
                   reservation_id: str | None = None,
                   current_baseline: int | None = None) -> dict | None:
@@ -1097,6 +1277,9 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
     }
     if d != 30 or src_prefix != "JOBS_TIMELINE":
         out["source_label"] = f"{src_prefix}_{active_d}D"
+    tl = slot_usage_timeline(c, proj, region, days=d, reservation_id=reservation_id)
+    if tl:
+        out["timeline"] = tl
     return out
 
 
@@ -1352,6 +1535,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
                 "autoscale_billed_slot_hours_30d": round((profile or {}).get("autoscale_slot_hours", 0.0), 1),
                 "recommended_baseline_slots": rec_baseline,
                 "recommended_max_slots": rec_max,
+                "timeline": list((profile or {}).get("timeline") or []),
             },
             "recommended_pricing_model": "BigQuery Enterprise Edition (Option 1: Baseline+Autoscale OR Option 2: 0-Baseline Autoscale)",
             "current_state": current_state,
@@ -1922,6 +2106,8 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
                            "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
                 "current_baseline_slots": cur_baseline,
                 "current_max_slots": cur_max,
+                "covered_baseline_slots": covered_baseline,
+                "committed_slots": comm_slots,
                 "p50_slots_all_minutes": round((profile or {}).get("p50_all", 0.0), 1),
                 "p95_slots_all_minutes": round((profile or {}).get("p95_all", 0.0), 1),
                 "p50_slots_busy_minutes": round((profile or {}).get("p50_busy", 0.0), 1),
@@ -1933,6 +2119,7 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
                 "autoscale_billed_slot_hours_30d": round((profile or {}).get("autoscale_slot_hours", pure_autoscale_hours), 1),
                 "recommended_baseline_slots": rec_baseline,
                 "recommended_max_slots": rec_max,
+                "timeline": list((profile or {}).get("timeline") or []),
             },
             "recommended_pricing_model": (
                 f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"

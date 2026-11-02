@@ -817,6 +817,75 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
         self.assertGreaterEqual(snap_n, 1)
         self.assertTrue(any("`central-slots-prod.region-us-east4`.INFORMATION_SCHEMA.RESERVATIONS" in q for q in disc_queries))
 
+    def test_slot_usage_timeline_and_dashboard_hydration(self):
+        from optimizer import config as cfg_mod
+        from review_app import main as review_main
+
+        c = cfg_mod.Config({
+            **cfg_mod._DEFAULTS,
+            "project_id": "acme-slot-admin",
+            "ops_dataset": "optimizer_ops",
+        })
+        sample_rows = [
+            {"t": "2026-10-20 10:00", "demand": 0.0, "med_busy": 0.0, "busy_mins": 0},
+            {"t": "2026-10-20 22:00", "demand": 28.9, "med_busy": 2.4, "busy_mins": 720},
+        ]
+
+        # 1. Primary JOBS_TIMELINE path
+        with mock.patch("optimizer.bq.query", return_value=sample_rows):
+            tl = rules.slot_usage_timeline(
+                c, "acme-slot-admin", "us", days=30, reservation_id="acme-slot-admin:us.pool1"
+            )
+        self.assertEqual(len(tl), 2)
+        self.assertEqual(tl[1]["demand"], 28.9)
+        self.assertEqual(tl[1]["busy_mins"], 720)
+
+        # 2. Fallback to jobs_hourly_slots when JOBS_TIMELINE fails
+        def fake_fallback(_c, sql, params=None, location=None):
+            if "JOBS_TIMELINE" in sql:
+                raise RuntimeError("403 JOBS_TIMELINE denied")
+            if "jobs_hourly_slots" in sql:
+                return sample_rows
+            return []
+
+        with mock.patch("optimizer.bq.query", side_effect=fake_fallback):
+            tl_fb = rules.slot_usage_timeline(
+                c, "acme-slot-admin", "us", days=30, reservation_id="acme-slot-admin:us.pool1"
+            )
+        self.assertEqual(len(tl_fb), 2)
+        self.assertEqual(tl_fb[0]["t"], "2026-10-20 10:00")
+
+        # 3. Live dashboard hydration populates timeline + CUD metadata on pre-existing cards and caches hits
+        review_main.invalidate_dashboard_cache()
+        ev = {
+            "reservation_fq": "acme-slot-admin.region-us-east4.prod-pool",
+            "covered_baseline_slots": 200,
+            "committed_slots_edition": 200,
+            "sizing_window_days": 180,
+            "capacity_sizing": {
+                "source": "JOBS_TIMELINE_180D",
+                "sizing_window_days": 180,
+                "p50_slots_all_minutes": 0.0,
+                "p99_slots_busy_minutes": 25.0,
+                "peak_slots_1min": 28.9,
+            },
+        }
+        with mock.patch.object(rules, "slot_usage_timeline", return_value=sample_rows) as m_tl:
+            cap1 = review_main._hydrate_capacity_sizing(
+                c, ev, rule_id="W-03", target_project="acme-slot-admin", target_region="us-east4", target_table="prod-pool"
+            )
+            ev2 = {"reservation_fq": "acme-slot-admin.region-us-east4.prod-pool", "capacity_sizing": {"sizing_window_days": 180}}
+            cap2 = review_main._hydrate_capacity_sizing(
+                c, ev2, rule_id="W-03", target_project="acme-slot-admin", target_region="us-east4", target_table="prod-pool"
+            )
+        m_tl.assert_called_once_with(
+            c, "acme-slot-admin", "us-east4", days=180, reservation_id="acme-slot-admin:us-east4.prod-pool"
+        )
+        self.assertEqual(cap1["covered_baseline_slots"], 200)
+        self.assertEqual(len(cap1["timeline"]), 2)
+        self.assertEqual(len(cap2["timeline"]), 2)
+        review_main.invalidate_dashboard_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,13 @@ export interface Viewer {
   finops_approvers_configured: boolean;
 }
 
+export interface CapacityTimelinePoint {
+  t: string;
+  demand: number;
+  med_busy?: number;
+  busy_mins?: number;
+}
+
 /** evidence.capacity_sizing: minute-by-minute slot telemetry backing W-01 / W-03 sizing. */
 export interface CapacitySizing {
   source?: string;
@@ -106,6 +113,8 @@ export interface CapacitySizing {
   method?: string;
   current_baseline_slots?: number;
   current_max_slots?: number;
+  covered_baseline_slots?: number;
+  committed_slots?: number | null;
   p50_slots_all_minutes?: number;
   p95_slots_all_minutes?: number;
   p50_slots_busy_minutes?: number;
@@ -116,6 +125,7 @@ export interface CapacitySizing {
   autoscale_billed_slot_hours_30d?: number;
   recommended_baseline_slots?: number;
   recommended_max_slots?: number;
+  timeline?: CapacityTimelinePoint[];
 }
 
 /** evidence.savings_math: how a card's number was computed. */

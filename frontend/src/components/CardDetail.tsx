@@ -273,7 +273,7 @@ export function CardDetail({
         )}
 
         {wCap && (
-          <Section title="Why these slot numbers were chosen" icon={<BarChart3 className="h-3.5 w-3.5" />}>
+          <Section title="Slot usage vs. baseline & autoscale limit" icon={<BarChart3 className="h-3.5 w-3.5" />}>
             <SlotSizingChart
               sizing={ev.capacity_sizing as CapacitySizing | undefined}
               recBaseline={num(pr.recommended_baseline_slots ?? (w01 ? data.w01?.baseline : data.w03?.rec_baseline))}
@@ -286,6 +286,11 @@ export function CardDetail({
                         num(ev.current_baseline_slots ?? pr.current_baseline_slots) +
                           num(ev.current_autoscale_add_slots ?? pr.current_autoscale_max_slots),
                     )
+                  : undefined
+              }
+              committedSlots={
+                w03 && (ev.covered_baseline_slots != null || ev.committed_slots_edition != null)
+                  ? num(ev.covered_baseline_slots ?? ev.committed_slots_edition)
                   : undefined
               }
               isReservation={w03}

@@ -25,7 +25,7 @@ except ModuleNotFoundError:
             os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + sys.argv[1:])
     raise
 
-from optimizer import bq, governance, pricing, regions, schema_guard, security, store, verifier  # noqa: E402
+from optimizer import bq, governance, pricing, regions, rules, schema_guard, security, store, verifier  # noqa: E402
 from optimizer import config as _config, settings_catalog, settings_store  # noqa: E402
 from optimizer.config import cfg  # noqa: E402
 
@@ -133,10 +133,89 @@ def _is_loopback_request() -> bool:
     return addr in ("127.0.0.1", "::1", "localhost", "")
 
 
+_TIMELINE_LOCK = threading.Lock()
+_TIMELINE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_TIMELINE_TTL_SEC = 300.0
+
+
 def invalidate_dashboard_cache() -> None:
     """Clear cached dashboard snapshot immediately when any decision (approve/reject/rollback) is applied."""
     with _DASHBOARD_LOCK:
         _DASHBOARD_CACHE.clear()
+    with _TIMELINE_LOCK:
+        _TIMELINE_CACHE.clear()
+
+
+def _hydrate_capacity_sizing(
+    c,
+    ev: dict,
+    *,
+    rule_id: str,
+    target_project: str | None = None,
+    target_region: str | None = None,
+    target_table: str | None = None,
+) -> dict | None:
+    """Ensure `ev["capacity_sizing"]` carries a chronological `timeline` array (hydrating on-the-fly
+    with a 5-min TTL cache for cards created before `timeline` was persisted in `evidence_json`)."""
+    if not isinstance(ev, dict):
+        return None
+    cap = dict(ev.get("capacity_sizing")) if isinstance(ev.get("capacity_sizing"), dict) else {}
+    if rule_id == "W-03":
+        if cap.get("covered_baseline_slots") is None and ev.get("covered_baseline_slots") is not None:
+            cap["covered_baseline_slots"] = ev.get("covered_baseline_slots")
+        if cap.get("committed_slots") is None and ev.get("committed_slots_edition") is not None:
+            cap["committed_slots"] = ev.get("committed_slots_edition")
+    existing_tl = cap.get("timeline")
+    if isinstance(existing_tl, list) and existing_tl:
+        ev["capacity_sizing"] = cap
+        return cap
+
+    days = max(7, min(180, int(cap.get("sizing_window_days") or ev.get("sizing_window_days") or 30)))
+    proj = str(target_project or c.get("project_id") or "").strip().lower()
+    reg = str(target_region or c.get("location") or "us").strip().lower()
+    if reg.startswith("region-"):
+        reg = reg[len("region-"):]
+    res_id: str | None = None
+
+    if rule_id == "W-03":
+        res_fq = str(ev.get("reservation_fq") or "").strip().lower()
+        parts = res_fq.split(".") if res_fq else []
+        if len(parts) == 3 and parts[1].startswith("region-"):
+            proj = parts[0]
+            reg = parts[1][len("region-"):]
+            res_name = parts[2]
+        else:
+            res_name = str(ev.get("reservation_name") or target_table or "").strip().lower()
+        if not proj or not res_name:
+            return cap or None
+        res_id = f"{proj}:{reg}.{res_name}"
+    elif not proj:
+        return cap or None
+
+    ckey = f"{proj}:{reg}:{res_id or 'od'}:{days}"
+    now_m = time.monotonic()
+    with _TIMELINE_LOCK:
+        hit = _TIMELINE_CACHE.get(ckey)
+        if hit and hit[0] > now_m:
+            tl = hit[1]
+        else:
+            tl = None
+    if tl is None:
+        try:
+            tl = rules.slot_usage_timeline(c, proj, reg, days=days, reservation_id=res_id) or []
+        except Exception:
+            tl = []
+        ttl = _TIMELINE_TTL_SEC if tl else 60.0
+        with _TIMELINE_LOCK:
+            if len(_TIMELINE_CACHE) > 256:
+                _TIMELINE_CACHE.clear()
+            _TIMELINE_CACHE[ckey] = (now_m + ttl, tl)
+
+    if tl:
+        cap["timeline"] = tl
+    if cap:
+        ev["capacity_sizing"] = cap
+    return cap or None
 
 
 @app.before_request
@@ -578,6 +657,22 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "applied_at": r.get("applied_at"),
         })
 
+    # Hydrate chronological slot usage timeline on active W-01 / W-03 cards (5-min cached)
+    hydrated_cap_cards = 0
+    for cs in cards:
+        r_ids = cs.get("rule_ids") or []
+        rid = "W-03" if "W-03" in r_ids else ("W-01" if "W-01" in r_ids else None)
+        if rid and hydrated_cap_cards < 6 and isinstance(cs.get("evidence"), dict):
+            _hydrate_capacity_sizing(
+                c,
+                cs["evidence"],
+                rule_id=rid,
+                target_project=cs.get("target_project"),
+                target_region=cs.get("target_region"),
+                target_table=cs.get("target_table"),
+            )
+            hydrated_cap_cards += 1
+
     # Latest W-01 sizing for the Project-Wide Billing Fit panel (any state except retired:
     # a SUPERSEDED card carries a number the current math no longer stands behind).
     w01 = None
@@ -587,6 +682,14 @@ def _fetch_dashboard_data_uncached(c) -> dict:
         latest_w = w01_live[0]
         ev = bq.loads(latest_w.get("evidence_json")) or {}
         pr = bq.loads(latest_w.get("proposed_change_json")) or {}
+        w01_cap = _hydrate_capacity_sizing(
+            c,
+            ev,
+            rule_id="W-01",
+            target_project=latest_w.get("target_project"),
+            target_region=latest_w.get("target_region"),
+            target_table=latest_w.get("target_table"),
+        )
         od = float(ev.get("on_demand_spend_monthly") or 0.0)
         o1 = float(ev.get("option_1_monthly_cost_usd") or 0.0)
         o2 = float(ev.get("option_2_monthly_cost_usd") or 0.0)
@@ -603,7 +706,7 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "billing_aware": isinstance(ev.get("savings_math"), dict),
             "sizing_window_days": int(ev.get("sizing_window_days") or 30),
             "slot_estimator_url": ev.get("slot_estimator_url"),
-            "capacity_sizing": ev.get("capacity_sizing") if isinstance(ev.get("capacity_sizing"), dict) else None,
+            "capacity_sizing": w01_cap,
         }
 
     w03 = None
@@ -616,6 +719,14 @@ def _fetch_dashboard_data_uncached(c) -> dict:
         top_w3 = w03_live[0]
         ev3 = bq.loads(top_w3.get("evidence_json")) or {}
         pr3 = bq.loads(top_w3.get("proposed_change_json")) or {}
+        w03_cap = _hydrate_capacity_sizing(
+            c,
+            ev3,
+            rule_id="W-03",
+            target_project=top_w3.get("target_project"),
+            target_region=top_w3.get("target_region"),
+            target_table=top_w3.get("target_table"),
+        )
         cur_c = float(ev3.get("current_reservation_spend_monthly") or ev3.get("on_demand_spend_monthly") or 0.0)
         o1_3 = float(ev3.get("option_1_monthly_cost_usd") or 0.0)
         o2_3 = float(ev3.get("option_2_monthly_cost_usd") or 0.0)
@@ -634,7 +745,7 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "recommended_option": ev3.get("recommended_option") or pr3.get("selected_option") or 1,
             "sizing_window_days": int(ev3.get("sizing_window_days") or 30),
             "slot_estimator_url": ev3.get("slot_estimator_url"),
-            "capacity_sizing": ev3.get("capacity_sizing") if isinstance(ev3.get("capacity_sizing"), dict) else None,
+            "capacity_sizing": w03_cap,
         }
 
     data = dict(
