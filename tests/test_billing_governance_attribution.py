@@ -886,6 +886,176 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
         self.assertEqual(len(cap2["timeline"]), 2)
         review_main.invalidate_dashboard_cache()
 
+    def test_w03_active_assigned_properly_sized_vs_unassigned_leftovers(self):
+        from optimizer import compiler, config as cfg_mod, scoring
+        from optimizer.executor import class3
+
+        c = cfg_mod.Config({
+            **cfg_mod._DEFAULTS,
+            "project_id": "acme-slot-admin",
+            "ops_dataset": "optimizer_ops",
+            "location": "US",
+            "pricing": {**cfg_mod._DEFAULTS["pricing"], "capacity_sizing_days": 180},
+            "executor": {**cfg_mod._DEFAULTS["executor"], "enable_reservation_changes": False},
+        })
+        prices = self.PRICES
+
+        # 1. Active, assigned reservation whose provisioned baseline (200) & autoscale (200 -> 400 max)
+        #    already match 180d telemetry -> emits a $0 PROPERLY_SIZED W-03 scorecard (not None!)
+        matching_profile = {
+            "p50_all": 225.0,
+            "p95_all": 340.0,
+            "p50_busy": 230.0,
+            "p99_busy": 380.0,
+            "peak": 395.0,
+            "busy_minutes": 40_000.0,
+            "total_minutes": 43_200.0,
+            "active_days": 180.0,
+            "slot_hours": 162_000.0,
+            "autoscale_slot_hours": 185_000.0,
+            "autoscale_slot_hours_above_baseline": 18_500.0,
+            "current_burst_slot_hours": 18_500.0,
+            "timeline": [{"t": "2026-10-20 12:00", "demand": 240.0, "med_busy": 225.0, "busy_mins": 720}],
+        }
+        row_optimal = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "prod-bi-pool",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 200,
+            "autoscale_max_slots": 200,
+            "edition_total_baseline_slots": 200,
+            "committed_slots": 200,
+            "query_assignments": 2,
+            "assignment_ids": ["assign_prod_1", "assign_prod_2"],
+            "assignees": ["PROJECT:acme-analytics", "PROJECT:acme-bi"],
+            "reservation_id": "acme-slot-admin:US.prod-bi-pool",
+            "active_days": 180.0,
+            "jobs_window": 48_000,
+            "jobs_30d": 8_000,
+            "slot_ms_30d": 162_000.0 * 3_600_000.0,
+            "bytes_billed_30d": 2_500.0 * (1024.0 ** 4),  # On-Demand equiv ~$15.6k/mo > reservation ~$8.4k/mo
+            "distinct_projects": 2,
+            "projects": ["acme-analytics", "acme-bi"],
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=matching_profile):
+            f_opt = rules._map_reservation_rightsizing(row_optimal, prices, c)
+
+        self.assertIsNotNone(f_opt)
+        self.assertEqual(f_opt["rule_id"], "W-03")
+        self.assertEqual(f_opt["gross_monthly_savings_usd"], 0.0)
+        self.assertEqual(f_opt["evidence"]["diagnosis_kind"], "PROPERLY_SIZED")
+        self.assertTrue(f_opt["proposed_change"]["no_op"])
+        self.assertNotIn("generated_ddl_option2", f_opt["proposed_change"])
+        self.assertNotIn("REQUIRES_TWO_PERSON_APPROVAL", f_opt["risk_notes"])
+        self.assertIn("INFORMATIONAL_PROPERLY_SIZED", f_opt["risk_notes"])
+        self.assertEqual(f_opt["proposed_change"]["recommended_baseline_slots"], 200)
+        self.assertEqual(f_opt["proposed_change"]["recommended_autoscale_max_slots"], 400)
+        self.assertEqual(f_opt["evidence"]["capacity_sizing"]["recommended_baseline_slots"], 200)
+        self.assertEqual(f_opt["evidence"]["capacity_sizing"]["recommended_max_slots"], 400)
+        self.assertEqual(len(f_opt["evidence"]["capacity_sizing"]["timeline"]), 1)
+
+        # Compiler preserves PROPERLY_SIZED $0 card even when min_card_net_monthly_usd > 0
+        scored_opt = scoring.score(f_opt, c, table_spend={}, table_cv={}, rule_history={})
+        kept, notes = compiler.split_money_losing([scored_opt], min_net=50.0)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(notes, [])
+        self.assertTrue(governance.is_finops_card(scored_opt))
+
+        # Executor treats no_op=True as a safe no-op even when enable_reservation_changes=False
+        from optimizer import bq as bq_mod
+        cs_noop = {
+            "change_set_id": "cs-noop-1",
+            "rule_ids": ["W-03"],
+            "target_project": "acme-slot-admin",
+            "target_dataset": "RESERVATION_CAPACITY",
+            "target_table": "prod-bi-pool",
+            "target_region": "us",
+            "state": "APPLYING",
+            "proposed_change_json": bq_mod.dumps(f_opt["proposed_change"]),
+        }
+        with mock.patch("optimizer.bq.execute") as m_exec, mock.patch("optimizer.bq.query") as m_q:
+            plan_noop = class3.run(c, cs_noop)
+        self.assertTrue(plan_noop["no_op"])
+        m_q.assert_not_called()
+        # Only _progress state_history note runs — zero ALTER RESERVATION DDL
+        self.assertTrue(all("ALTER RESERVATION" not in str(call.args[1]) for call in m_exec.call_args_list))
+
+        # 2. Active, assigned 0-baseline pure-autoscale reservation with HUGE excess cap (0 -> 1000 when 0 -> 150 needed)
+        #    and $0 monthly bill delta -> emits $0 AUTOSCALE_CAP_RIGHTSIZING card (not PROPERLY_SIZED)
+        spiky_profile = {
+            "p50_all": 0.0,
+            "p95_all": 35.0,
+            "p50_busy": 40.0,
+            "p99_busy": 120.0,
+            "peak": 135.0,
+            "busy_minutes": 4_000.0,
+            "total_minutes": 43_200.0,
+            "active_days": 180.0,
+            "slot_hours": 3_200.0,
+            "autoscale_slot_hours": 4_000.0,
+            "autoscale_slot_hours_above_baseline": 4_000.0,
+            "current_burst_slot_hours": 4_000.0,
+            "timeline": [{"t": "2026-10-20 12:00", "demand": 135.0, "med_busy": 40.0, "busy_mins": 120}],
+        }
+        row_excess_cap = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "burst-etl-pool",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 0,
+            "autoscale_max_slots": 1000,
+            "edition_total_baseline_slots": 0,
+            "committed_slots": 0,
+            "query_assignments": 1,
+            "assignment_ids": ["assign_etl_1"],
+            "assignees": ["PROJECT:acme-etl"],
+            "reservation_id": "acme-slot-admin:US.burst-etl-pool",
+            "active_days": 180.0,
+            "jobs_window": 6_000,
+            "jobs_30d": 1_000,
+            "slot_ms_30d": 3_200.0 * 3_600_000.0,
+            "bytes_billed_30d": 120.0 * (1024.0 ** 4),  # On-Demand ~$750/mo > autoscale ~$240/mo
+            "distinct_projects": 1,
+            "projects": ["acme-etl"],
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=spiky_profile):
+            f_cap = rules._map_reservation_rightsizing(row_excess_cap, prices, c)
+
+        self.assertIsNotNone(f_cap)
+        self.assertEqual(f_cap["evidence"]["diagnosis_kind"], "AUTOSCALE_CAP_RIGHTSIZING")
+        self.assertFalse(f_cap["proposed_change"]["no_op"])
+        self.assertEqual(f_cap["proposed_change"]["recommended_baseline_slots"], 0)
+        self.assertEqual(f_cap["proposed_change"]["recommended_autoscale_max_slots"], 150)
+        self.assertIn("ALTER RESERVATION", f_cap["proposed_change"]["generated_ddl"])
+
+        # 3. Unassigned leftover reservation (query_assignments == 0) with < $10/mo spend (like optimum-graph-demo)
+        #    MUST remain suppressed (returns None)
+        row_unassigned = {
+            **row_excess_cap,
+            "reservation_name": "optimum-graph-demo",
+            "autoscale_max_slots": 100,
+            "query_assignments": 0,
+            "assignment_ids": [],
+            "assignees": [],
+            "jobs_window": 80,
+            "jobs_30d": 15,
+            "slot_ms_30d": 36.0 * 3_600_000.0,  # ~$2.70/mo
+            "bytes_billed_30d": 0.1 * (1024.0 ** 4),
+        }
+        tiny_profile = {
+            **spiky_profile,
+            "p99_busy": 12.0,
+            "peak": 15.0,
+            "slot_hours": 36.0,
+            "autoscale_slot_hours": 45.0,
+            "autoscale_slot_hours_above_baseline": 45.0,
+            "current_burst_slot_hours": 45.0,
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=tiny_profile):
+            f_unassigned = rules._map_reservation_rightsizing(row_unassigned, prices, c)
+        self.assertIsNone(f_unassigned)
+
 
 if __name__ == "__main__":
     unittest.main()

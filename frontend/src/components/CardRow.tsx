@@ -1,9 +1,9 @@
 import { motion } from "framer-motion";
-import { Users } from "lucide-react";
+import { CheckCircle2, Users } from "lucide-react";
 import type { ChangeSet, RegionsInfo } from "@/lib/api";
 import { Badge, Meter } from "./ui";
 import { RegionBadge } from "./RegionBadge";
-import { cn, CLASS_META, fullPath, needsTwo, targetLabel, usd } from "@/lib/utils";
+import { cn, CLASS_META, fullPath, isProperlySized, needsTwo, targetLabel, usd } from "@/lib/utils";
 
 export function CardRow({
   c,
@@ -23,6 +23,7 @@ export function CardRow({
 }) {
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const partial = (c.approvals || []).length > 0;
+  const propSized = isProperlySized(c);
   const sm = c.evidence?.savings_math;
   const demo = !!sm?.demo_floor_applied;
   const legacy = !sm;
@@ -49,6 +50,14 @@ export function CardRow({
               <Badge key={r} className="font-mono">{r}</Badge>
             ))}
             <RegionBadge c={c} info={regions} />
+            {propSized && (
+              <Badge
+                className="bg-emerald-500/10 text-emerald-600 ring-emerald-500/30 dark:text-emerald-300"
+                title="Provisioned baseline and autoscale limit already match historical slot consumption"
+              >
+                <CheckCircle2 className="h-3 w-3" /> Properly sized
+              </Badge>
+            )}
             {needsTwo(c) && (
               <Badge className={partial ? "bg-amber-500/10 text-amber-300 ring-amber-500/30" : ""} title="Two-person approval">
                 <Users className="h-3 w-3" /> {partial ? "1/2 signed" : "2-person"}
@@ -73,7 +82,8 @@ export function CardRow({
           <div className="truncate font-mono text-[13px] font-medium text-zinc-800 dark:text-zinc-100" title={fullPath(c)}>
             {c.target_project && c.target_dataset && c.target_dataset !== "None"
               && c.target_dataset !== "PROJECT_WIDE_BILLING" && c.target_dataset !== "HUMAN_ADHOC_GOVERNANCE"
-              && !(c.rule_ids || []).includes("W-02") ? (
+              && c.target_dataset !== "RESERVATION_CAPACITY"
+              && !(c.rule_ids || []).includes("W-02") && !(c.rule_ids || []).includes("W-03") ? (
               <><span className="text-zinc-400 dark:text-zinc-500">{c.target_project}.</span>{targetLabel(c)}</>
             ) : targetLabel(c)}
           </div>
@@ -92,7 +102,9 @@ export function CardRow({
               ? `−${usd(Math.abs(Number(c.net_monthly_value_usd)), 2)}`
               : usd(c.net_monthly_value_usd)}
           </div>
-          <div className="text-[10px] uppercase tracking-wider text-zinc-500">net / mo</div>
+          <div className="text-[10px] uppercase tracking-wider text-zinc-500">
+            {propSized ? "optimal" : "net / mo"}
+          </div>
         </div>
       </div>
       <div className="mt-3 flex items-center gap-3 pl-1.5">

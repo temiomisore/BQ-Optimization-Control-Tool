@@ -67,7 +67,7 @@ What `scripts/install.sh` sets up automatically (~4 minutes):
 | `docs/HOW_TO_RUN_ON_YOUR_DATASET.md` & `docs/STEP_BY_STEP_OPTIMIZATION_GUIDE.md` | End-to-end operational guides for running against your own datasets and GCP Organization |
 | `docs/DEMO_MASTER_PLAYBOOK.md` & `docs/DEMO_MASTER_PLAYBOOK_2.md` (+ `notebooks/`, `scripts/demo_setup*.py`) | Customer Demo Playbooks 1 & 2, BigQuery Studio notebooks, and synthetic fixture generators |
 | `terraform/`, `scripts/deploy.sh`, `Dockerfile`, `run.sh` | Production WAF-hardened container (`non-root appuser`, OpenJDK + ZetaSQL `.jar`, Gunicorn) + Terraform IaC with Cloud Armor WAF policy (`sqli`/`xss`) |
-| `tests/` | 146 pure-logic unit tests (no live GCP required): `python -m unittest discover -s tests -t .` |
+| `tests/` | 182 pure-logic unit & security tests (no live GCP required): `python -m unittest discover -s tests -t .` |
 
 ## Quickstart (Local CLI)
 
@@ -109,7 +109,9 @@ reservations/commitments, and project-level cards are shown and approvable only 
 and `W-03` (Existing Reservation Right-Sizing & Slot-vs-On-Demand Fit) size `slot_capacity`
 (baseline) and `autoscale_max_slots` from up to **180 days** (`pricing.capacity_sizing_days`) of
 historical `INFORMATION_SCHEMA` slot telemetry, auto-discovering slot-admin projects directly from
-`jobs_events.reservation_id` and linking to the **GCP Console Slot Estimator** for manual CUD review.
+`jobs_events.reservation_id`, always surfacing an emerald \$0 **`PROPERLY SIZED`** scorecard +
+slot-usage timeline chart on active assigned reservations when no change is needed, and linking to the
+**GCP Console Slot Estimator** for manual CUD review.
 Others get HTTP 403 (`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the `W-01`/`W-03`
 panel, or the org-wide spend figure. `execute` re-checks approvers and sends a card back to review
 if needed. Identity comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker

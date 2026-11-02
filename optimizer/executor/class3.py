@@ -281,6 +281,32 @@ def reservation_resize_plan(c: Config, cs: dict, change: dict) -> dict:
 
 
 def _run_reservation_resize(c: Config, cs: dict, change: dict) -> dict:
+    if change.get("no_op"):
+        proj = security.validate_project_id(cs["target_project"])
+        region = security.validate_region(cs.get("target_region") or c.get("location", "US"))
+        raw_name = change.get("reservation_name") or cs.get("target_table")
+        res_fq = security.validate_reservation_fq(f"{proj}.region-{region}.{raw_name}")
+        cur_base = max(0, int(change.get("current_baseline_slots") or 0))
+        cur_auto = max(0, int(change.get("current_autoscale_max_slots") or 0))
+        _progress(c, cs, "S1_NO_OP_PROPERLY_SIZED", {
+            "reservation_fq": res_fq,
+            "baseline_slots": cur_base,
+            "autoscale_max_slots": cur_auto,
+        })
+        return {
+            "action": "RESIZE_RESERVATION",
+            "no_op": True,
+            "region": region,
+            "reservation_fq": res_fq,
+            "edition": str(change.get("edition") or "ENTERPRISE").upper(),
+            "prior_baseline_slots": cur_base,
+            "prior_autoscale_max_slots": cur_auto,
+            "new_baseline_slots": cur_base,
+            "new_autoscale_max_slots": cur_auto,
+            "return_to_on_demand": False,
+            "dropped_assignments": [],
+            "note": f"Reservation {res_fq} is already properly sized ({cur_base} baseline + {cur_auto} autoscale) — no DDL executed.",
+        }
     if not c["executor"].get("enable_reservation_changes", False):
         raise Blocked("reservation changes are disabled (executor.enable_reservation_changes=false). "
                       "Resizing a reservation changes slot capacity for assigned workloads — "
@@ -303,6 +329,28 @@ def _run_reservation_resize(c: Config, cs: dict, change: dict) -> dict:
         raw_auto = cur["autoscale"].get("max_slots")
     orig_auto = max(0, int(raw_auto or 0))
     orig_edition = str(cur.get("edition") or p["edition"]).upper()
+
+    if not p["return_to_on_demand"] and orig_base == p["baseline_slots"] and orig_auto == p["autoscale_max_slots"]:
+        _progress(c, cs, "S1_NO_OP_PROPERLY_SIZED", {
+            "reservation_fq": p["reservation_fq"],
+            "baseline_slots": orig_base,
+            "autoscale_max_slots": orig_auto,
+        })
+        return {
+            "action": "RESIZE_RESERVATION",
+            "no_op": True,
+            "option": p["option"],
+            "region": p["region"],
+            "reservation_fq": p["reservation_fq"],
+            "edition": orig_edition,
+            "prior_baseline_slots": orig_base,
+            "prior_autoscale_max_slots": orig_auto,
+            "new_baseline_slots": orig_base,
+            "new_autoscale_max_slots": orig_auto,
+            "return_to_on_demand": False,
+            "dropped_assignments": [],
+            "note": f"Reservation {p['reservation_fq']} already matches target ({orig_base} baseline + {orig_auto} autoscale) — no DDL executed.",
+        }
 
     to_drop: list[dict] = []
     if p["return_to_on_demand"]:
@@ -412,10 +460,11 @@ def _rollback_reservation_resize(c: Config, cs: dict, plan: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def run(c: Config, cs: dict) -> dict:
+    change = bq.loads(cs["proposed_change_json"]) or {}
+    if change.get("action") == "RESIZE_RESERVATION" and change.get("no_op"):
+        return _run_reservation_resize(c, cs, change)
     if not c["executor"]["enable_class3"]:
         raise Blocked("class 3 is disabled (executor.enable_class3=false) — rehearse on scratch data first")
-
-    change = bq.loads(cs["proposed_change_json"]) or {}
     if change.get("action") == "CAPACITY_PRICING_MIGRATION":
         return _run_capacity_migration(c, cs, change)
     if change.get("action") == "RESIZE_RESERVATION":

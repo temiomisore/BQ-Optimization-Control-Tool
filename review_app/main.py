@@ -743,6 +743,8 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "rec_max": int(pr3.get("recommended_autoscale_max_slots") or 0),
             "option_2_mode": str(ev3.get("option_2_mode") or pr3.get("option_2_mode") or "PURE_AUTOSCALE"),
             "recommended_option": ev3.get("recommended_option") or pr3.get("selected_option") or 1,
+            "diagnosis_kind": str(ev3.get("diagnosis_kind") or ""),
+            "no_op": bool(pr3.get("no_op") or ev3.get("diagnosis_kind") == "PROPERLY_SIZED"),
             "sizing_window_days": int(ev3.get("sizing_window_days") or 30),
             "slot_estimator_url": ev3.get("slot_estimator_url"),
             "capacity_sizing": w03_cap,

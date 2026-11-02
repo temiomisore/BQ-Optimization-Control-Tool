@@ -6,7 +6,7 @@ import {
 import type { CapacitySizing, ChangeSet, Dashboard, SavingsMath } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import {
-  CLASS_META, cn, ddlFor, fmtDate, fullPath, isW01, isW02, isW03, needsTwo, safeConsoleUrl, targetLabel, titleize, usd,
+  CLASS_META, cn, ddlFor, fmtDate, fullPath, isProperlySized, isW01, isW02, isW03, needsTwo, safeConsoleUrl, targetLabel, titleize, usd,
 } from "@/lib/utils";
 import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
@@ -95,6 +95,7 @@ export function CardDetail({
   const w02 = isW02(c);
   const w03 = isW03(c);
   const wCap = w01 || w03;
+  const propSized = isProperlySized(c);
   const ev = c.evidence || {};
   const pr = c.proposed || {};
   const estimatorUrl = safeConsoleUrl(ev.slot_estimator_url);
@@ -109,9 +110,11 @@ export function CardDetail({
 
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const hasOpt2 = !!pr.generated_ddl_option2;
-  const headline = wCap
-    ? num(opt === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd) || num(c.net_monthly_value_usd)
-    : num(c.net_monthly_value_usd);
+  const headline = propSized
+    ? 0
+    : wCap
+      ? num(opt === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd) || num(c.net_monthly_value_usd)
+      : num(c.net_monthly_value_usd);
   const ddl = hasOpt2 && opt === 2 ? pr.generated_ddl_option2 : ddlFor(c);
   const isPr = c.apply_class === 4 || c.execution_route === "CI_PULL_REQUEST";
   const approvals = c.approvals || [];
@@ -150,6 +153,16 @@ export function CardDetail({
       const recMax = pr.recommended_autoscale_max_slots ?? 0;
       const src = ev.capacity_sizing?.source;
       const winDays = Number(ev.sizing_window_days || 30);
+      if (propSized) {
+        const p50 = ev.capacity_sizing?.p50_slots_all_minutes ?? 0;
+        const p99 = ev.capacity_sizing?.p99_slots_busy_minutes ?? 0;
+        return [
+          `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${num(curBase) + num(curAuto)} max · ${usd(ev.current_reservation_spend_monthly)}/mo).`,
+          `Observed ${winDays}d slot consumption (median ${p50} slots · p99 busy ${p99} slots) aligns with your provisioned baseline & autoscale limit.`,
+          `No capacity resize or billing migration is needed ($0/mo change).`,
+          `Verified from ${winDays}d INFORMATION_SCHEMA slot history${src ? ` (${src})` : ""}.`,
+        ];
+      }
       const opt2Mode = ev.option_2_mode === "ON_DEMAND" ? "Return to On-Demand ($6.25/TiB)" : `0-baseline autoscale (0 → ${recMax})`;
       return [
         `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${usd(ev.current_reservation_spend_monthly)}/mo).`,
@@ -171,7 +184,7 @@ export function CardDetail({
     if (ev.gemini_ai_diagnosis) out.push(`Gemini diagnosis: ${ev.gemini_ai_diagnosis}`);
     if (ev.dry_run_verification) out.push(`Dry run: ${ev.dry_run_verification}`);
     return out;
-  }, [c, w01, w02, w03, ev, pr, data.w01]);
+  }, [c, w01, w02, w03, propSized, ev, pr, data.w01]);
 
   const approve = () =>
     decide.mutate({
@@ -202,6 +215,11 @@ export function CardDetail({
             {(c.rule_ids || []).map((r) => <Badge key={r} className="font-mono">{r}</Badge>)}
             <RegionBadge c={c} info={data.regions} withName />
             <Badge>{titleize(c.state || "")}</Badge>
+            {propSized && (
+              <Badge className="bg-emerald-500/10 text-emerald-600 ring-emerald-500/30 dark:text-emerald-300">
+                <CheckCircle2 className="h-3 w-3" /> Properly sized
+              </Badge>
+            )}
             {two && <Badge className="text-amber-300 ring-amber-500/30">2-person</Badge>}
             {c.governance_scope === "FINOPS" && (
               <Badge className="bg-amber-500/10 text-amber-300 ring-amber-500/30" title="Only FinOps / governance approvers can approve this">
@@ -229,7 +247,7 @@ export function CardDetail({
               <AnimatedNumber value={headline} format={(n) => usd(n)} />
             </div>
             <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-              net / month{wCap ? ` · option ${opt}` : ""}
+              {propSized ? "no change needed · optimal" : `net / month${wCap ? ` · option ${opt}` : ""}`}
             </div>
           </div>
         </div>
@@ -239,25 +257,27 @@ export function CardDetail({
       <div className="flex-1 space-y-6 overflow-y-auto p-5">
         {(wCap || hasOpt2) && (
           <div className="space-y-2">
-            <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-[#0c0c0f]">
-              {[1, 2].map((o) => (
-                <button
-                  key={o}
-                  onClick={() => setOpt(o)}
-                  className={cn(
-                    "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
-                    opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
-                  )}
-                >
-                  {optLabels[o - 1]}
-                  {wCap && (
-                    <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
-                      est. {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
-                    </div>
-                  )}
-                </button>
-              ))}
-            </div>
+            {!propSized && (
+              <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-[#0c0c0f]">
+                {[1, 2].map((o) => (
+                  <button
+                    key={o}
+                    onClick={() => setOpt(o)}
+                    className={cn(
+                      "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
+                      opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
+                    )}
+                  >
+                    {optLabels[o - 1]}
+                    {wCap && (
+                      <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
+                        est. {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
             {estimatorUrl && (
               <a
                 href={estimatorUrl}
@@ -332,11 +352,17 @@ export function CardDetail({
 
         {(c.risk_notes || []).length > 0 && (
           <div className="flex flex-wrap gap-1.5">
-            {(c.risk_notes || []).map((r) => (
-              <Badge key={r} className="text-[10px] text-amber-400 ring-amber-500/20">
-                <AlertTriangle className="h-3 w-3" />{titleize(r.toLowerCase())}
-              </Badge>
-            ))}
+            {(c.risk_notes || []).map((r) =>
+              r === "INFORMATIONAL_PROPERLY_SIZED" ? (
+                <Badge key={r} className="bg-emerald-500/10 text-[10px] text-emerald-500 ring-emerald-500/25 dark:text-emerald-300">
+                  <CheckCircle2 className="h-3 w-3" />Properly sized · informational scorecard
+                </Badge>
+              ) : (
+                <Badge key={r} className="text-[10px] text-amber-400 ring-amber-500/20">
+                  <AlertTriangle className="h-3 w-3" />{titleize(r.toLowerCase())}
+                </Badge>
+              ),
+            )}
           </div>
         )}
 
@@ -397,8 +423,12 @@ export function CardDetail({
         )}
 
         {ddl && !(ev.current_sql && ev.proposed_sql && isPr) && (
-          <Section title="Generated change">
-            <CodeBlock code={String(ddl)} title={hasOpt2 ? `DDL · option ${opt}` : "DDL"} tone="sky" />
+          <Section title={propSized ? "Sizing verification note" : "Generated change"}>
+            <CodeBlock
+              code={String(ddl)}
+              title={propSized ? "Status · no DDL needed" : hasOpt2 ? `DDL · option ${opt}` : "DDL"}
+              tone={propSized ? "emerald" : "sky"}
+            />
           </Section>
         )}
 
@@ -460,16 +490,23 @@ export function CardDetail({
 
       {/* actions */}
       <div className="flex flex-wrap items-center gap-2 border-t border-zinc-200 bg-zinc-50/80 p-4 dark:border-ink-800 dark:bg-black/20">
-        <Button variant="success" onClick={approve} loading={decide.isPending && decide.variables?.action === "approve"}>
-          <CheckCircle2 className="h-4 w-4" />{approveLabel}
-        </Button>
+        {propSized ? (
+          <span className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-600 dark:text-emerald-300">
+            <CheckCircle2 className="h-4 w-4" />
+            Properly sized — no capacity change needed
+          </span>
+        ) : (
+          <Button variant="success" onClick={approve} loading={decide.isPending && decide.variables?.action === "approve"}>
+            <CheckCircle2 className="h-4 w-4" />{approveLabel}
+          </Button>
+        )}
         {isPr && (
           <Button variant="secondary" onClick={() => onPr(c)}>
             <GitPullRequest className="h-4 w-4" />Open GitHub PR
           </Button>
         )}
         <Button variant="ghost" className="ml-auto text-rose-400" onClick={() => setRejectOpen(true)}>
-          <XCircle className="h-4 w-4" />Reject
+          <XCircle className="h-4 w-4" />{propSized ? "Dismiss" : "Reject"}
         </Button>
       </div>
 

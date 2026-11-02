@@ -113,7 +113,10 @@ export const regionName = (r?: string | null) => (r && REGION_NAMES[r]) || "";
 export const isW01 = (c: ChangeSet) => (c.rule_ids || []).includes("W-01") || c.proposed?.action === "CAPACITY_PRICING_MIGRATION";
 export const isW02 = (c: ChangeSet) => (c.rule_ids || []).includes("W-02");
 export const isW03 = (c: ChangeSet) => (c.rule_ids || []).includes("W-03") || c.proposed?.action === "RESIZE_RESERVATION";
-export const needsTwo = (c: ChangeSet) => c.apply_class === 3 || (c.risk_notes || []).includes("REQUIRES_TWO_PERSON_APPROVAL");
+export const isProperlySized = (c: ChangeSet) =>
+  c.evidence?.diagnosis_kind === "PROPERLY_SIZED" || Boolean(c.proposed?.no_op);
+export const needsTwo = (c: ChangeSet) =>
+  !isProperlySized(c) && (c.apply_class === 3 || (c.risk_notes || []).includes("REQUIRES_TWO_PERSON_APPROVAL"));
 
 export function safeConsoleUrl(raw?: unknown): string | null {
   if (typeof raw !== "string" || !raw.trim()) return null;

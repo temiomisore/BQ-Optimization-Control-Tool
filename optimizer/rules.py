@@ -1656,7 +1656,9 @@ def _sql_reservation_rightsizing(c: Config) -> str:
              r.autoscale_max_slots                                               AS autoscale_max_slots,
              r.edition_total_baseline_slots                                      AS edition_total_baseline_slots,
              c.committed_slots                                                   AS committed_slots,
-             a.query_assignments                                                 AS query_assignments,
+             IF(r.admin_project IS NOT NULL,
+                COALESCE(a.query_assignments, 0),
+                a.query_assignments)                                             AS query_assignments,
              a.assignment_ids                                                    AS assignment_ids,
              a.assignees                                                         AS assignees,
              u.reservation_id                                                    AS reservation_id,
@@ -1891,18 +1893,62 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
     opt2_pct = int(round((opt2_savings / max(cur_monthly_cost, 1.0)) * 100))
     opt1_label = f"Option 1 · {rec_baseline} Baseline + Autoscale to {rec_max}"
 
-    # Suppress noise when current reservation is already within $10/mo of optimal
+    # When current reservation is already within $10/mo of optimal:
+    # - Unassigned / idle 0-baseline leftover pools (query_assignments == 0 or jobs_window == 0) stay suppressed.
+    # - Active assigned reservations ALWAYS surface in FinOps:
+    #     * cur_max - rec_max >= 100  -> $0 AUTOSCALE_CAP_RIGHTSIZING guardrail card (tighten excess burst cap)
+    #     * cur_max - rec_max <  100  -> $0 PROPERLY_SIZED card so teams still see their slot-usage chart out of the gate
+    properly_sized = False
     if max(opt1_savings, opt2_savings) < 10.0:
-        return None
+        if meta.get("query_assignments") is None and jobs_window > 0 and c.get("project_id"):
+            live = _live_reservation_meta(c, admin_proj, region, res_name)
+            if live:
+                for k, v in live.items():
+                    if meta.get(k) is None and v is not None:
+                        meta[k] = v
+        query_assignments = int(_f(meta.get("query_assignments"), 0.0))
+        is_active_assigned = query_assignments > 0 and jobs_window > 0
+        if not is_active_assigned:
+            return None
+        if cur_max - rec_max < 100:
+            properly_sized = True
+            rec_baseline = cur_baseline
+            rec_autoscale_add = cur_autoscale_add
+            rec_max = cur_max
+            opt1_baseline_hours = cur_baseline * 730.0
+            opt1_baseline_cost = cur_baseline_cost
+            opt1_autoscale_cost = cur_autoscale_cost
+            opt1_cost = cur_monthly_cost
+            opt1_savings = 0.0
+            opt1_pct = 0
+            opt2_savings = 0.0
+            opt2_pct = 0
+            opt1_label = f"Current Sizing · {cur_baseline} Baseline + Autoscale to {cur_max} (Optimal)"
 
-    recommended = 1 if opt1_savings >= opt2_savings else 2
-    gross = opt1_savings if recommended == 1 else opt2_savings
-    opt_cost = opt1_cost if recommended == 1 else opt2_cost
+    if properly_sized:
+        recommended = 1
+        gross = 0.0
+        opt_cost = cur_monthly_cost
+    else:
+        if opt1_savings != opt2_savings:
+            recommended = 1 if opt1_savings > opt2_savings else 2
+        else:
+            recommended = 1 if opt1_cost <= opt2_cost else 2
+        gross = opt1_savings if recommended == 1 else opt2_savings
+        opt_cost = opt1_cost if recommended == 1 else opt2_cost
+
     cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
     estimator_url = _slot_estimator_url(admin_proj, region, edition=edition)
 
     p50_slots = _f((profile or {}).get("p50_all"))
-    if jobs_window <= 0:
+    p99_busy_slots = _f((profile or {}).get("p99_busy"))
+    if properly_sized:
+        diagnosis_kind = "PROPERLY_SIZED"
+        cost_driver = (
+            f"Provisioned capacity ({cur_baseline} baseline + {cur_autoscale_add} autoscale = {cur_max} max) "
+            f"matches {obs_days}d slot consumption — no capacity change needed"
+        )
+    elif jobs_window <= 0:
         diagnosis_kind = "IDLE_RESERVATION"
         cost_driver = (
             f"0 queries ran on reservation '{res_name}' over {obs_days}d while "
@@ -1939,81 +1985,101 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             f"({cur_baseline}+{cur_autoscale_add} → {rec_baseline}+{rec_autoscale_add} slots)"
         )
 
-    risk_notes = ["CROSS_WORKLOAD_FINANCIAL_CHANGE", "REQUIRES_TWO_PERSON_APPROVAL"]
-    if uncovered_baseline > 0 and edition != "STANDARD":
-        risk_notes.append("UNCOVERED_BASELINE_PAYG_SLOTS")
-    if comm_slots and rec_baseline < covered_baseline and edition != "STANDARD":
-        risk_notes.append("COMMITTED_SLOTS_CONTINUE_UNTIL_EXPIRY")
-    if rec_baseline > covered_baseline and edition != "STANDARD":
-        risk_notes.append("CUD_PURCHASE_MANUAL_IN_CONSOLE")
-    if not profile and jobs_window > 0:
-        risk_notes.append("AUTOSCALE_COST_NOT_CHECKED_AGAINST_JOBS_TIMELINE")
+    if properly_sized:
+        risk_notes = ["INFORMATIONAL_PROPERLY_SIZED"]
+    else:
+        risk_notes = ["CROSS_WORKLOAD_FINANCIAL_CHANGE", "REQUIRES_TWO_PERSON_APPROVAL"]
+        if uncovered_baseline > 0 and edition != "STANDARD":
+            risk_notes.append("UNCOVERED_BASELINE_PAYG_SLOTS")
+        if comm_slots and rec_baseline < covered_baseline and edition != "STANDARD":
+            risk_notes.append("COMMITTED_SLOTS_CONTINUE_UNTIL_EXPIRY")
+        if rec_baseline > covered_baseline and edition != "STANDARD":
+            risk_notes.append("CUD_PURCHASE_MANUAL_IN_CONSOLE")
+        if not profile and jobs_window > 0:
+            risk_notes.append("AUTOSCALE_COST_NOT_CHECKED_AGAINST_JOBS_TIMELINE")
 
     cud_rate_lbl = "PAYG (Standard has no CUDs)" if edition == "STANDARD" else "1-Yr Commit target rate"
-    ddl_opt1 = (
-        f"-- OPTION 1 (Right-Size {edition} Reservation '{res_name}')\n"
-        f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
-        f"--   Proposed: {rec_baseline} Baseline ({cr}/slot-hr {cud_rate_lbl}) + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
-        f"--   Estimated Bill Optimization: ${opt1_savings:,.2f}/mo ({opt1_pct}% improvement)\n"
-        + (
-            "--   Note: 1-Yr/3-Yr capacity commitments carry a lock-in period and are never purchased automatically;\n"
-            "--   verify commitment coverage in the GCP Console Slot Estimator before buying or renewing CUDs.\n"
-            if edition != "STANDARD" else ""
-        )
-        + f"ALTER RESERVATION `{res_fq}`\n"
-          f"SET OPTIONS (\n"
-          f"  slot_capacity = {rec_baseline},\n"
-          f"  autoscale_max_slots = {rec_autoscale_add}  -- burst on top of baseline -> {rec_max} max\n"
-          f");"
-    )
-
     assignment_ids = [str(x) for x in (meta.get("assignment_ids") or []) if x]
-    if option_2_mode == "ON_DEMAND":
-        if assignment_ids:
-            drop_lines = "".join(
-                f"DROP ASSIGNMENT IF EXISTS `{res_fq}.{aid}`;\n"
-                for aid in assignment_ids
-                if re.match(r"^[A-Za-z0-9_-]{1,1024}$", aid)
-            )
-        else:
-            drop_lines = f"-- Executor enumerates and drops active QUERY assignments on `{res_fq}` before zeroing slots\n"
-        ddl_opt2 = (
-            f"-- OPTION 2 (Return Assigned Workloads to On-Demand Billing — {odr}/TiB)\n"
-            f"--   Current Reservation Spend: ${cur_monthly_cost:,.2f}/mo vs Projected On-Demand: ${opt2_cost:,.2f}/mo ({bytes_tib_30d:,.1f} TiB/mo)\n"
-            f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · $0 idle slot cost)\n"
-            f"{drop_lines}"
-            f"ALTER RESERVATION `{res_fq}`\n"
-            f"SET OPTIONS (\n"
-            f"  slot_capacity = 0,\n"
-            f"  autoscale_max_slots = 0\n"
-            f");"
+    if properly_sized:
+        ddl_opt1 = (
+            f"-- PROPERLY SIZED ({edition} Reservation '{res_name}')\n"
+            f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
+            f"--   Observed {obs_days}d demand (median {p50_slots:,.0f} slots · p99 busy {p99_busy_slots:,.0f} slots) "
+            f"is already within optimal slot & billing bounds.\n"
+            f"--   No ALTER RESERVATION action is needed."
         )
-        opt2_state_desc = (
-            f"Unassign QUERY workloads → On-Demand ({bytes_tib_30d:,.1f} TiB/mo @ {odr}/TiB) + "
-            f"zero '{res_name}' capacity = ${opt2_cost:,.2f} / month"
-        )
-        opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · pay per TiB scanned, $0 idle slots)"
+        ddl_opt2: str | None = None
+        opt2_state_desc = ""
+        opt2_savings_desc = ""
     else:
-        ddl_opt2 = (
-            f"-- OPTION 2 (0-Baseline Pure Autoscaling on '{res_name}' — $0 Idle Cost)\n"
-            f"--   Baseline: 0 Slots ($0.00/mo fixed when idle) + Autoscale 0 -> {rec_max} Slots (~{pure_autoscale_hours:,.0f} billed slot-h @ {pr_}/slot-hr)\n"
-            f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · no commitment lock-in)\n"
-            f"ALTER RESERVATION `{res_fq}`\n"
-            f"SET OPTIONS (\n"
-            f"  slot_capacity = 0,\n"
-            f"  autoscale_max_slots = {rec_max}\n"
-            f");"
+        ddl_opt1 = (
+            f"-- OPTION 1 (Right-Size {edition} Reservation '{res_name}')\n"
+            f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
+            f"--   Proposed: {rec_baseline} Baseline ({cr}/slot-hr {cud_rate_lbl}) + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
+            f"--   Estimated Bill Optimization: ${opt1_savings:,.2f}/mo ({opt1_pct}% improvement)\n"
+            + (
+                "--   Note: 1-Yr/3-Yr capacity commitments carry a lock-in period and are never purchased automatically;\n"
+                "--   verify commitment coverage in the GCP Console Slot Estimator before buying or renewing CUDs.\n"
+                if edition != "STANDARD" else ""
+            )
+            + f"ALTER RESERVATION `{res_fq}`\n"
+              f"SET OPTIONS (\n"
+              f"  slot_capacity = {rec_baseline},\n"
+              f"  autoscale_max_slots = {rec_autoscale_add}  -- burst on top of baseline -> {rec_max} max\n"
+              f");"
         )
-        opt2_state_desc = (
-            f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month"
-        )
-        opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)"
+        if option_2_mode == "ON_DEMAND":
+            if assignment_ids:
+                drop_lines = "".join(
+                    f"DROP ASSIGNMENT IF EXISTS `{res_fq}.{aid}`;\n"
+                    for aid in assignment_ids
+                    if re.match(r"^[A-Za-z0-9_-]{1,1024}$", aid)
+                )
+            else:
+                drop_lines = f"-- Executor enumerates and drops active QUERY assignments on `{res_fq}` before zeroing slots\n"
+            ddl_opt2 = (
+                f"-- OPTION 2 (Return Assigned Workloads to On-Demand Billing — {odr}/TiB)\n"
+                f"--   Current Reservation Spend: ${cur_monthly_cost:,.2f}/mo vs Projected On-Demand: ${opt2_cost:,.2f}/mo ({bytes_tib_30d:,.1f} TiB/mo)\n"
+                f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · $0 idle slot cost)\n"
+                f"{drop_lines}"
+                f"ALTER RESERVATION `{res_fq}`\n"
+                f"SET OPTIONS (\n"
+                f"  slot_capacity = 0,\n"
+                f"  autoscale_max_slots = 0\n"
+                f");"
+            )
+            opt2_state_desc = (
+                f"Unassign QUERY workloads → On-Demand ({bytes_tib_30d:,.1f} TiB/mo @ {odr}/TiB) + "
+                f"zero '{res_name}' capacity = ${opt2_cost:,.2f} / month"
+            )
+            opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · pay per TiB scanned, $0 idle slots)"
+        else:
+            ddl_opt2 = (
+                f"-- OPTION 2 (0-Baseline Pure Autoscaling on '{res_name}' — $0 Idle Cost)\n"
+                f"--   Baseline: 0 Slots ($0.00/mo fixed when idle) + Autoscale 0 -> {rec_max} Slots (~{pure_autoscale_hours:,.0f} billed slot-h @ {pr_}/slot-hr)\n"
+                f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · no commitment lock-in)\n"
+                f"ALTER RESERVATION `{res_fq}`\n"
+                f"SET OPTIONS (\n"
+                f"  slot_capacity = 0,\n"
+                f"  autoscale_max_slots = {rec_max}\n"
+                f");"
+            )
+            opt2_state_desc = (
+                f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month"
+            )
+            opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)"
 
-    formula = (
-        f"current {edition} reservation '{res_name}' ({cur_baseline} baseline + {cur_autoscale_add} autoscale) = "
-        f"${cur_monthly_cost:,.2f}/mo; Option {recommended} = ${opt_cost:,.2f}/mo; "
-        f"optimizing bill by ${gross:,.2f}/mo"
-    )
+    if properly_sized:
+        formula = (
+            f"current {edition} reservation '{res_name}' ({cur_baseline} baseline + {cur_autoscale_add} autoscale = "
+            f"${cur_monthly_cost:,.2f}/mo) is already within optimal {obs_days}d slot & billing bounds ($0.00/mo change needed)"
+        )
+    else:
+        formula = (
+            f"current {edition} reservation '{res_name}' ({cur_baseline} baseline + {cur_autoscale_add} autoscale) = "
+            f"${cur_monthly_cost:,.2f}/mo; Option {recommended} = ${opt_cost:,.2f}/mo; "
+            f"optimizing bill by ${gross:,.2f}/mo"
+        )
     math = _savings_math(
         "RESERVATION_CAPACITY_RIGHTSIZING", formula,
         billing_mix=f"100% reservation ({edition})", cost_source="BILLING_AWARE",
@@ -2046,12 +2112,67 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             f"(active {edition} commitments in {region}: {comm_slots} slots)"
         )
 
-    savings_basis = "BYTES_ON_DEMAND" if (recommended == 2 and option_2_mode == "ON_DEMAND") else "SLOT_EDITIONS"
+    savings_basis = "BYTES_ON_DEMAND" if (not properly_sized and recommended == 2 and option_2_mode == "ON_DEMAND") else "SLOT_EDITIONS"
     opt2_short = (
         f"Return to On-Demand (${opt2_cost:,.0f}/mo)"
         if option_2_mode == "ON_DEMAND"
         else f"0-Baseline Pure Autoscale to {rec_max} (${opt2_cost:,.0f}/mo)"
     )
+
+    if properly_sized:
+        finding_summary = (
+            f"Reservation '{res_name}' ({edition}, {cur_baseline} baseline + {cur_autoscale_add} autoscale = "
+            f"{cur_max} max, ${cur_monthly_cost:,.0f}/mo) is properly sized from {win_desc} "
+            f"({jobs_30d:,} jobs/mo · {raw_slot_hours_30d:,.0f} slot-h/mo) — no capacity change needed."
+        )
+        rec_pricing_model = f"Keep {edition} Reservation '{res_name}' as Configured (Properly Sized)"
+        proposed_state: dict[str, str] = {
+            "status": (
+                f"Properly sized — keep {cur_baseline} Baseline Slots + {cur_autoscale_add} Autoscale Slots "
+                f"({cur_max} max) = ${cur_monthly_cost:,.2f} / month"
+            ),
+            "net_savings": "$0.00 / month (already within optimal slot & billing range · no action needed)",
+        }
+    else:
+        finding_summary = (
+            f"Reservation '{res_name}' ({edition}, {cur_baseline} baseline + {cur_autoscale_add} autoscale = "
+            f"${cur_monthly_cost:,.0f}/mo) can be right-sized from {win_desc}: "
+            f"Option 1: {rec_baseline} Baseline + Autoscale to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
+            f"OR Option 2: {opt2_short} (→ est. ${opt2_savings:,.0f}/mo efficiency gain). "
+            f"Recommended: Option {recommended}."
+        )
+        rec_pricing_model = (
+            f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"
+        )
+        proposed_state = {
+            "option_1_rightsized": (
+                f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
+                f"{rec_autoscale_add} Autoscaling Slots (${opt1_autoscale_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
+            ),
+            "option_1_net_savings": (
+                f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain"
+                + (" · note active CUD lock-in until expiry)" if (comm_slots and rec_baseline < covered_baseline and edition != "STANDARD")
+                   else (" · Standard PAYG)" if edition == "STANDARD" else " · 1-Yr Commit target rate; note CUD lock-in)"))
+            ),
+            "option_2_alternative": opt2_state_desc,
+            "option_2_net_savings": opt2_savings_desc,
+        }
+
+    proposed_change: dict[str, object] = {
+        "action": "RESIZE_RESERVATION",
+        "no_op": properly_sized,
+        "reservation_name": res_name,
+        "edition": edition,
+        "current_baseline_slots": cur_baseline,
+        "current_autoscale_max_slots": cur_autoscale_add,
+        "recommended_baseline_slots": rec_baseline,
+        "recommended_autoscale_max_slots": rec_max,
+        "option_2_mode": option_2_mode,
+        "selected_option": recommended,
+        "generated_ddl": ddl_opt1,
+    }
+    if ddl_opt2:
+        proposed_change["generated_ddl_option2"] = ddl_opt2
 
     return {
         "rule_id": "W-03",
@@ -2062,13 +2183,7 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         "target_dataset": "RESERVATION_CAPACITY",
         "target_table": res_name,
         "target_region": region,
-        "finding_summary": (
-            f"Reservation '{res_name}' ({edition}, {cur_baseline} baseline + {cur_autoscale_add} autoscale = "
-            f"${cur_monthly_cost:,.0f}/mo) can be right-sized from {win_desc}: "
-            f"Option 1: {rec_baseline} Baseline + Autoscale to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
-            f"OR Option 2: {opt2_short} (→ est. ${opt2_savings:,.0f}/mo efficiency gain). "
-            f"Recommended: Option {recommended}."
-        ),
+        "finding_summary": finding_summary,
         "evidence": {
             "reservation_name": res_name,
             "reservation_fq": res_fq,
@@ -2121,39 +2236,13 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
                 "recommended_max_slots": rec_max,
                 "timeline": list((profile or {}).get("timeline") or []),
             },
-            "recommended_pricing_model": (
-                f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"
-            ),
+            "recommended_pricing_model": rec_pricing_model,
             "current_state": current_state,
-            "proposed_state": {
-                "option_1_rightsized": (
-                    f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
-                    f"{rec_autoscale_add} Autoscaling Slots (${opt1_autoscale_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
-                ),
-                "option_1_net_savings": (
-                    f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain"
-                    + (" · note active CUD lock-in until expiry)" if (comm_slots and rec_baseline < covered_baseline and edition != "STANDARD")
-                       else (" · Standard PAYG)" if edition == "STANDARD" else " · 1-Yr Commit target rate; note CUD lock-in)"))
-                ),
-                "option_2_alternative": opt2_state_desc,
-                "option_2_net_savings": opt2_savings_desc,
-            },
+            "proposed_state": proposed_state,
             "savings_math": math,
         },
         "observation_days": obs_days,
-        "proposed_change": {
-            "action": "RESIZE_RESERVATION",
-            "reservation_name": res_name,
-            "edition": edition,
-            "current_baseline_slots": cur_baseline,
-            "current_autoscale_max_slots": cur_autoscale_add,
-            "recommended_baseline_slots": rec_baseline,
-            "recommended_autoscale_max_slots": rec_max,
-            "option_2_mode": option_2_mode,
-            "selected_option": recommended,
-            "generated_ddl": ddl_opt1,
-            "generated_ddl_option2": ddl_opt2,
-        },
+        "proposed_change": proposed_change,
         "gross_monthly_savings_usd": gross,
         "risk_notes": risk_notes,
         "confidence_hint": 0.85 if profile else 0.7,

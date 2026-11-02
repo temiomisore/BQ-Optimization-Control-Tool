@@ -247,6 +247,8 @@ export interface Dashboard {
     rec_max: number;
     option_2_mode: string;
     recommended_option?: number | null;
+    diagnosis_kind?: string;
+    no_op?: boolean;
     sizing_window_days?: number;
     slot_estimator_url?: string | null;
     capacity_sizing?: CapacitySizing | null;

@@ -151,6 +151,8 @@ def unapproved_money_losing_pending(c: Config, min_net: float = 0.0) -> list[dic
         FROM {_t(c)}
         WHERE state = 'PENDING_REVIEW'
           AND ARRAY_LENGTH(IFNULL(approvals, [])) = 0
+          AND COALESCE(JSON_VALUE(evidence_json, '$.diagnosis_kind'), '') != 'PROPERLY_SIZED'
+          AND COALESCE(JSON_VALUE(proposed_change_json, '$.no_op'), 'false') != 'true'
           AND net_monthly_value_usd < CAST(@min_net AS NUMERIC)""", {"min_net": float(min_net)})
 
 

@@ -109,12 +109,15 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
       ? {
           curLabel: `${w3.reservation_name} (${w3.cur_baseline}+)`,
           curVal: w3.cur_cost,
-          opt1Label: `Opt 1 · ${w3.rec_baseline}+→${w3.rec_max}`,
+          opt1Label: w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED"
+            ? `Optimal · ${w3.cur_baseline}+→${w3.cur_max}`
+            : `Opt 1 · ${w3.rec_baseline}+→${w3.rec_max}`,
           opt1Val: w3.o1,
           opt2Label: w3.option_2_mode === "ON_DEMAND" ? "Opt 2 · On-Demand" : `Opt 2 · 0→${w3.rec_max}`,
           opt2Val: w3.o2,
           opt1Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o1)) / w3.cur_cost)) : 0,
           opt2Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o2)) / w3.cur_cost)) : 0,
+          properlySized: Boolean(w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED"),
         }
       : null;
 
@@ -239,12 +242,27 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
               <ReactECharts option={bars} style={{ height: w && w3 ? 150 : 170 }} notMerge />
             )}
             <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-              <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
-              <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-600 dark:text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
+              {!w && (capChart as { properlySized?: boolean }).properlySized ? (
+                <>
+                  <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">
+                    Current · {w3?.cur_baseline ?? 0} Base / {w3?.cur_max ?? 0} Max
+                  </div>
+                  <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-600 dark:text-emerald-300">
+                    Properly sized · $0 change needed
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
+                  <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-600 dark:text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
+                </>
+              )}
             </div>
             {w && w3 && (
               <div className="mt-1.5 truncate rounded-md border border-zinc-200 px-2 py-1 font-mono text-[10px] text-zinc-500 dark:border-ink-800">
-                W-03 · {w3.reservation_name}: {w3.cur_baseline}→{w3.rec_baseline} baseline ({w3.rec_max} max)
+                {w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED"
+                  ? `W-03 · ${w3.reservation_name}: Properly sized (${w3.cur_baseline} baseline · ${w3.cur_max} max)`
+                  : `W-03 · ${w3.reservation_name}: ${w3.cur_baseline}→${w3.rec_baseline} baseline (${w3.rec_max} max)`}
               </div>
             )}
           </>
