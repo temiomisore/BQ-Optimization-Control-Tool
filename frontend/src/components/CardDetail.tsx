@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AlertTriangle, Calculator, CheckCircle2, ChevronRight, ExternalLink, GitPullRequest, History, Landmark, ShieldCheck, Users, X, XCircle,
+  AlertTriangle, BarChart3, Calculator, CheckCircle2, ChevronRight, ExternalLink, GitPullRequest, History, Landmark, ShieldCheck, Users, X, XCircle,
 } from "lucide-react";
-import type { ChangeSet, Dashboard, SavingsMath } from "@/lib/api";
+import type { CapacitySizing, ChangeSet, Dashboard, SavingsMath } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import {
   CLASS_META, cn, ddlFor, fmtDate, fullPath, isW01, isW02, isW03, needsTwo, safeConsoleUrl, targetLabel, titleize, usd,
@@ -12,6 +12,7 @@ import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
 import { Rich, StateCompare } from "./StateCompare";
 import { RegionBadge } from "./RegionBadge";
+import { SlotSizingChart } from "./SlotSizingChart";
 
 const num = (v: unknown) => Number(v || 0);
 
@@ -269,6 +270,31 @@ export function CardDetail({
               </a>
             )}
           </div>
+        )}
+
+        {wCap && (
+          <Section title="Why these slot numbers were chosen" icon={<BarChart3 className="h-3.5 w-3.5" />}>
+            <SlotSizingChart
+              sizing={ev.capacity_sizing as CapacitySizing | undefined}
+              recBaseline={num(pr.recommended_baseline_slots ?? (w01 ? data.w01?.baseline : data.w03?.rec_baseline))}
+              recMax={num(pr.recommended_autoscale_max_slots ?? (w01 ? data.w01?.max : data.w03?.rec_max))}
+              curBaseline={w03 ? num(ev.current_baseline_slots ?? pr.current_baseline_slots) : undefined}
+              curMax={
+                w03
+                  ? num(
+                      ev.current_max_slots ??
+                        num(ev.current_baseline_slots ?? pr.current_baseline_slots) +
+                          num(ev.current_autoscale_add_slots ?? pr.current_autoscale_max_slots),
+                    )
+                  : undefined
+              }
+              isReservation={w03}
+              selectedOption={opt}
+              option2Mode={String(ev.option_2_mode || pr.option_2_mode || "PURE_AUTOSCALE")}
+              bytesTib30d={ev.bytes_scanned_tib_30d != null ? num(ev.bytes_scanned_tib_30d) : null}
+              windowDays={num(ev.sizing_window_days || 30)}
+            />
+          </Section>
         )}
 
         {bullets.length > 0 && (

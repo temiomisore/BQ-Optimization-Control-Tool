@@ -548,7 +548,7 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
             "pricing": {"capacity_sizing_days": 180},
         }
         prof = {
-            "p50_all": 120.0, "p95_all": 260.0, "p99_busy": 340.0, "peak": 400.0,
+            "p50_all": 120.0, "p95_all": 260.0, "p50_busy": 185.0, "p99_busy": 340.0, "peak": 400.0,
             "busy_minutes": 100000.0, "total_minutes": 259200.0, "active_days": 180.0,
             "slot_hours": 90000.0, "autoscale_slot_hours": 115000.0,
             "autoscale_slot_hours_above_baseline": 28000.0,
@@ -569,6 +569,9 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
         m_prof.assert_called_once_with(cfg_180, "acme-analytics-prod", "us-east4", days=180)
         self.assertEqual(f["target_table"], "ALL_DATASETS_AND_TABLES_US_EAST4")
         self.assertEqual(f["observation_days"], 180)
+        self.assertEqual(f["evidence"]["capacity_sizing"]["p50_slots_busy_minutes"], 185.0)
+        self.assertEqual(f["evidence"]["capacity_sizing"]["recommended_baseline_slots"], 100)
+        self.assertEqual(f["evidence"]["capacity_sizing"]["recommended_max_slots"], 350)
         self.assertEqual(
             f["evidence"]["slot_estimator_url"],
             "https://console.cloud.google.com/bigquery/admin/reservations;region=us-east4"

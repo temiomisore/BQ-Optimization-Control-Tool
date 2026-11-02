@@ -3,7 +3,8 @@ import ReactECharts from "echarts-for-react";
 import { motion } from "framer-motion";
 import { Bot, UserRound, Workflow } from "lucide-react";
 import type { Dashboard } from "@/lib/api";
-import { usd } from "@/lib/utils";
+import { cn, usd } from "@/lib/utils";
+import { SlotSizingChart } from "./SlotSizingChart";
 
 const CLASS_COLORS = ["#38bdf8", "#f59e0b", "#f43f5e", "#8b5cf6"];
 
@@ -33,6 +34,7 @@ export type CardTab = "queue" | "finops";
 
 export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (cls: number, tab: CardTab) => void }) {
   const dark = useDark();
+  const [capMode, setCapMode] = useState<"slots" | "cost">("slots");
   const k = data.kpis;
   // Per class, split by where the cards live: the Review queue (engineering) or the
   // FinOps & billing tab (W-01/W-02 etc.), so the tooltip ties out to the lists below.
@@ -186,24 +188,59 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
       </div>
 
       <div className={panel}>
-        <div className="mb-2 flex items-center justify-between">
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
           <span className="label">{w ? "Slot & billing fit · W-01 / W-03" : "Reservation right-sizing · W-03"}</span>
-          {w ? (
-            <span className="font-mono text-[11px] text-sky-400">
-              {w.tib.toLocaleString()} TiB/mo · {w.sizing_window_days || 30}d
-            </span>
-          ) : w3 ? (
-            <span className="font-mono text-[11px] text-sky-400">
-              {w3.edition} · {w3.sizing_window_days || 30}d
-            </span>
-          ) : null}
+          {capChart && (
+            <div className="inline-flex rounded-md border border-zinc-200 bg-zinc-100 p-0.5 text-[10px] font-medium dark:border-ink-800 dark:bg-[#0c0c0f]">
+              <button
+                type="button"
+                onClick={() => setCapMode("slots")}
+                className={cn(
+                  "rounded px-2 py-0.5 transition-colors",
+                  capMode === "slots"
+                    ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300"
+                    : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
+                )}
+              >
+                Why slots
+              </button>
+              <button
+                type="button"
+                onClick={() => setCapMode("cost")}
+                className={cn(
+                  "rounded px-2 py-0.5 transition-colors",
+                  capMode === "cost"
+                    ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300"
+                    : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
+                )}
+              >
+                Monthly $
+              </button>
+            </div>
+          )}
         </div>
         {bars && capChart ? (
           <>
-            <ReactECharts option={bars} style={{ height: w && w3 ? 150 : 170 }} notMerge />
+            {capMode === "slots" ? (
+              <SlotSizingChart
+                compact
+                sizing={w ? w.capacity_sizing : w3?.capacity_sizing}
+                recBaseline={w ? w.baseline : w3?.rec_baseline || 0}
+                recMax={w ? w.max : w3?.rec_max || 0}
+                curBaseline={!w && w3 ? w3.cur_baseline : undefined}
+                curMax={!w && w3 ? w3.cur_max : undefined}
+                isReservation={!w && !!w3}
+                selectedOption={Number((w ? w.recommended_option : w3?.recommended_option) || 1)}
+                option2Mode={!w && w3 ? w3.option_2_mode : "PURE_AUTOSCALE"}
+                bytesTib30d={w ? w.tib : undefined}
+                windowDays={(w ? w.sizing_window_days : w3?.sizing_window_days) || 30}
+              />
+            ) : (
+              <ReactECharts option={bars} style={{ height: w && w3 ? 150 : 170 }} notMerge />
+            )}
             <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-              <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
-              <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
+              <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
+              <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-600 dark:text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
             </div>
             {w && w3 && (
               <div className="mt-1.5 truncate rounded-md border border-zinc-200 px-2 py-1 font-mono text-[10px] text-zinc-500 dark:border-ink-800">

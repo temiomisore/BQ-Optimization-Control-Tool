@@ -603,6 +603,7 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "billing_aware": isinstance(ev.get("savings_math"), dict),
             "sizing_window_days": int(ev.get("sizing_window_days") or 30),
             "slot_estimator_url": ev.get("slot_estimator_url"),
+            "capacity_sizing": ev.get("capacity_sizing") if isinstance(ev.get("capacity_sizing"), dict) else None,
         }
 
     w03 = None
@@ -633,6 +634,7 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "recommended_option": ev3.get("recommended_option") or pr3.get("selected_option") or 1,
             "sizing_window_days": int(ev3.get("sizing_window_days") or 30),
             "slot_estimator_url": ev3.get("slot_estimator_url"),
+            "capacity_sizing": ev3.get("capacity_sizing") if isinstance(ev3.get("capacity_sizing"), dict) else None,
         }
 
     data = dict(

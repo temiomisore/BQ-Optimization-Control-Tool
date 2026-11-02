@@ -99,6 +99,25 @@ export interface Viewer {
   finops_approvers_configured: boolean;
 }
 
+/** evidence.capacity_sizing: minute-by-minute slot telemetry backing W-01 / W-03 sizing. */
+export interface CapacitySizing {
+  source?: string;
+  sizing_window_days?: number;
+  method?: string;
+  current_baseline_slots?: number;
+  current_max_slots?: number;
+  p50_slots_all_minutes?: number;
+  p95_slots_all_minutes?: number;
+  p50_slots_busy_minutes?: number;
+  p99_slots_busy_minutes?: number;
+  peak_slots_1min?: number;
+  busy_minutes_pct?: number;
+  measured_slot_hours_30d?: number;
+  autoscale_billed_slot_hours_30d?: number;
+  recommended_baseline_slots?: number;
+  recommended_max_slots?: number;
+}
+
 /** evidence.savings_math: how a card's number was computed. */
 export interface SavingsMath {
   method?: string;
@@ -203,6 +222,7 @@ export interface Dashboard {
     o1_pct: number; o2_pct: number; baseline: number; max: number;
     recommended_option?: number | null; billing_aware?: boolean;
     sizing_window_days?: number; slot_estimator_url?: string | null;
+    capacity_sizing?: CapacitySizing | null;
   };
   w03?: null | {
     count: number;
@@ -219,6 +239,7 @@ export interface Dashboard {
     recommended_option?: number | null;
     sizing_window_days?: number;
     slot_estimator_url?: string | null;
+    capacity_sizing?: CapacitySizing | null;
   };
   directors: string[];
   projects: string[];
