@@ -203,6 +203,213 @@ def _rollback_capacity_migration(c: Config, cs: dict, plan: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# W-03 reservation right-sizing: ALTER RESERVATION (+ optional On-Demand return)
+# ---------------------------------------------------------------------------
+
+def _assignee_uri(assignee_type: str | None, assignee_id: str | None) -> str:
+    aid = str(assignee_id or "").strip()
+    if not aid:
+        raise Blocked("missing assignee_id on reservation assignment")
+    if aid.startswith("projects/"):
+        tail = aid[len("projects/"):]
+        if not re.fullmatch(r"\d{4,25}", tail):
+            tail = security.validate_project_id(tail)
+        return f"projects/{tail}"
+    if aid.startswith(("folders/", "organizations/")):
+        prefix, tail = aid.split("/", 1)
+        if not re.fullmatch(r"\d{4,25}", tail):
+            raise Blocked(f"invalid {prefix} assignee id: {aid!r}")
+        return f"{prefix}/{tail}"
+    atype = str(assignee_type or "PROJECT").strip().upper()
+    if atype == "PROJECT":
+        if not re.fullmatch(r"\d{4,25}", aid):
+            aid = security.validate_project_id(aid)
+        return f"projects/{aid}"
+    if atype == "FOLDER" and re.fullmatch(r"\d{4,25}", aid):
+        return f"folders/{aid}"
+    if atype == "ORGANIZATION" and re.fullmatch(r"\d{4,25}", aid):
+        return f"organizations/{aid}"
+    raise Blocked(f"unsupported reservation assignee ({assignee_type!r}: {assignee_id!r})")
+
+
+def reservation_resize_plan(c: Config, cs: dict, change: dict) -> dict:
+    """Pure: resolve W-03 Option 1 / Option 2 into concrete ALTER RESERVATION parameters."""
+    import os
+    proj = security.validate_project_id(cs["target_project"])
+    region = security.validate_region(cs.get("target_region") or c.get("location", "US"))
+    raw_name = change.get("reservation_name") or cs.get("target_table")
+    res_fq = security.validate_reservation_fq(f"{proj}.region-{region}.{raw_name}")
+    res_name = res_fq.split(".")[-1]
+    raw = os.environ.get("BQOPT_RESERVATION_OPTION") or change.get("selected_option") or 1
+    try:
+        opt = 2 if int(raw) == 2 else 1
+    except (TypeError, ValueError):
+        opt = 1
+    edition = str(change.get("edition") or "ENTERPRISE").strip().upper().replace("-", "_").replace(" ", "_")
+    opt2_mode = str(change.get("option_2_mode") or "PURE_AUTOSCALE").strip().upper()
+
+    if opt == 2 and opt2_mode == "ON_DEMAND":
+        return_to_od = True
+        baseline, autoscale, ceiling = 0, 0, 0
+    else:
+        return_to_od = False
+        ceiling = _round50(change.get("recommended_autoscale_max_slots", 300)) or 50
+        if edition == "STANDARD":
+            ceiling = min(ceiling, 1600)
+        baseline = _round50(change.get("recommended_baseline_slots", 100)) if opt == 1 else 0
+        baseline = min(baseline, ceiling)
+        autoscale = max(0, ceiling - baseline)
+
+    alter_sql = (
+        f"ALTER RESERVATION `{res_fq}`\n"
+        f"SET OPTIONS (slot_capacity = {baseline}, autoscale_max_slots = {autoscale})"
+    )
+    bq.assert_single_statement_ddl(alter_sql, ("ALTER_RESERVATION",))
+    return {
+        "option": opt,
+        "project": proj,
+        "region": region,
+        "reservation_name": res_name,
+        "reservation_fq": res_fq,
+        "edition": edition,
+        "baseline_slots": baseline,
+        "autoscale_max_slots": autoscale,
+        "max_slots": ceiling,
+        "return_to_on_demand": return_to_od,
+        "alter_reservation_sql": alter_sql,
+    }
+
+
+def _run_reservation_resize(c: Config, cs: dict, change: dict) -> dict:
+    if not c["executor"].get("enable_reservation_changes", False):
+        raise Blocked("reservation changes are disabled (executor.enable_reservation_changes=false). "
+                      "Resizing a reservation changes slot capacity for assigned workloads — "
+                      "set it true in config.yaml to allow a real run.")
+    p = reservation_resize_plan(c, cs, change)
+    loc = f"region-{p['region']}"
+    rloc = bq.location_for(p["region"])
+
+    existing = bq.query(c, f"""
+        SELECT reservation_name, edition, slot_capacity,
+               autoscale.max_slots AS autoscale_max_slots
+        FROM `{p['project']}.{loc}.INFORMATION_SCHEMA.RESERVATIONS`
+        WHERE LOWER(reservation_name) = @n""", {"n": p["reservation_name"].lower()}, location=rloc)
+    if not existing:
+        raise Blocked(f"reservation {p['reservation_fq']!r} not found in {loc}")
+    cur = existing[0]
+    orig_base = max(0, int(cur.get("slot_capacity") or 0))
+    raw_auto = cur.get("autoscale_max_slots")
+    if raw_auto is None and isinstance(cur.get("autoscale"), dict):
+        raw_auto = cur["autoscale"].get("max_slots")
+    orig_auto = max(0, int(raw_auto or 0))
+    orig_edition = str(cur.get("edition") or p["edition"]).upper()
+
+    to_drop: list[dict] = []
+    if p["return_to_on_demand"]:
+        arows = bq.query(c, f"""
+            SELECT assignment_id, assignee_type, assignee_id
+            FROM `{p['project']}.{loc}.INFORMATION_SCHEMA.ASSIGNMENTS`
+            WHERE LOWER(reservation_name) = @n
+              AND UPPER(COALESCE(job_type, 'QUERY')) = 'QUERY'""",
+            {"n": p["reservation_name"].lower()}, location=rloc)
+        for a in (arows or []):
+            afq = security.validate_assignment_fq(f"{p['reservation_fq']}.{a['assignment_id']}")
+            auri = _assignee_uri(a.get("assignee_type"), a.get("assignee_id"))
+            to_drop.append({
+                "assignment_fq": afq,
+                "assignee_type": str(a.get("assignee_type") or "PROJECT").upper(),
+                "assignee_id": str(a.get("assignee_id") or ""),
+                "assignee_uri": auri,
+            })
+
+    _progress(c, cs, "S0_PRECHECK", {
+        "option": p["option"],
+        "prior_baseline_slots": orig_base,
+        "prior_autoscale_max_slots": orig_auto,
+        "return_to_on_demand": p["return_to_on_demand"],
+        "assignments_to_drop": len(to_drop),
+    })
+
+    plan: dict = {
+        "action": "RESIZE_RESERVATION",
+        "option": p["option"],
+        "region": p["region"],
+        "reservation_fq": p["reservation_fq"],
+        "edition": orig_edition,
+        "prior_baseline_slots": orig_base,
+        "prior_autoscale_max_slots": orig_auto,
+        "new_baseline_slots": p["baseline_slots"],
+        "new_autoscale_max_slots": p["autoscale_max_slots"],
+        "return_to_on_demand": p["return_to_on_demand"],
+        "dropped_assignments": [],
+    }
+    bq.execute(c, f"UPDATE `{c.ops}.change_sets` SET rollback_plan_json=@p WHERE change_set_id=@id",
+               {"p": bq.dumps(plan), "id": cs["change_set_id"]})
+
+    for item in to_drop:
+        bq.execute(c, f"DROP ASSIGNMENT IF EXISTS `{item['assignment_fq']}`", location=rloc)
+        plan["dropped_assignments"].append(item)
+        bq.execute(c, f"UPDATE `{c.ops}.change_sets` SET rollback_plan_json=@p WHERE change_set_id=@id",
+                   {"p": bq.dumps(plan), "id": cs["change_set_id"]})
+
+    bq.assert_single_statement_ddl(p["alter_reservation_sql"], ("ALTER_RESERVATION",))
+    bq.execute(c, p["alter_reservation_sql"], location=rloc)
+
+    if p["return_to_on_demand"]:
+        plan["note"] = (
+            f"Unassigned {len(plan['dropped_assignments'])} QUERY assignment(s) from {p['reservation_name']} "
+            f"(returning jobs to On-Demand) and set capacity to 0 slots."
+        )
+    else:
+        plan["note"] = (
+            f"Resized {orig_edition} reservation {p['reservation_name']} from "
+            f"{orig_base}+{orig_auto} slots to {p['baseline_slots']}+{p['autoscale_max_slots']} slots "
+            f"({p['max_slots']} max)."
+        )
+    bq.execute(c, f"UPDATE `{c.ops}.change_sets` SET rollback_plan_json=@p WHERE change_set_id=@id",
+               {"p": bq.dumps(plan), "id": cs["change_set_id"]})
+    _progress(c, cs, "S1_RESERVATION_RESIZED", {
+        "reservation": p["reservation_fq"],
+        "slot_capacity": p["baseline_slots"],
+        "autoscale_max_slots": p["autoscale_max_slots"],
+        "dropped_assignments": len(plan["dropped_assignments"]),
+    })
+    return plan
+
+
+def _rollback_reservation_resize(c: Config, cs: dict, plan: dict) -> None:
+    """Restore previous slot_capacity + autoscale_max_slots first, then re-bind any dropped QUERY assignments."""
+    rloc = bq.location_for(plan.get("region") or _region_of(plan.get("reservation_fq")))
+    rfq = security.validate_reservation_fq(plan["reservation_fq"])
+    orig_base = _round50(plan.get("prior_baseline_slots", 0))
+    orig_auto = _round50(plan.get("prior_autoscale_max_slots", 0))
+    alter_sql = (
+        f"ALTER RESERVATION `{rfq}`\n"
+        f"SET OPTIONS (slot_capacity = {orig_base}, autoscale_max_slots = {orig_auto})"
+    )
+    bq.assert_single_statement_ddl(alter_sql, ("ALTER_RESERVATION",))
+    bq.execute(c, alter_sql, location=rloc)
+
+    restored_assigns: list[str] = []
+    for item in (plan.get("dropped_assignments") or []):
+        afq = security.validate_assignment_fq(item["assignment_fq"])
+        auri = _assignee_uri(item.get("assignee_type"), item.get("assignee_id"))
+        bq.execute(
+            c,
+            f"CREATE ASSIGNMENT `{afq}`\nOPTIONS (assignee = '{auri}', job_type = 'QUERY')",
+            location=rloc,
+        )
+        restored_assigns.append(afq)
+
+    _progress(c, cs, "ROLLED_BACK", {
+        "reservation": rfq,
+        "restored_baseline_slots": orig_base,
+        "restored_autoscale_max_slots": orig_auto,
+        "restored_assignments": restored_assigns,
+    })
+
+
+# ---------------------------------------------------------------------------
 
 def run(c: Config, cs: dict) -> dict:
     if not c["executor"]["enable_class3"]:
@@ -211,9 +418,11 @@ def run(c: Config, cs: dict) -> dict:
     change = bq.loads(cs["proposed_change_json"]) or {}
     if change.get("action") == "CAPACITY_PRICING_MIGRATION":
         return _run_capacity_migration(c, cs, change)
+    if change.get("action") == "RESIZE_RESERVATION":
+        return _run_reservation_resize(c, cs, change)
 
     if change.get("action") not in ("REPARTITION",):
-        raise Blocked(f"class3 v1 only implements REPARTITION and CAPACITY_PRICING_MIGRATION (got {change.get('action')}); "
+        raise Blocked(f"class3 v1 only implements REPARTITION, CAPACITY_PRICING_MIGRATION and RESIZE_RESERVATION (got {change.get('action')}); "
                       f"CONSOLIDATE_SHARDS and ARCHIVE_TO_GCS_THEN_DROP are runbook-only for now")
 
     cli = bq.client(c)
@@ -456,6 +665,8 @@ def rollback(c: Config, cs: dict) -> None:
     plan = bq.loads(cs.get("rollback_plan_json")) or {}
     if plan.get("action") == "CAPACITY_PRICING_MIGRATION":
         return _rollback_capacity_migration(c, cs, plan)
+    if plan.get("action") == "RESIZE_RESERVATION":
+        return _rollback_reservation_resize(c, cs, plan)
     proj = security.validate_project_id(cs["target_project"])
     ds_id = security.validate_dataset_id(cs["target_dataset"])
     tbl_id = security.validate_table_id(cs["target_table"])

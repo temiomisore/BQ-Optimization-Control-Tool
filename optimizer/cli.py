@@ -163,7 +163,9 @@ def cmd_collect(c) -> None:
 
 
 # Findings that are not tied to one dataset stay in scope for dataset-scoped runs.
-_CROSS_DATASET_TARGETS = (None, "queries", "PROJECT_WIDE_BILLING", "HUMAN_ADHOC_GOVERNANCE")
+_CROSS_DATASET_TARGETS = (
+    None, "queries", "PROJECT_WIDE_BILLING", "RESERVATION_CAPACITY", "HUMAN_ADHOC_GOVERNANCE"
+)
 
 
 def _in_scope(item: dict, target_ds: str | None) -> bool:

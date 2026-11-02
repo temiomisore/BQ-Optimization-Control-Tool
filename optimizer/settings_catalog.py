@@ -167,8 +167,9 @@ SETTINGS: list[dict] = [
        edit="editor", kind="dataset", nullable=True, applies="collect"),
 
     _s("reservation_admin_project", "Reservation admin project", "everyday", "Ownership & billing",
-       "Project that owns your slot reservations. Reservation jobs are priced at their edition's "
-       "slot rate (Enterprise list price if not set).", env="BQOPT_RESERVATION_ADMIN_PROJECT",
+       "Optional override for the project that owns your slot reservations. Even when unset, the "
+       "collector auto-discovers reservation admin projects from jobs_events.reservation_id.",
+       env="BQOPT_RESERVATION_ADMIN_PROJECT",
        edit="editor", kind="project", nullable=True, applies="collect"),
     _s("employee_hierarchy_table", "HR hierarchy table", "everyday", "Ownership & billing",
        "Employee -> manager -> director table (project.dataset.table), for card owners and spend by "
@@ -214,6 +215,15 @@ SETTINGS: list[dict] = [
                 {"value": 0.5, "label": "0.5 (50%) — Mix of baseline and autoscale"},
                 {"value": 0.25, "label": "0.25 (25%) — Mostly committed baseline"},
                 {"value": 0.0, "label": "0.0 (0%) — Fixed baseline only (no cash savings)"}]),
+    _s("pricing.capacity_sizing_days", "Capacity sizing window (days)", "everyday",
+       "Savings math", "How many days of historical INFORMATION_SCHEMA slot & scan telemetry W-01 "
+       "(On-Demand -> Slots) and W-03 (Reservation Right-Sizing) analyze to size baseline and "
+       "autoscaling slots, normalized to a 30-day monthly rate.",
+       edit="finops", kind="int", min=7, max=180, applies="rules",
+       presets=[{"value": 30, "label": "30 days (recent month)"},
+                {"value": 60, "label": "60 days (2 months)"},
+                {"value": 90, "label": "90 days (1 quarter)"},
+                {"value": 180, "label": "180 days — Full 6-month scan history (default)"}]),
     _s("pricing.w01_min_on_demand_tib_30d", "Editions card threshold (TiB / 30 days)", "everyday",
        "Savings math", "Only suggest moving a project to slot billing (W-01) when it scans at least "
        "this much on-demand in 30 days.", default=100.0,
@@ -357,8 +367,8 @@ SETTINGS: list[dict] = [
        "Materialized views (they add a running cost)."),
     _s("executor.enable_class3", "Apply Class 3 changes", "safety", "What the tool may change",
        "Table rebuilds (copy, swap, rebind permissions). Needs two approvals."),
-    _s("executor.enable_reservation_changes", "Apply reservation changes (W-01)", "safety",
-       "What the tool may change", "Creates real reservations and moves a project to slot billing."),
+    _s("executor.enable_reservation_changes", "Apply reservation changes (W-01 / W-03)", "safety",
+       "What the tool may change", "Creates or right-sizes real reservations and assignments for W-01 and W-03."),
     _s("executor.change_window_utc", "Change window (UTC hours)", "safety", "What the tool may change",
        "Approved changes are only applied between these hours."),
     _s("executor.backup_hold_days", "Keep backups for (days)", "safety", "What the tool may change",

@@ -91,7 +91,32 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
   };
 
   const w = data.w01;
-  const bars = w && {
+  const w3 = data.w03;
+  const capChart = w
+    ? {
+        curLabel: "On-Demand",
+        curVal: w.od,
+        opt1Label: `Opt 1 · ${w.baseline}+→${w.max}`,
+        opt1Val: w.o1,
+        opt2Label: `Opt 2 · 0→${w.max}`,
+        opt2Val: w.o2,
+        opt1Pct: Math.max(0, 100 - w.o1_pct),
+        opt2Pct: Math.max(0, 100 - w.o2_pct),
+      }
+    : w3
+      ? {
+          curLabel: `${w3.reservation_name} (${w3.cur_baseline}+)`,
+          curVal: w3.cur_cost,
+          opt1Label: `Opt 1 · ${w3.rec_baseline}+→${w3.rec_max}`,
+          opt1Val: w3.o1,
+          opt2Label: w3.option_2_mode === "ON_DEMAND" ? "Opt 2 · On-Demand" : `Opt 2 · 0→${w3.rec_max}`,
+          opt2Val: w3.o2,
+          opt1Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o1)) / w3.cur_cost)) : 0,
+          opt2Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o2)) / w3.cur_cost)) : 0,
+        }
+      : null;
+
+  const bars = capChart && {
     ...baseTheme(dark),
     tooltip: { ...baseTheme(dark).tooltip, trigger: "axis", axisPointer: { type: "shadow" }, valueFormatter: (v: number) => `${usd(v)}/mo` },
     grid: { left: 8, right: 56, top: 8, bottom: 8, containLabel: true },
@@ -102,7 +127,7 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
       axisLine: { show: false },
       axisTick: { show: false },
       axisLabel: { color: dark ? "#d4d4d8" : "#3f3f46", fontSize: 11 },
-      data: ["On-Demand", `Opt 1 · ${w.baseline}+→${w.max}`, `Opt 2 · 0→${w.max}`],
+      data: [capChart.curLabel, capChart.opt1Label, capChart.opt2Label],
     },
     series: [
       {
@@ -111,9 +136,9 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
         itemStyle: { borderRadius: [0, 6, 6, 0] },
         label: { show: true, position: "right", formatter: (p: any) => usd(p.value), fontFamily: "JetBrains Mono", fontSize: 11, color: dark ? "#e4e4e7" : "#27272a" },
         data: [
-          { value: Math.round(w.od), itemStyle: { color: "#f43f5e" } },
-          { value: Math.round(w.o1), itemStyle: { color: "#38bdf8" } },
-          { value: Math.round(w.o2), itemStyle: { color: "#10b981" } },
+          { value: Math.round(capChart.curVal), itemStyle: { color: "#f43f5e" } },
+          { value: Math.round(capChart.opt1Val), itemStyle: { color: "#38bdf8" } },
+          { value: Math.round(capChart.opt2Val), itemStyle: { color: "#10b981" } },
         ],
       },
     ],
@@ -162,19 +187,32 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
 
       <div className={panel}>
         <div className="mb-2 flex items-center justify-between">
-          <span className="label">Project-wide billing fit · W-01</span>
-          {w && <span className="font-mono text-[11px] text-sky-400">{w.tib.toLocaleString()} TiB / 30d</span>}
+          <span className="label">{w ? "Slot & billing fit · W-01 / W-03" : "Reservation right-sizing · W-03"}</span>
+          {w ? (
+            <span className="font-mono text-[11px] text-sky-400">
+              {w.tib.toLocaleString()} TiB/mo · {w.sizing_window_days || 30}d
+            </span>
+          ) : w3 ? (
+            <span className="font-mono text-[11px] text-sky-400">
+              {w3.edition} · {w3.sizing_window_days || 30}d
+            </span>
+          ) : null}
         </div>
-        {bars ? (
+        {bars && capChart ? (
           <>
-            <ReactECharts option={bars} style={{ height: 170 }} notMerge />
+            <ReactECharts option={bars} style={{ height: w && w3 ? 150 : 170 }} notMerge />
             <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-              <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-300">Option 1 saves {100 - w.o1_pct}%</div>
-              <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-300">Option 2 saves {100 - w.o2_pct}%</div>
+              <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
+              <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
             </div>
+            {w && w3 && (
+              <div className="mt-1.5 truncate rounded-md border border-zinc-200 px-2 py-1 font-mono text-[10px] text-zinc-500 dark:border-ink-800">
+                W-03 · {w3.reservation_name}: {w3.cur_baseline}→{w3.rec_baseline} baseline ({w3.rec_max} max)
+              </div>
+            )}
           </>
         ) : (
-          <div className="grid h-[200px] place-items-center text-sm text-zinc-500">No W-01 sizing yet — run the rules engine.</div>
+          <div className="grid h-[200px] place-items-center text-sm text-zinc-500">No W-01 / W-03 capacity sizing yet — run the rules engine.</div>
         )}
       </div>
 

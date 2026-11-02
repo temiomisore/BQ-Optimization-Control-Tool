@@ -40,12 +40,16 @@ _DEFAULTS: dict[str, Any] = {
         # Share of a reservation slot-time reduction that turns into cash (0..1). 1.0 = autoscale
         # slots you stop paying for; lower it when most capacity is committed baseline.
         "reservation_savings_realization": 1.0,
+        # Historical lookback window (days) used by W-01 (On-Demand -> Slots) and W-03 (Existing
+        # Reservation Right-Sizing) to size baseline_slots + autoscale_max_slots right after a
+        # 180-day scan, normalized to a 30-day monthly rate without diluting newer projects.
+        "capacity_sizing_days": 180,
     },
     "governance": {
         # Who may see and approve billing / commitment / reservation / project-level cards.
         # Empty = nobody (fail closed). Env BQOPT_FINOPS_APPROVERS adds comma-separated emails.
         "finops_approvers": [],
-        "finops_rule_ids": ["W-01", "C1-07", "C1-05", "W-02", "C1-06"],
+        "finops_rule_ids": ["W-01", "W-03", "C1-07", "C1-05", "W-02", "C1-06"],
         # DEMO ONLY: trust the identity picked in the UI persona picker. Production: false + IAP.
         "trust_client_identity": False,
         # IAP signed-header audience; when set, the review app trusts only IAP-verified emails.
@@ -63,7 +67,7 @@ _DEFAULTS: dict[str, Any] = {
         "enable_class1": True,
         "enable_class2": False,
         "enable_class3": False,
-        "enable_reservation_changes": False,   # W-01: real CREATE RESERVATION + ASSIGNMENT (changes project billing)
+        "enable_reservation_changes": False,   # W-01 / W-03: real CREATE / ALTER RESERVATION + ASSIGNMENT
         "change_window_utc": [3, 9],
         "backup_hold_days": 7,
         "max_structural_changes_per_table_per_days": 7,

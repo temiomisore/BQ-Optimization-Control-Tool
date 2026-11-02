@@ -803,23 +803,91 @@ def _map_adaptive_opts(row: dict, prices: dict, c: Config) -> Finding:
 # R11 — C1-07 / W-01 Editions Billing-Mode Fit & Capacity Sizing
 # --------------------------------------------------------------------------
 
+def _capacity_sizing_days(c: Any) -> int:
+    """Historical lookback window (7..180 days) for W-01 & W-03 capacity sizing.
+    Real Config objects default to 180 days (full 6-month scan); plain unit-test dicts
+    without `pricing.capacity_sizing_days` default to 30 days for test stability."""
+    p = (c or {}).get("pricing") if isinstance(c, dict) else None
+    raw = (p or {}).get("capacity_sizing_days") if isinstance(p, dict) else None
+    if raw is None:
+        return 30
+    return max(7, min(180, int(_f(raw, 180.0))))
+
+
+def _slot_estimator_url(proj: str, region: str, *, edition: str | None = None) -> str:
+    """Concrete GCP Console Slot Estimator deep link (populated project & region)."""
+    reg = str(region or "us").strip().lower()
+    if reg.startswith("region-"):
+        reg = reg[len("region-"):]
+    ed = (edition or "").strip().upper()
+    if ed == "STANDARD":
+        return f"https://console.cloud.google.com/bigquery/admin/reservations?project={proj}"
+    if ed in ("ENTERPRISE", "ENTERPRISE_PLUS"):
+        return (
+            f"https://console.cloud.google.com/bigquery/admin/reservations;region={reg}"
+            f"/slot-estimator;source={ed}?project={proj}"
+        )
+    return (
+        f"https://console.cloud.google.com/bigquery/admin/reservations;region={reg}"
+        f"/slot-estimator;source=EDITION_UNSPECIFIED;resourceType=PROJECT;resource={proj}?project={proj}"
+    )
+
+
 def _sql_editions_fit(c: Config) -> str:
     # Only ON-DEMAND work can move to Editions: projects (or the parts of projects)
     # that already run on a reservation are excluded from the comparison.
+    # Evaluates up to `pricing.capacity_sizing_days` (default 180d) per (project_id, region)
+    # and normalizes to a 30-day monthly rate without diluting projects created <180d ago.
     min_tib = _f((c.get("pricing") or {}).get("w01_min_on_demand_tib_30d"), 100.0)
+    days = _capacity_sizing_days(c)
+    home = security.validate_region(str(c.get("location") or "US"))
     return f"""
+      WITH base AS (
+        SELECT project_id,
+               LOWER(COALESCE(region, '{home}')) AS region,
+               billing_mode,
+               total_bytes_billed,
+               total_slot_ms,
+               reservation_id,
+               creation_time
+        FROM `{c.ops}.v_jobs_costed`
+        WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+      ),
+      agg AS (
+        SELECT project_id,
+               region,
+               GREATEST(
+                 LEAST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, {days}.0),
+                 LEAST({days}.0, 30.0)
+               ) AS active_days,
+               SUM(IF(billing_mode = 'ON_DEMAND', total_bytes_billed, 0)) AS raw_od_bytes,
+               SUM(IF(billing_mode = 'ON_DEMAND', total_slot_ms, 0))      AS raw_od_slot_ms,
+               SUM(total_bytes_billed)                                    AS raw_total_bytes,
+               SUM(total_slot_ms)                                         AS raw_total_slot_ms,
+               COUNTIF(billing_mode = 'ON_DEMAND')                        AS raw_od_jobs,
+               COUNTIF(billing_mode = 'RESERVATION')                      AS raw_resv_jobs,
+               ARRAY_AGG(DISTINCT reservation_id IGNORE NULLS ORDER BY reservation_id LIMIT 3) AS reservations
+        FROM base
+        GROUP BY 1, 2
+      )
       SELECT project_id,
-             SUM(IF(billing_mode = 'ON_DEMAND', total_bytes_billed, 0)) AS od_bytes_billed_30d,
-             SUM(IF(billing_mode = 'ON_DEMAND', total_slot_ms, 0))      AS od_slot_ms_30d,
-             SUM(total_bytes_billed)                                    AS total_bytes_billed_30d,
-             SUM(total_slot_ms)                                         AS total_slot_ms_30d,
-             COUNTIF(billing_mode = 'ON_DEMAND')                        AS od_jobs_30d,
-             COUNTIF(billing_mode = 'RESERVATION')                      AS resv_jobs_30d,
-             ARRAY_AGG(DISTINCT reservation_id IGNORE NULLS ORDER BY reservation_id LIMIT 3) AS reservations
-      FROM `{c.ops}.v_jobs_costed`
-      WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-      GROUP BY 1
-      HAVING od_bytes_billed_30d > {min_tib} * POW(1024, 4)
+             region,
+             ROUND(active_days, 1)                                                       AS active_days,
+             raw_od_bytes * (30.0 / active_days)                                         AS od_bytes_billed_30d,
+             raw_od_slot_ms * (30.0 / active_days)                                       AS od_slot_ms_30d,
+             raw_total_bytes * (30.0 / active_days)                                      AS total_bytes_billed_30d,
+             raw_total_slot_ms * (30.0 / active_days)                                    AS total_slot_ms_30d,
+             IF(raw_od_jobs > 0,
+                GREATEST(1, CAST(ROUND(raw_od_jobs * (30.0 / active_days)) AS INT64)),
+                0)                                                                       AS od_jobs_30d,
+             IF(raw_resv_jobs > 0,
+                GREATEST(1, CAST(ROUND(raw_resv_jobs * (30.0 / active_days)) AS INT64)),
+                0)                                                                       AS resv_jobs_30d,
+             raw_od_jobs                                                                 AS od_jobs_window,
+             reservations
+      FROM agg
+      WHERE raw_od_jobs > 0
+        AND raw_od_bytes * (30.0 / active_days) > {min_tib} * POW(1024, 4)
     """
 
 
@@ -833,62 +901,200 @@ def _floor50(x: float) -> int:
     return int(math.floor(max(float(x), 0.0) / 50.0)) * 50
 
 
-def _slot_profile(c: Config, proj: str, region: str, days: int = 30) -> dict | None:
-    """Per-minute slot usage for QUERY jobs from INFORMATION_SCHEMA.JOBS_TIMELINE.
+def _query_in_region(c: Config, sql: str, params: dict | None, region: str) -> list[dict]:
+    """Run `bq.query` passing `location=` only when `region` differs from the home location
+    (keeps 2-argument `bq.query(c, sql)` unit-test mocks compatible)."""
+    home = str(c.get("location") or "US").strip().lower()
+    reg_norm = str(region or home).strip().lower()
+    if reg_norm.startswith("region-"):
+        reg_norm = reg_norm[len("region-"):]
+    if reg_norm == home:
+        return bq.query(c, sql, params) if params else bq.query(c, sql)
+    return bq.query(c, sql, params, location=bq.location_for(reg_norm))
 
-    Every minute in the window is counted (idle minutes = 0 slots), so:
-      * p50_all  = the load that is present at least half of the time -> steady baseline
-      * p99_busy = the top of normal busy-minute demand (ignores the rarest 1% spikes) -> ceiling
-    It also prices autoscaling the way it is billed: whole 50-slot steps, for at least a
-    minute, every minute there is work (autoscale_slot_hours; *_above_baseline = the part
-    above a baseline of p50_all rounded down to 50). Small, spiky workloads pay far more
-    than their measured slot-hours this way.
-    Only on-demand jobs are profiled: work already on a reservation is not being migrated.
-    Returns None if JOBS_TIMELINE cannot be read (caller falls back to defaults)."""
-    try:
-        rows = bq.query(c, f"""
-          WITH busy AS (
-            SELECT TIMESTAMP_TRUNC(period_start, MINUTE) AS minute,
-                   SUM(period_slot_ms) / 60000.0       AS slots
-            FROM `{proj}.region-{region.lower()}.INFORMATION_SCHEMA.JOBS_TIMELINE`
-            WHERE job_creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days) + 1} DAY)
-              AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY)
-              AND job_type = 'QUERY'
-              AND (statement_type IS NULL OR statement_type != 'SCRIPT')
-              AND reservation_id IS NULL
-            GROUP BY 1
-          ),
-          all_minutes AS (
-            SELECT m AS minute, COALESCE(b.slots, 0) AS slots
-            FROM UNNEST(GENERATE_TIMESTAMP_ARRAY(
-                   TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(days)} DAY), MINUTE),
-                   TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MINUTE), INTERVAL 1 MINUTE)) AS m
-            LEFT JOIN busy b ON b.minute = m
-          ),
-          base AS (
-            SELECT FLOOR(APPROX_QUANTILES(slots, 100)[OFFSET(50)] / 50) * 50 AS baseline
-            FROM all_minutes
-          )
-          SELECT
-            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(50)] FROM all_minutes) AS p50_all,
-            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(95)] FROM all_minutes) AS p95_all,
-            (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(99)] FROM busy)        AS p99_busy,
-            (SELECT MAX(slots) FROM busy)                                     AS peak,
-            (SELECT COUNT(*) FROM busy)                                       AS busy_minutes,
-            (SELECT COUNT(*) FROM all_minutes)                                AS total_minutes,
-            (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours,
-            (SELECT SUM(CEIL(slots / 50) * 50) / 60.0 FROM busy)              AS autoscale_slot_hours,
-            (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50) / 60.0
-               FROM busy b CROSS JOIN base)                                   AS autoscale_slot_hours_above_baseline
-        """)
-    except Exception:
-        return None
+
+def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
+                  reservation_id: str | None = None,
+                  current_baseline: int | None = None) -> dict | None:
+    """Per-minute slot usage for QUERY jobs from INFORMATION_SCHEMA.JOBS_TIMELINE (up to 180d).
+
+    Every minute in the active window is counted (idle minutes = 0 slots), clamping the window
+    start so projects/reservations created <`days` ago are not diluted by pre-creation zeros
+    (while flooring the window to at least MIN(days, 30) days so 1-2 day spikes aren't
+    extrapolated 30x). Returned slot-hour totals (`slot_hours`, `autoscale_slot_hours`,
+    `autoscale_slot_hours_above_baseline`, `current_burst_slot_hours`) are normalized to a
+    30-day month so they compare directly against `baseline * 730` monthly slot-hours.
+
+    When `reservation_id` is None (W-01), only on-demand jobs (`reservation_id IS NULL`) are
+    profiled. When `reservation_id` is provided (W-03), jobs on that reservation are profiled
+    (trying `JOBS_TIMELINE_BY_ORGANIZATION` first when org-scoped, then `JOBS_TIMELINE`, then
+    `optimizer_ops.jobs_hourly_slots` fallback)."""
+    d = max(7, min(180, int(days)))
+    min_d = min(d, 30)
+    reg = security.validate_region(region)
+    vproj = security.validate_project_id(proj)
+    cur_base = max(0, int(current_baseline or 0))
+
+    sources: list[tuple[str, str, dict | None]] = []
+    if reservation_id:
+        res_clause = "LOWER(reservation_id) = @res_id"
+        params: dict | None = {"res_id": reservation_id.strip().lower()}
+        if str(c.get("jobs_view") or "").strip().upper() == "JOBS_BY_ORGANIZATION":
+            sources.append((
+                f"`region-{reg}`.INFORMATION_SCHEMA.JOBS_TIMELINE_BY_ORGANIZATION",
+                "JOBS_TIMELINE_ORG",
+                params,
+            ))
+        sources.append((
+            f"`{vproj}.region-{reg}.INFORMATION_SCHEMA.JOBS_TIMELINE`",
+            "JOBS_TIMELINE",
+            params,
+        ))
+    else:
+        res_clause = "reservation_id IS NULL"
+        params = None
+        sources.append((
+            f"`{vproj}.region-{reg}.INFORMATION_SCHEMA.JOBS_TIMELINE`",
+            "JOBS_TIMELINE",
+            None,
+        ))
+
+    rows = None
+    src_prefix = "JOBS_TIMELINE"
+    for from_view, label, qparams in sources:
+        try:
+            cand = _query_in_region(c, f"""
+              WITH busy AS (
+                SELECT TIMESTAMP_TRUNC(period_start, MINUTE) AS minute,
+                       SUM(period_slot_ms) / 60000.0       AS slots
+                FROM {from_view}
+                WHERE job_creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d + 1} DAY)
+                  AND period_start      >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+                  AND job_type = 'QUERY'
+                  AND (statement_type IS NULL OR statement_type != 'SCRIPT')
+                  AND {res_clause}
+                GROUP BY 1
+              ),
+              bounds AS (
+                SELECT GREATEST(
+                  TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY), MINUTE),
+                  LEAST(
+                    COALESCE((SELECT MIN(minute) FROM busy), CURRENT_TIMESTAMP()),
+                    TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {min_d} DAY), MINUTE)
+                  )
+                ) AS win_start
+              ),
+              all_minutes AS (
+                SELECT m AS minute, COALESCE(b.slots, 0) AS slots
+                FROM bounds,
+                     UNNEST(GENERATE_TIMESTAMP_ARRAY(
+                       bounds.win_start,
+                       TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MINUTE), INTERVAL 1 MINUTE)) AS m
+                LEFT JOIN busy b ON b.minute = m
+              ),
+              base AS (
+                SELECT FLOOR(APPROX_QUANTILES(slots, 100)[OFFSET(50)] / 50) * 50 AS baseline
+                FROM all_minutes
+              )
+              SELECT
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(50)] FROM all_minutes) AS p50_all,
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(95)] FROM all_minutes) AS p95_all,
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(99)] FROM busy)        AS p99_busy,
+                (SELECT MAX(slots) FROM busy)                                     AS peak,
+                (SELECT COUNT(*) FROM busy)                                       AS busy_minutes,
+                (SELECT COUNT(*) FROM all_minutes)                                AS total_minutes,
+                (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours,
+                (SELECT SUM(CEIL(slots / 50) * 50) / 60.0 FROM busy)              AS autoscale_slot_hours,
+                (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50) / 60.0
+                   FROM busy b CROSS JOIN base)                                   AS autoscale_slot_hours_above_baseline,
+                (SELECT SUM(CEIL(GREATEST(b.slots - {cur_base}, 0) / 50) * 50) / 60.0
+                   FROM busy b)                                                   AS current_burst_slot_hours
+            """, qparams, reg)
+            if cand and cand[0].get("total_minutes"):
+                rows = cand
+                src_prefix = label
+                break
+        except Exception:
+            continue
+
+    # Fallback for reservation profiling when JOBS_TIMELINE is unreadable: hourly rollup table
+    if not rows and reservation_id and c.get("project_id") and c.get("ops_dataset"):
+        try:
+            h_rows = bq.query(c, f"""
+              WITH busy AS (
+                SELECT hour_ts,
+                       SUM(total_slot_ms) / 3600000.0 AS slots
+                FROM `{c.ops}.jobs_hourly_slots`
+                WHERE LOWER(region) = @reg
+                  AND LOWER(reservation_id) = @res_id
+                  AND hour_ts >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY)
+                GROUP BY 1
+              ),
+              bounds AS (
+                SELECT GREATEST(
+                  TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {d} DAY), HOUR),
+                  LEAST(
+                    COALESCE((SELECT MIN(hour_ts) FROM busy), CURRENT_TIMESTAMP()),
+                    TIMESTAMP_TRUNC(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {min_d} DAY), HOUR)
+                  )
+                ) AS win_start
+              ),
+              all_hours AS (
+                SELECT h AS hour_ts, COALESCE(b.slots, 0) AS slots
+                FROM bounds,
+                     UNNEST(GENERATE_TIMESTAMP_ARRAY(
+                       bounds.win_start,
+                       TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), HOUR), INTERVAL 1 HOUR)) AS h
+                LEFT JOIN busy b ON b.hour_ts = h
+              ),
+              base AS (
+                SELECT FLOOR(APPROX_QUANTILES(slots, 100)[OFFSET(50)] / 50) * 50 AS baseline
+                FROM all_hours
+              )
+              SELECT
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(50)] FROM all_hours) AS p50_all,
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(95)] FROM all_hours) AS p95_all,
+                (SELECT APPROX_QUANTILES(slots, 100)[OFFSET(99)] FROM busy)      AS p99_busy,
+                (SELECT MAX(slots) FROM busy)                                    AS peak,
+                (SELECT COUNT(*) * 60 FROM busy)                                 AS busy_minutes,
+                (SELECT COUNT(*) * 60 FROM all_hours)                            AS total_minutes,
+                (SELECT SUM(slots) FROM busy)                                    AS slot_hours,
+                (SELECT SUM(CEIL(slots / 50) * 50) FROM busy)                    AS autoscale_slot_hours,
+                (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50)
+                   FROM busy b CROSS JOIN base)                                  AS autoscale_slot_hours_above_baseline,
+                (SELECT SUM(CEIL(GREATEST(b.slots - {cur_base}, 0) / 50) * 50)
+                   FROM busy b)                                                  AS current_burst_slot_hours
+            """, {"reg": reg.lower(), "res_id": reservation_id.strip().lower()})
+            if h_rows and h_rows[0].get("total_minutes"):
+                rows = h_rows
+                src_prefix = "JOBS_HOURLY_SLOTS"
+        except Exception:
+            rows = None
+
     if not rows or not rows[0].get("total_minutes"):
         return None
     r = rows[0]
-    return {k: float(r.get(k) or 0.0) for k in
-            ("p50_all", "p95_all", "p99_busy", "peak", "busy_minutes", "total_minutes", "slot_hours",
-             "autoscale_slot_hours", "autoscale_slot_hours_above_baseline")}
+    total_mins = max(float(r.get("total_minutes") or 0.0), 1.0)
+    min_mins = float(min_d) * 1440.0
+    # Normalize multi-month (up to 180d) cumulative slot-hours to a 30-day month (43,200 mins)
+    month_scale = 43200.0 / max(total_mins, min_mins)
+    active_d = max(1, int(round(total_mins / 1440.0)))
+    out = {
+        "p50_all": float(r.get("p50_all") or 0.0),
+        "p95_all": float(r.get("p95_all") or 0.0),
+        "p99_busy": float(r.get("p99_busy") or 0.0),
+        "peak": float(r.get("peak") or 0.0),
+        "busy_minutes": float(r.get("busy_minutes") or 0.0),
+        "total_minutes": total_mins,
+        "active_days": float(active_d),
+        "slot_hours": float(r.get("slot_hours") or 0.0) * month_scale,
+        "autoscale_slot_hours": float(r.get("autoscale_slot_hours") or 0.0) * month_scale,
+        "autoscale_slot_hours_above_baseline": float(r.get("autoscale_slot_hours_above_baseline") or 0.0) * month_scale,
+        "current_burst_slot_hours": float(r.get("current_burst_slot_hours") or 0.0) * month_scale,
+    }
+    if d != 30 or src_prefix != "JOBS_TIMELINE":
+        out["source_label"] = f"{src_prefix}_{active_d}D"
+    return out
 
 
 def size_capacity(profile: dict | None) -> tuple[int, int, str]:
@@ -902,7 +1108,8 @@ def size_capacity(profile: dict | None) -> tuple[int, int, str]:
     ceiling = max(_ceil50(profile["p99_busy"]), 50)
     ceiling = min(ceiling, max(_ceil50(profile["peak"] * 2), 50))
     ceiling = max(ceiling, baseline + 50)
-    return baseline, ceiling, "JOBS_TIMELINE_30D"
+    src = str(profile.get("source_label") or "JOBS_TIMELINE_30D")
+    return baseline, ceiling, src
 
 
 def _rate_txt(x: float) -> str:
@@ -931,12 +1138,22 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     on_demand_cost = round(bytes_tib * on_demand_rate, 2)
 
     proj = row["project_id"]
-    region = c.get("location", "US")
+    home_loc = str(c.get("location") or "US")
+    region = str(row.get("region") or home_loc)
+    is_home_region = region.strip().lower() == home_loc.strip().lower()
+    target_table = (
+        "ALL_DATASETS_AND_TABLES"
+        if is_home_region
+        else f"ALL_DATASETS_AND_TABLES_{re.sub(r'[^A-Za-z0-9_]', '_', region.strip().upper())}"
+    )
+    days = _capacity_sizing_days(c)
+    obs_days = max(1, int(round(_f(row.get("active_days"), float(days)))))
 
-    # Enterprise Sizing from REAL per-minute slot usage (INFORMATION_SCHEMA.JOBS_TIMELINE, 30d)
-    profile = _slot_profile(c, proj, region)
+    # Enterprise Sizing from REAL per-minute slot usage (INFORMATION_SCHEMA.JOBS_TIMELINE, up to 180d)
+    profile = _slot_profile(c, proj, region) if days == 30 else _slot_profile(c, proj, region, days=days)
     rec_baseline, rec_max, sizing_source = size_capacity(profile)
     rec_autoscale_add = rec_max - rec_baseline
+    profile_days = max(1, int(round(_f((profile or {}).get("active_days"), float(obs_days)))))
 
     commit_rate = pricing.rate(prices, "slot_hour_usd_enterprise_1yr")
     payg_rate = pricing.rate(prices, "slot_hour_usd_enterprise")
@@ -954,7 +1171,8 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
 
     def _billed_note(step_used: bool, measured: float) -> str:
         if step_used:
-            return "autoscale billed in 50-slot steps for every busy minute (JOBS_TIMELINE, 30d)"
+            win_lbl = "30d" if profile_days == 30 else f"{profile_days}d normalized to 30d"
+            return f"autoscale billed in 50-slot steps for every busy minute (JOBS_TIMELINE, {win_lbl})"
         return f"measured {measured:,.0f} slot-h x {_AUTOSCALE_OVERHEAD} autoscale overhead"
 
     # --- OPTION 1: Baseline (1-Yr Commit rate) + Autoscaling Burst up to rec_max ---
@@ -996,12 +1214,14 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     gross = opt1_savings if recommended == 1 else opt2_savings
     is_editions_better = gross > 0
     cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
+    estimator_url = _slot_estimator_url(proj, region)
 
     ddl_opt1 = (
         f"-- OPTION 1 (Recommended for Steady 24/7 Enterprise Workloads)\n"
         f"--   Baseline: {rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ {cr}/slot-hr 1-Yr Commit)\n"
         f"--   Autoscaling Burst: +{rec_autoscale_add} Slots up to {rec_max} Max (${autoscale_monthly_cost:,.2f}/mo est. burst @ {pr_}/slot-hr)\n"
-        f"--   Total Projected Spend: ${opt1_cost:,.2f}/mo (Saves ${opt1_savings:,.2f}/mo vs On-Demand)\n"
+        f"--   Total Projected Spend: ${opt1_cost:,.2f}/mo (Est. ${opt1_savings:,.2f}/mo bill optimization vs On-Demand)\n"
+        f"--   Note: 1-Yr/3-Yr commitments carry a lock-in period; verify in GCP Slot Estimator before purchasing CUDs manually.\n"
         f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-prod-pool`\n"
         f"OPTIONS (\n"
         f"  edition = 'ENTERPRISE',\n"
@@ -1020,7 +1240,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         f"-- OPTION 2 (Recommended for Spiky / Daytime-Only Workloads — $0 Idle Cost)\n"
         f"--   Baseline: 0 Slots ($0.00/mo fixed cost when no queries are running)\n"
         f"--   Pure Autoscaling Burst: Scales 0 -> {rec_max} Slots on demand (~{opt2_billed_slot_hours:,.0f} burst slot-hrs @ {pr_}/slot-hr PAYG)\n"
-        f"--   Total Projected Spend: ${opt2_cost:,.2f}/mo (Saves ${opt2_savings:,.2f}/mo vs On-Demand · No Annual Lock-In)\n"
+        f"--   Total Projected Spend: ${opt2_cost:,.2f}/mo (Est. ${opt2_savings:,.2f}/mo bill optimization vs On-Demand · No Annual Lock-In)\n"
         f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-autoscale-only-pool`\n"
         f"OPTIONS (\n"
         f"  edition = 'ENTERPRISE',\n"
@@ -1053,6 +1273,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         formula += (f". WARNING: only {raw_slot_hours:,.1f} slot-h were recorded for {raw_bytes_tib:,.1f} TiB "
                     f"({slot_h_per_tib:.2f} slot-h/TiB; real scans need >= {_MIN_PLAUSIBLE_SLOT_H_PER_TIB}), so "
                     f"the Editions cost is understated; check it with the BigQuery slot estimator first")
+    pool_key = f"billing:{proj}" if is_home_region else f"billing:{proj}:{region.strip().lower()}"
     math = _savings_math(
         "ON_DEMAND_SPEND_VS_EDITIONS_CAPACITY", formula,
         billing_mix="100% on-demand (reservation jobs excluded)", cost_source="BILLING_AWARE",
@@ -1063,21 +1284,23 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         slot_hours_per_tib_30d=round(slot_h_per_tib, 3) if slot_h_per_tib is not None else None,
         slot_telemetry_plausible=not implausible,
         reservation_jobs_excluded_30d=resv_jobs,
-        pool_key=f"billing:{proj}", pool_spend_usd=on_demand_cost)
+        sizing_window_days=obs_days,
+        pool_key=pool_key, pool_spend_usd=on_demand_cost)
     if floors:
         math["demo_floor_applied"] = True
         math["demo_floor_inputs"] = floors
         risk_notes.append("DEMO_SYNTHETIC_FLOOR_APPLIED")
 
+    win_desc = f"{obs_days}d history normalized to 30d" if obs_days != 30 else "30d"
     current_state = {
         "billing_model": f"On-Demand ({odr} per TiB scanned)",
-        "30d_bytes_scanned": f"{bytes_tib:,.1f} TiB billed on-demand",
+        "30d_bytes_scanned": f"{bytes_tib:,.1f} TiB/mo billed on-demand ({win_desc})",
         "current_monthly_bill": f"${on_demand_cost:,.2f} / month (on-demand jobs only)",
         "cost_driver": "High scan volume (wide tables & unpartitioned scans) billed per Terabyte",
     }
     if resv_jobs > 0:
         current_state["already_on_reservation"] = (
-            f"{resv_jobs} jobs in 30d already ran on a reservation "
+            f"{resv_jobs} jobs/mo already ran on a reservation "
             f"({', '.join(row.get('reservations') or []) or 'reservation'}); they are excluded here")
 
     return {
@@ -1087,12 +1310,12 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         "savings_basis": "SLOT_EDITIONS" if is_editions_better else "BYTES_ON_DEMAND",
         "target_project": proj,
         "target_dataset": "PROJECT_WIDE_BILLING",
-        "target_table": "ALL_DATASETS_AND_TABLES",
+        "target_table": target_table,
         "target_region": region,
         "finding_summary": (
-            f"On-demand workload billed {bytes_tib:,.0f} TiB in 30d (${on_demand_cost:,.0f}/mo). "
-            f"Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → saves ${opt1_savings:,.0f}/mo) "
-            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → saves ${opt2_savings:,.0f}/mo). "
+            f"On-demand workload billed {bytes_tib:,.0f} TiB/mo ({win_desc}, ${on_demand_cost:,.0f}/mo). "
+            f"Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
+            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → est. ${opt2_savings:,.0f}/mo efficiency gain). "
             f"Recommended: Option {recommended}."
         ),
         "evidence": {
@@ -1102,12 +1325,17 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
             "estimated_editions_spend_monthly": opt_cost,
             "option_1_monthly_cost_usd": opt1_cost,
             "option_1_savings_usd": opt1_savings,
+            "option_1_label": f"Option 1 · {rec_baseline} Baseline + Autoscale to {rec_max}",
             "option_2_monthly_cost_usd": opt2_cost,
             "option_2_savings_usd": opt2_savings,
+            "option_2_label": f"Option 2 · 0-Baseline Pure Autoscale (0 → {rec_max})",
             "recommended_option": recommended,
             "reservation_jobs_30d": resv_jobs,
+            "sizing_window_days": obs_days,
+            "slot_estimator_url": estimator_url,
             "capacity_sizing": {
                 "source": sizing_source,
+                "sizing_window_days": profile_days,
                 "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
                            "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
                 "p50_slots_all_minutes": round((profile or {}).get("p50_all", 0.0), 1),
@@ -1126,13 +1354,13 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
             "proposed_state": {
                 "option_1_steady_24x7": (f"{rec_baseline} Baseline Slots (${baseline_monthly_cost:,.0f}/mo) + up to "
                                          f"{rec_autoscale_add} Autoscaling Slots (${autoscale_monthly_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"),
-                "option_1_net_savings": f"${opt1_savings:,.2f} / month ({opt1_pct}% reduction · 1-Yr Commit rate + predictable capacity)",
+                "option_1_net_savings": f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain · 1-Yr Commit rate; note commitment lock-in)",
                 "option_2_spiky_0_baseline": f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month",
-                "option_2_net_savings": f"${opt2_savings:,.2f} / month ({opt2_pct}% reduction · $0 idle cost overnight & no lock-in)",
+                "option_2_net_savings": f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)",
             },
             "savings_math": math,
         },
-        "observation_days": 30,
+        "observation_days": obs_days,
         "proposed_change": {
             "action": "CAPACITY_PRICING_MIGRATION",
             "recommended_baseline_slots": rec_baseline,
@@ -1145,6 +1373,598 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         "gross_monthly_savings_usd": gross,
         "risk_notes": risk_notes,
         "confidence_hint": 0.4 if implausible else 0.85,
+    }
+
+
+# --------------------------------------------------------------------------
+# R11b — W-03 Existing Reservation Right-Sizing & Slot-vs-On-Demand Fit
+# --------------------------------------------------------------------------
+
+def _sql_reservation_rightsizing(c: Config) -> str:
+    """Audit active reservations (snapshotted in v_reservation_rates and/or observed in
+    v_jobs_costed) across up to `pricing.capacity_sizing_days` (default 180d)."""
+    days = _capacity_sizing_days(c)
+    home = security.validate_region(str(c.get("location") or "US"))
+    return f"""
+      WITH res_snap AS (
+        SELECT LOWER(admin_project)                                           AS admin_project,
+               LOWER(COALESCE(region, '{home}'))                              AS region,
+               LOWER(reservation_name)                                        AS reservation_name,
+               UPPER(COALESCE(edition, 'ENTERPRISE'))                         AS edition,
+               baseline_slots,
+               autoscale_max_slots,
+               SUM(COALESCE(baseline_slots, 0)) OVER (
+                 PARTITION BY LOWER(admin_project),
+                              LOWER(COALESCE(region, '{home}')),
+                              UPPER(COALESCE(edition, 'ENTERPRISE'))
+               )                                                              AS edition_total_baseline_slots
+        FROM `{c.ops}.v_reservation_rates`
+        WHERE admin_project IS NOT NULL AND reservation_name IS NOT NULL
+      ),
+      usage AS (
+        SELECT LOWER(REGEXP_EXTRACT(reservation_id, r'^(.+):[^:]+$'))         AS admin_project,
+               LOWER(COALESCE(REGEXP_EXTRACT(reservation_id, r':([^.:]+)\\.[^.:]+$'), region, '{home}')) AS region,
+               LOWER(REGEXP_EXTRACT(reservation_id, r'\\.([^.:]+)$'))         AS reservation_name,
+               ANY_VALUE(reservation_id)                                      AS reservation_id,
+               GREATEST(
+                 LEAST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, {days}.0),
+                 LEAST({days}.0, 30.0)
+               )                                                              AS active_days,
+               COUNT(*)                                                       AS raw_jobs,
+               SUM(total_slot_ms)                                             AS raw_slot_ms,
+               SUM(total_bytes_billed)                                        AS raw_bytes_billed,
+               COUNT(DISTINCT project_id)                                     AS distinct_projects,
+               ARRAY_AGG(DISTINCT project_id IGNORE NULLS ORDER BY project_id LIMIT 5) AS projects
+        FROM `{c.ops}.v_jobs_costed`
+        WHERE reservation_id IS NOT NULL
+          AND creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY)
+        GROUP BY 1, 2, 3
+        HAVING admin_project IS NOT NULL AND reservation_name IS NOT NULL
+      ),
+      comm_latest AS (
+        SELECT region, project_id, raw_json
+        FROM `{c.ops}.object_state_raw_daily`
+        WHERE kind = 'CAPACITY_COMMITMENT'
+          AND snapshot_date = (SELECT MAX(snapshot_date) FROM `{c.ops}.object_state_raw_daily`
+                               WHERE kind = 'CAPACITY_COMMITMENT')
+      ),
+      comm AS (
+        SELECT LOWER(COALESCE(JSON_VALUE(raw_json, '$.project_id'), project_id)) AS admin_project,
+               LOWER(COALESCE(region, '{home}'))                                 AS region,
+               UPPER(COALESCE(JSON_VALUE(raw_json, '$.edition'), 'ENTERPRISE'))  AS edition,
+               SUM(IF(UPPER(COALESCE(JSON_VALUE(raw_json, '$.state'), 'ACTIVE')) = 'ACTIVE',
+                      COALESCE(SAFE_CAST(JSON_VALUE(raw_json, '$.slot_count') AS INT64), 0),
+                      0))                                                        AS committed_slots
+        FROM comm_latest
+        GROUP BY 1, 2, 3
+      ),
+      assign_latest AS (
+        SELECT region, project_id, raw_json
+        FROM `{c.ops}.object_state_raw_daily`
+        WHERE kind = 'ASSIGNMENT'
+          AND snapshot_date = (SELECT MAX(snapshot_date) FROM `{c.ops}.object_state_raw_daily`
+                               WHERE kind = 'ASSIGNMENT')
+      ),
+      assigns AS (
+        SELECT LOWER(COALESCE(JSON_VALUE(raw_json, '$.project_id'), project_id)) AS admin_project,
+               LOWER(COALESCE(region, '{home}'))                                 AS region,
+               LOWER(JSON_VALUE(raw_json, '$.reservation_name'))                 AS reservation_name,
+               COUNT(*)                                                          AS query_assignments,
+               ARRAY_AGG(JSON_VALUE(raw_json, '$.assignment_id') IGNORE NULLS
+                         ORDER BY JSON_VALUE(raw_json, '$.assignment_id') LIMIT 5) AS assignment_ids,
+               ARRAY_AGG(CONCAT(
+                 UPPER(COALESCE(JSON_VALUE(raw_json, '$.assignee_type'), 'PROJECT')), ':',
+                 COALESCE(JSON_VALUE(raw_json, '$.assignee_id'), '')
+               ) IGNORE NULLS LIMIT 5)                                           AS assignees
+        FROM assign_latest
+        WHERE UPPER(COALESCE(JSON_VALUE(raw_json, '$.job_type'), 'QUERY')) = 'QUERY'
+        GROUP BY 1, 2, 3
+      )
+      SELECT COALESCE(r.admin_project, u.admin_project)                          AS admin_project,
+             COALESCE(r.region, u.region)                                        AS region,
+             COALESCE(r.reservation_name, u.reservation_name)                    AS reservation_name,
+             r.edition                                                           AS edition,
+             r.baseline_slots                                                    AS baseline_slots,
+             r.autoscale_max_slots                                               AS autoscale_max_slots,
+             r.edition_total_baseline_slots                                      AS edition_total_baseline_slots,
+             c.committed_slots                                                   AS committed_slots,
+             a.query_assignments                                                 AS query_assignments,
+             a.assignment_ids                                                    AS assignment_ids,
+             a.assignees                                                         AS assignees,
+             u.reservation_id                                                    AS reservation_id,
+             ROUND(COALESCE(u.active_days, {days}.0), 1)                         AS active_days,
+             COALESCE(u.raw_jobs, 0)                                             AS jobs_window,
+             IF(COALESCE(u.raw_jobs, 0) > 0,
+                GREATEST(1, CAST(ROUND(u.raw_jobs * (30.0 / COALESCE(u.active_days, 30.0))) AS INT64)),
+                0)                                                               AS jobs_30d,
+             COALESCE(u.raw_slot_ms, 0) * (30.0 / COALESCE(u.active_days, 30.0)) AS slot_ms_30d,
+             COALESCE(u.raw_bytes_billed, 0) * (30.0 / COALESCE(u.active_days, 30.0)) AS bytes_billed_30d,
+             COALESCE(u.distinct_projects, 0)                                    AS distinct_projects,
+             u.projects                                                          AS projects
+      FROM res_snap r
+      FULL OUTER JOIN usage u
+        ON r.admin_project = u.admin_project
+       AND r.region = u.region
+       AND r.reservation_name = u.reservation_name
+      LEFT JOIN comm c
+        ON c.admin_project = COALESCE(r.admin_project, u.admin_project)
+       AND c.region = COALESCE(r.region, u.region)
+       AND c.edition = COALESCE(r.edition, 'ENTERPRISE')
+      LEFT JOIN assigns a
+        ON a.admin_project = COALESCE(r.admin_project, u.admin_project)
+       AND a.region = COALESCE(r.region, u.region)
+       AND a.reservation_name = COALESCE(r.reservation_name, u.reservation_name)
+      WHERE COALESCE(r.admin_project, u.admin_project) IS NOT NULL
+        AND COALESCE(r.reservation_name, u.reservation_name) IS NOT NULL
+    """
+
+
+def _live_reservation_meta(c: Config, admin_proj: str, region: str, res_name: str) -> dict | None:
+    """Fallback live lookup of RESERVATIONS (+ CAPACITY_COMMITMENTS + ASSIGNMENTS) when
+    `object_state_raw_daily` has not snapshotted `admin_proj` yet."""
+    if not c.get("project_id"):
+        return None
+    try:
+        vproj = security.validate_project_id(admin_proj)
+        vreg = security.validate_region(region)
+    except Exception:
+        return None
+    try:
+        rrows = _query_in_region(c, f"""
+            SELECT reservation_name,
+                   UPPER(COALESCE(edition, 'ENTERPRISE')) AS edition,
+                   slot_capacity                          AS baseline_slots,
+                   autoscale.max_slots                    AS autoscale_max_slots,
+                   SUM(COALESCE(slot_capacity, 0)) OVER (
+                     PARTITION BY UPPER(COALESCE(edition, 'ENTERPRISE'))
+                   )                                      AS edition_total_baseline_slots
+            FROM `{vproj}.region-{vreg}`.INFORMATION_SCHEMA.RESERVATIONS
+        """, None, vreg)
+    except Exception:
+        return None
+    match = next(
+        (r for r in (rrows or []) if str(r.get("reservation_name") or "").strip().lower() == res_name.lower()),
+        None,
+    )
+    if not match:
+        return None
+    out = dict(match)
+    ed = str(match.get("edition") or "ENTERPRISE").strip().upper()
+    try:
+        crows = _query_in_region(c, f"""
+            SELECT SUM(COALESCE(slot_count, 0)) AS committed_slots
+            FROM `{vproj}.region-{vreg}`.INFORMATION_SCHEMA.CAPACITY_COMMITMENTS
+            WHERE UPPER(COALESCE(state, 'ACTIVE')) = 'ACTIVE'
+              AND UPPER(COALESCE(edition, 'ENTERPRISE')) = @ed
+        """, {"ed": ed}, vreg)
+        if crows and crows[0].get("committed_slots") is not None:
+            out["committed_slots"] = int(crows[0]["committed_slots"])
+    except Exception:
+        pass
+    try:
+        arows = _query_in_region(c, f"""
+            SELECT assignment_id, assignee_type, assignee_id
+            FROM `{vproj}.region-{vreg}`.INFORMATION_SCHEMA.ASSIGNMENTS
+            WHERE LOWER(reservation_name) = @n AND UPPER(COALESCE(job_type, 'QUERY')) = 'QUERY'
+        """, {"n": res_name.lower()}, vreg)
+        if arows is not None:
+            out["query_assignments"] = len(arows)
+            out["assignment_ids"] = [str(a["assignment_id"]) for a in arows if a.get("assignment_id")][:5]
+            out["assignees"] = [
+                f"{str(a.get('assignee_type') or 'PROJECT').upper()}:{a.get('assignee_id') or ''}"
+                for a in arows
+            ][:5]
+    except Exception:
+        pass
+    return out
+
+
+def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding | None:
+    admin_proj = str(row.get("admin_project") or "").strip().lower()
+    res_name = str(row.get("reservation_name") or "").strip().lower()
+    home_loc = str(c.get("location") or "US")
+    region = str(row.get("region") or home_loc).strip().lower()
+    if region.startswith("region-"):
+        region = region[len("region-"):]
+    if not admin_proj or not res_name:
+        return None
+    try:
+        res_fq = security.validate_reservation_fq(f"{admin_proj}.region-{region}.{res_name}")
+    except Exception:
+        return None
+
+    meta = dict(row)
+    if meta.get("baseline_slots") is None and meta.get("autoscale_max_slots") is None:
+        live = _live_reservation_meta(c, admin_proj, region, res_name)
+        if live:
+            for k, v in live.items():
+                if meta.get(k) is None and v is not None:
+                    meta[k] = v
+    if meta.get("baseline_slots") is None and meta.get("autoscale_max_slots") is None:
+        return None  # Cannot right-size without knowing provisioned baseline/autoscale capacity
+
+    edition = str(meta.get("edition") or "ENTERPRISE").strip().upper().replace("-", "_").replace(" ", "_")
+    if edition not in ("STANDARD", "ENTERPRISE", "ENTERPRISE_PLUS"):
+        edition = "ENTERPRISE"
+
+    cur_baseline = max(0, int(_f(meta.get("baseline_slots"), 0.0)))
+    cur_autoscale_add = max(0, int(_f(meta.get("autoscale_max_slots"), 0.0)))
+    cur_max = cur_baseline + cur_autoscale_add
+
+    if cur_baseline == 0 and cur_autoscale_add == 0:
+        return None
+    if res_name == "human-adhoc-sandbox-pool" and cur_baseline == 0 and cur_autoscale_add <= 50:
+        return None  # W-02 ad-hoc runaway cap reservation is intentionally throttled
+
+    days = _capacity_sizing_days(c)
+    obs_days = max(1, int(round(_f(meta.get("active_days"), float(days)))))
+    jobs_window = int(_f(meta.get("jobs_window") if meta.get("jobs_window") is not None else meta.get("jobs_30d"), 0.0))
+    jobs_30d = int(_f(meta.get("jobs_30d"), float(jobs_window)))
+    raw_slot_hours_30d = _f(meta.get("slot_ms_30d")) / 3_600_000.0
+    bytes_tib_30d = _f(meta.get("bytes_billed_30d")) / _TIB
+    res_id = str(meta.get("reservation_id") or f"{admin_proj}:{region}.{res_name}")
+
+    # 1. Profile historical slot demand on this reservation
+    if jobs_window <= 0 and raw_slot_hours_30d <= 0:
+        profile: dict | None = {
+            "p50_all": 0.0, "p95_all": 0.0, "p99_busy": 0.0, "peak": 0.0,
+            "busy_minutes": 0.0, "total_minutes": float(obs_days) * 1440.0,
+            "active_days": float(obs_days),
+            "slot_hours": 0.0, "autoscale_slot_hours": 0.0,
+            "autoscale_slot_hours_above_baseline": 0.0, "current_burst_slot_hours": 0.0,
+        }
+        rec_baseline, rec_max, sizing_source = 0, 50, f"IDLE_RESERVATION_{obs_days}D"
+    else:
+        profile = _slot_profile(
+            c, admin_proj, region, days=days,
+            reservation_id=res_id, current_baseline=cur_baseline,
+        )
+        if profile and profile.get("busy_minutes", 0) > 0:
+            rec_baseline, rec_max, sizing_source = size_capacity(profile)
+        else:
+            avg_slots = raw_slot_hours_30d / 730.0
+            rec_baseline = _floor50(avg_slots * 0.8) if avg_slots >= 50.0 else 0
+            rec_max = max(_ceil50(max(avg_slots * 3.0, float(rec_baseline + 50))), 50)
+            if cur_max > 0:
+                rec_max = min(rec_max, max(cur_max, rec_baseline + 50))
+            sizing_source = f"JOBS_SUMMARY_{obs_days}D"
+            profile = None
+
+    if edition == "STANDARD":
+        rec_max = min(rec_max, 1600)
+        rec_baseline = min(rec_baseline, max(rec_max - 50, 0))
+    rec_autoscale_add = max(0, rec_max - rec_baseline)
+    profile_days = max(1, int(round(_f((profile or {}).get("active_days"), float(obs_days)))))
+
+    # 2. Price current reservation configuration (including CUD coverage vs PAYG)
+    payg_rate = pricing.edition_slot_rate(prices, edition)
+    commit_rate = pricing.edition_commit_rate(prices, edition)
+    on_demand_rate = pricing.rate(prices, "on_demand_usd_per_tib")
+
+    comm_raw = meta.get("committed_slots")
+    comm_slots: int | None
+    if edition == "STANDARD":
+        comm_slots = 0
+        covered_baseline = 0
+        uncovered_baseline = cur_baseline
+    elif comm_raw is not None:
+        comm_slots = max(0, int(_f(comm_raw, 0.0)))
+        ed_tot = max(cur_baseline, int(_f(meta.get("edition_total_baseline_slots"), float(cur_baseline))))
+        alloc_comm = int(round(comm_slots * (cur_baseline / max(ed_tot, 1))))
+        covered_baseline = min(cur_baseline, alloc_comm)
+        uncovered_baseline = max(cur_baseline - covered_baseline, 0)
+    else:
+        comm_slots = None
+        covered_baseline = cur_baseline
+        uncovered_baseline = 0
+
+    cur_baseline_cost = round((covered_baseline * commit_rate + uncovered_baseline * payg_rate) * 730.0, 2)
+    measured_cur_burst = max(raw_slot_hours_30d - cur_baseline * 730.0, 0.0)
+    step_cur_burst = _f((profile or {}).get("current_burst_slot_hours"))
+    cur_burst_hours = (
+        max(measured_cur_burst * _AUTOSCALE_OVERHEAD, step_cur_burst)
+        if cur_autoscale_add > 0 else 0.0
+    )
+    cur_autoscale_cost = round(cur_burst_hours * payg_rate, 2)
+    cur_monthly_cost = round(cur_baseline_cost + cur_autoscale_cost, 2)
+
+    # 3. Price Option 1 (Right-Sized Baseline + Autoscale)
+    opt1_baseline_hours = rec_baseline * 730.0
+    opt1_baseline_cost = round(opt1_baseline_hours * commit_rate, 2)
+    measured_opt1_burst = max(raw_slot_hours_30d - opt1_baseline_hours, 0.0)
+    step_opt1_burst = _f((profile or {}).get("autoscale_slot_hours_above_baseline"))
+    opt1_burst_hours = (
+        max(measured_opt1_burst * _AUTOSCALE_OVERHEAD, step_opt1_burst)
+        if rec_autoscale_add > 0 else 0.0
+    )
+    opt1_autoscale_cost = round(opt1_burst_hours * payg_rate, 2)
+    opt1_cost = round(opt1_baseline_cost + opt1_autoscale_cost, 2)
+    opt1_savings = round(max(cur_monthly_cost - opt1_cost, 0.0), 2)
+    opt1_pct = int(round((opt1_savings / max(cur_monthly_cost, 1.0)) * 100))
+
+    # 4. Price Option 2 (0-Baseline Pure Autoscale OR Return to On-Demand $6.25/TiB)
+    step_opt2 = _f((profile or {}).get("autoscale_slot_hours"))
+    pure_autoscale_hours = max(raw_slot_hours_30d * _AUTOSCALE_OVERHEAD, step_opt2)
+    pure_autoscale_cost = round(pure_autoscale_hours * payg_rate, 2)
+    od_equiv_cost = round(bytes_tib_30d * on_demand_rate, 2)
+
+    if (jobs_window > 0 and bytes_tib_30d > 0
+            and od_equiv_cost < pure_autoscale_cost
+            and od_equiv_cost < cur_monthly_cost):
+        option_2_mode = "ON_DEMAND"
+        opt2_cost = od_equiv_cost
+        opt2_label = f"Option 2 · Return to On-Demand ({_rate_txt(on_demand_rate)}/TiB)"
+    else:
+        option_2_mode = "PURE_AUTOSCALE"
+        opt2_cost = pure_autoscale_cost
+        opt2_label = f"Option 2 · 0-Baseline Pure Autoscale (0 → {rec_max})"
+
+    opt2_savings = round(max(cur_monthly_cost - opt2_cost, 0.0), 2)
+    opt2_pct = int(round((opt2_savings / max(cur_monthly_cost, 1.0)) * 100))
+    opt1_label = f"Option 1 · {rec_baseline} Baseline + Autoscale to {rec_max}"
+
+    # Suppress noise when current reservation is already within $10/mo of optimal
+    if max(opt1_savings, opt2_savings) < 10.0:
+        return None
+
+    recommended = 1 if opt1_savings >= opt2_savings else 2
+    gross = opt1_savings if recommended == 1 else opt2_savings
+    opt_cost = opt1_cost if recommended == 1 else opt2_cost
+    cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
+    estimator_url = _slot_estimator_url(admin_proj, region, edition=edition)
+
+    p50_slots = _f((profile or {}).get("p50_all"))
+    if jobs_window <= 0:
+        diagnosis_kind = "IDLE_RESERVATION"
+        cost_driver = (
+            f"0 queries ran on reservation '{res_name}' over {obs_days}d while "
+            f"{cur_baseline} baseline slots remain provisioned 24/7"
+        )
+    elif recommended == 2 and option_2_mode == "ON_DEMAND":
+        diagnosis_kind = "BETTER_ON_DEMAND"
+        cost_driver = (
+            f"Light scan volume ({bytes_tib_30d:,.1f} TiB/mo across {jobs_30d:,} jobs/mo) costs less on "
+            f"On-Demand ({odr}/TiB = ${od_equiv_cost:,.2f}/mo) than reservation capacity (${cur_monthly_cost:,.2f}/mo)"
+        )
+    elif rec_baseline < cur_baseline:
+        diagnosis_kind = "OVERPROVISIONED_BASELINE"
+        cost_driver = (
+            f"Provisioned {cur_baseline} baseline slots 24/7 exceed steady median demand "
+            f"({p50_slots:,.0f} slots); shifting peaks to autoscaling cuts idle slot spend"
+        )
+    elif rec_baseline > cur_baseline:
+        diagnosis_kind = "UNDERPROVISIONED_BASELINE_HEAVY_AUTOSCALE"
+        cost_driver = (
+            f"Steady slot demand ({p50_slots:,.0f} median slots) is overflowing {cur_baseline} baseline slots "
+            f"into expensive PAYG autoscaling (~{cur_burst_hours:,.0f} burst slot-h/mo)"
+        )
+    elif uncovered_baseline > 0 and edition != "STANDARD":
+        diagnosis_kind = "UNCOVERED_BASELINE_PAYG"
+        cost_driver = (
+            f"{uncovered_baseline} of {cur_baseline} baseline slots lack active capacity commitment "
+            f"coverage and bill 24/7 at PAYG ({pr_}/slot-hr vs {cr}/slot-hr 1-Yr Commit)"
+        )
+    else:
+        diagnosis_kind = "AUTOSCALE_CAP_RIGHTSIZING"
+        cost_driver = (
+            f"Right-sizing reservation '{res_name}' from {obs_days}d slot telemetry "
+            f"({cur_baseline}+{cur_autoscale_add} → {rec_baseline}+{rec_autoscale_add} slots)"
+        )
+
+    risk_notes = ["CROSS_WORKLOAD_FINANCIAL_CHANGE", "REQUIRES_TWO_PERSON_APPROVAL"]
+    if uncovered_baseline > 0 and edition != "STANDARD":
+        risk_notes.append("UNCOVERED_BASELINE_PAYG_SLOTS")
+    if comm_slots and rec_baseline < covered_baseline and edition != "STANDARD":
+        risk_notes.append("COMMITTED_SLOTS_CONTINUE_UNTIL_EXPIRY")
+    if rec_baseline > covered_baseline and edition != "STANDARD":
+        risk_notes.append("CUD_PURCHASE_MANUAL_IN_CONSOLE")
+    if not profile and jobs_window > 0:
+        risk_notes.append("AUTOSCALE_COST_NOT_CHECKED_AGAINST_JOBS_TIMELINE")
+
+    cud_rate_lbl = "PAYG (Standard has no CUDs)" if edition == "STANDARD" else "1-Yr Commit target rate"
+    ddl_opt1 = (
+        f"-- OPTION 1 (Right-Size {edition} Reservation '{res_name}')\n"
+        f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
+        f"--   Proposed: {rec_baseline} Baseline ({cr}/slot-hr {cud_rate_lbl}) + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
+        f"--   Estimated Bill Optimization: ${opt1_savings:,.2f}/mo ({opt1_pct}% improvement)\n"
+        + (
+            "--   Note: 1-Yr/3-Yr capacity commitments carry a lock-in period and are never purchased automatically;\n"
+            "--   verify commitment coverage in the GCP Console Slot Estimator before buying or renewing CUDs.\n"
+            if edition != "STANDARD" else ""
+        )
+        + f"ALTER RESERVATION `{res_fq}`\n"
+          f"SET OPTIONS (\n"
+          f"  slot_capacity = {rec_baseline},\n"
+          f"  autoscale_max_slots = {rec_autoscale_add}  -- burst on top of baseline -> {rec_max} max\n"
+          f");"
+    )
+
+    assignment_ids = [str(x) for x in (meta.get("assignment_ids") or []) if x]
+    if option_2_mode == "ON_DEMAND":
+        if assignment_ids:
+            drop_lines = "".join(
+                f"DROP ASSIGNMENT IF EXISTS `{res_fq}.{aid}`;\n"
+                for aid in assignment_ids
+                if re.match(r"^[A-Za-z0-9_-]{1,1024}$", aid)
+            )
+        else:
+            drop_lines = f"-- Executor enumerates and drops active QUERY assignments on `{res_fq}` before zeroing slots\n"
+        ddl_opt2 = (
+            f"-- OPTION 2 (Return Assigned Workloads to On-Demand Billing — {odr}/TiB)\n"
+            f"--   Current Reservation Spend: ${cur_monthly_cost:,.2f}/mo vs Projected On-Demand: ${opt2_cost:,.2f}/mo ({bytes_tib_30d:,.1f} TiB/mo)\n"
+            f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · $0 idle slot cost)\n"
+            f"{drop_lines}"
+            f"ALTER RESERVATION `{res_fq}`\n"
+            f"SET OPTIONS (\n"
+            f"  slot_capacity = 0,\n"
+            f"  autoscale_max_slots = 0\n"
+            f");"
+        )
+        opt2_state_desc = (
+            f"Unassign QUERY workloads → On-Demand ({bytes_tib_30d:,.1f} TiB/mo @ {odr}/TiB) + "
+            f"zero '{res_name}' capacity = ${opt2_cost:,.2f} / month"
+        )
+        opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · pay per TiB scanned, $0 idle slots)"
+    else:
+        ddl_opt2 = (
+            f"-- OPTION 2 (0-Baseline Pure Autoscaling on '{res_name}' — $0 Idle Cost)\n"
+            f"--   Baseline: 0 Slots ($0.00/mo fixed when idle) + Autoscale 0 -> {rec_max} Slots (~{pure_autoscale_hours:,.0f} billed slot-h @ {pr_}/slot-hr)\n"
+            f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · no commitment lock-in)\n"
+            f"ALTER RESERVATION `{res_fq}`\n"
+            f"SET OPTIONS (\n"
+            f"  slot_capacity = 0,\n"
+            f"  autoscale_max_slots = {rec_max}\n"
+            f");"
+        )
+        opt2_state_desc = (
+            f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month"
+        )
+        opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)"
+
+    formula = (
+        f"current {edition} reservation '{res_name}' ({cur_baseline} baseline + {cur_autoscale_add} autoscale) = "
+        f"${cur_monthly_cost:,.2f}/mo; Option {recommended} = ${opt_cost:,.2f}/mo; "
+        f"optimizing bill by ${gross:,.2f}/mo"
+    )
+    math = _savings_math(
+        "RESERVATION_CAPACITY_RIGHTSIZING", formula,
+        billing_mix=f"100% reservation ({edition})", cost_source="BILLING_AWARE",
+        current_reservation_monthly_usd=cur_monthly_cost,
+        on_demand_equivalent_monthly_usd=od_equiv_cost,
+        pure_autoscale_monthly_usd=pure_autoscale_cost,
+        recommended_option=recommended,
+        option_2_mode=option_2_mode,
+        sizing_window_days=obs_days,
+        covered_baseline_slots=covered_baseline,
+        uncovered_baseline_slots=uncovered_baseline,
+        committed_slots_edition=comm_slots,
+        pool_key=f"reservation:{admin_proj}:{region}:{res_name}",
+        pool_spend_usd=cur_monthly_cost,
+    )
+
+    win_desc = f"{obs_days}d history normalized to 30d" if obs_days != 30 else "30d"
+    current_state = {
+        "reservation": f"{res_fq} ({edition})",
+        "provisioned_capacity": f"{cur_baseline} Baseline Slots + {cur_autoscale_add} Autoscale Slots ({cur_max} max)",
+        "observed_demand": (
+            f"{raw_slot_hours_30d:,.1f} slot-h/mo · {bytes_tib_30d:,.1f} TiB/mo across {jobs_30d:,} jobs/mo ({win_desc})"
+        ),
+        "current_monthly_bill": f"${cur_monthly_cost:,.2f} / month (baseline ${cur_baseline_cost:,.0f} + burst ${cur_autoscale_cost:,.0f})",
+        "cost_driver": cost_driver,
+    }
+    if comm_slots is not None and edition != "STANDARD":
+        current_state["commitment_coverage"] = (
+            f"{covered_baseline} covered / {uncovered_baseline} uncovered baseline slots "
+            f"(active {edition} commitments in {region}: {comm_slots} slots)"
+        )
+
+    savings_basis = "BYTES_ON_DEMAND" if (recommended == 2 and option_2_mode == "ON_DEMAND") else "SLOT_EDITIONS"
+    opt2_short = (
+        f"Return to On-Demand (${opt2_cost:,.0f}/mo)"
+        if option_2_mode == "ON_DEMAND"
+        else f"0-Baseline Pure Autoscale to {rec_max} (${opt2_cost:,.0f}/mo)"
+    )
+
+    return {
+        "rule_id": "W-03",
+        "apply_class": 3,
+        "source": "CUSTOM_RULE",
+        "savings_basis": savings_basis,
+        "target_project": admin_proj,
+        "target_dataset": "RESERVATION_CAPACITY",
+        "target_table": res_name,
+        "target_region": region,
+        "finding_summary": (
+            f"Reservation '{res_name}' ({edition}, {cur_baseline} baseline + {cur_autoscale_add} autoscale = "
+            f"${cur_monthly_cost:,.0f}/mo) can be right-sized from {win_desc}: "
+            f"Option 1: {rec_baseline} Baseline + Autoscale to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
+            f"OR Option 2: {opt2_short} (→ est. ${opt2_savings:,.0f}/mo efficiency gain). "
+            f"Recommended: Option {recommended}."
+        ),
+        "evidence": {
+            "reservation_name": res_name,
+            "reservation_fq": res_fq,
+            "edition": edition,
+            "diagnosis_kind": diagnosis_kind,
+            "current_baseline_slots": cur_baseline,
+            "current_autoscale_add_slots": cur_autoscale_add,
+            "current_max_slots": cur_max,
+            "covered_baseline_slots": covered_baseline,
+            "uncovered_baseline_slots": uncovered_baseline,
+            "committed_slots_edition": comm_slots,
+            "query_assignments": int(_f(meta.get("query_assignments"), 0.0)),
+            "assignees": list(meta.get("assignees") or []),
+            "projects_using": list(meta.get("projects") or []),
+            "bytes_scanned_tib_30d": round(bytes_tib_30d, 1),
+            "slot_hours_30d": round(raw_slot_hours_30d, 1),
+            "current_reservation_spend_monthly": cur_monthly_cost,
+            "on_demand_spend_monthly": cur_monthly_cost,  # CardDetail baseline-spend fallback compatibility
+            "on_demand_equivalent_monthly_usd": od_equiv_cost,
+            "estimated_editions_spend_monthly": opt_cost,
+            "option_1_monthly_cost_usd": opt1_cost,
+            "option_1_savings_usd": opt1_savings,
+            "option_1_label": opt1_label,
+            "option_2_monthly_cost_usd": opt2_cost,
+            "option_2_savings_usd": opt2_savings,
+            "option_2_label": opt2_label,
+            "option_2_mode": option_2_mode,
+            "recommended_option": recommended,
+            "sizing_window_days": obs_days,
+            "slot_estimator_url": estimator_url,
+            "capacity_sizing": {
+                "source": sizing_source,
+                "sizing_window_days": profile_days,
+                "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
+                           "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
+                "current_baseline_slots": cur_baseline,
+                "current_max_slots": cur_max,
+                "p50_slots_all_minutes": round((profile or {}).get("p50_all", 0.0), 1),
+                "p95_slots_all_minutes": round((profile or {}).get("p95_all", 0.0), 1),
+                "p99_slots_busy_minutes": round((profile or {}).get("p99_busy", 0.0), 1),
+                "peak_slots_1min": round((profile or {}).get("peak", 0.0), 1),
+                "busy_minutes_pct": round(100.0 * (profile or {}).get("busy_minutes", 0.0)
+                                          / max((profile or {}).get("total_minutes", 1.0), 1.0), 2),
+                "measured_slot_hours_30d": round((profile or {}).get("slot_hours", raw_slot_hours_30d), 1),
+                "autoscale_billed_slot_hours_30d": round((profile or {}).get("autoscale_slot_hours", pure_autoscale_hours), 1),
+                "recommended_baseline_slots": rec_baseline,
+                "recommended_max_slots": rec_max,
+            },
+            "recommended_pricing_model": (
+                f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"
+            ),
+            "current_state": current_state,
+            "proposed_state": {
+                "option_1_rightsized": (
+                    f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
+                    f"{rec_autoscale_add} Autoscaling Slots (${opt1_autoscale_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
+                ),
+                "option_1_net_savings": (
+                    f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain"
+                    + (" · note active CUD lock-in until expiry)" if (comm_slots and rec_baseline < covered_baseline and edition != "STANDARD")
+                       else (" · Standard PAYG)" if edition == "STANDARD" else " · 1-Yr Commit target rate; note CUD lock-in)"))
+                ),
+                "option_2_alternative": opt2_state_desc,
+                "option_2_net_savings": opt2_savings_desc,
+            },
+            "savings_math": math,
+        },
+        "observation_days": obs_days,
+        "proposed_change": {
+            "action": "RESIZE_RESERVATION",
+            "reservation_name": res_name,
+            "edition": edition,
+            "current_baseline_slots": cur_baseline,
+            "current_autoscale_max_slots": cur_autoscale_add,
+            "recommended_baseline_slots": rec_baseline,
+            "recommended_autoscale_max_slots": rec_max,
+            "option_2_mode": option_2_mode,
+            "selected_option": recommended,
+            "generated_ddl": ddl_opt1,
+            "generated_ddl_option2": ddl_opt2,
+        },
+        "gross_monthly_savings_usd": gross,
+        "risk_notes": risk_notes,
+        "confidence_hint": 0.85 if profile else 0.7,
     }
 
 
@@ -2814,6 +3634,7 @@ RULES: list[tuple[Callable[[Config], str], Callable[[dict, dict, Config], Findin
     (_sql_time_travel, _map_time_travel),
     (_sql_adaptive_opts, _map_adaptive_opts),
     (_sql_editions_fit, _map_editions_fit),
+    (_sql_reservation_rightsizing, _map_reservation_rightsizing),
     (_sql_human_runaway_guardrail, _map_human_runaway_guardrail),
     (_sql_mv_rollup, _map_mv_rollup),
     (_sql_zombie_dts, _map_zombie_dts),

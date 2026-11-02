@@ -175,10 +175,11 @@ In customer production environments, `scripts/install.sh` automatically deploys 
 ## 6. Step 3: Run the Rules Engine & Honest Scoring
 
 ### What is Happening?
-The Rules Engine analyzes the query telemetry against 10+ optimization patterns:
+The Rules Engine analyzes the query telemetry against 15+ optimization patterns:
 1. **`C1-01` (Table Clustering)**: Detects frequent filtering on `loyalty_tier, persona` on `dim_customer`.
-2. **`C4-01` (Projection Minimization)**: Detects expensive queries doing `SELECT *` across 80 columns of `dim_customer`.
-3. **`C4-03` (SArgable Predicates)**: Flags queries using `WHERE DATE(customer_since_date) = ...` that prevent partition pruning.
+2. **`W-01` & `W-03` (180-Day Slot & Billing-Model Right-Sizing)**: Sizes `slot_capacity` (baseline) and `autoscale_max_slots` from up to **180 days** (`pricing.capacity_sizing_days`) of `INFORMATION_SCHEMA` slot usage — both for **On-Demand → BigQuery Editions** (`W-01`) and for **existing BigQuery Reservations** (`W-03`, catching over-provisioned baselines, heavy PAYG autoscale, uncovered baseline PAYG slots, and tiny reservations better suited for On-Demand).
+3. **`C4-01` (Projection Minimization)**: Detects expensive queries doing `SELECT *` across 80 columns of `dim_customer`.
+4. **`C4-03` (SArgable Predicates)**: Flags queries using `WHERE DATE(customer_since_date) = ...` that prevent partition pruning.
 
 ### The Honest Scoring Formula:
 The engine enforces the **Subquery-Summation Cap**:

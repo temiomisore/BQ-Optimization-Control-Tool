@@ -202,6 +202,23 @@ export interface Dashboard {
     tib: number; od: number; o1: number; o2: number;
     o1_pct: number; o2_pct: number; baseline: number; max: number;
     recommended_option?: number | null; billing_aware?: boolean;
+    sizing_window_days?: number; slot_estimator_url?: string | null;
+  };
+  w03?: null | {
+    count: number;
+    reservation_name: string;
+    edition: string;
+    cur_cost: number;
+    o1: number;
+    o2: number;
+    cur_baseline: number;
+    cur_max: number;
+    rec_baseline: number;
+    rec_max: number;
+    option_2_mode: string;
+    recommended_option?: number | null;
+    sizing_window_days?: number;
+    slot_estimator_url?: string | null;
   };
   directors: string[];
   projects: string[];

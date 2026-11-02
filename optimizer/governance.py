@@ -30,11 +30,12 @@ from typing import Any, Iterable, Mapping
 FINOPS = "FINOPS"
 ENGINEERING = "ENGINEERING"
 
-# W-01 reservations/commitments, C1-07 legacy id for W-01, C1-05 dataset storage
-# billing model, W-02 project-wide guardrail + reservation, C1-06 ALTER PROJECT.
-DEFAULT_FINOPS_RULE_IDS = ("W-01", "C1-07", "C1-05", "W-02", "C1-06")
-FINOPS_TARGET_DATASETS = ("PROJECT_WIDE_BILLING", "HUMAN_ADHOC_GOVERNANCE")
-FINOPS_ACTIONS = ("CAPACITY_PRICING_MIGRATION", "SET_STORAGE_BILLING_MODEL",
+# W-01 reservations/commitments, W-03 existing reservation right-sizing, C1-07
+# legacy id for W-01, C1-05 dataset storage billing model, W-02 project-wide
+# guardrail + reservation, C1-06 ALTER PROJECT.
+DEFAULT_FINOPS_RULE_IDS = ("W-01", "W-03", "C1-07", "C1-05", "W-02", "C1-06")
+FINOPS_TARGET_DATASETS = ("PROJECT_WIDE_BILLING", "RESERVATION_CAPACITY", "HUMAN_ADHOC_GOVERNANCE")
+FINOPS_ACTIONS = ("CAPACITY_PRICING_MIGRATION", "RESIZE_RESERVATION", "SET_STORAGE_BILLING_MODEL",
                   "APPLY_HUMAN_COST_GUARDRAIL", "ENABLE_ADAPTIVE_OPTIMIZATION")
 
 # Identity sources, strongest first.

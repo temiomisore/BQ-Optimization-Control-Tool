@@ -96,6 +96,18 @@ def edition_slot_rate(prices: Mapping | None, edition: str | None) -> float:
     return rate(prices, "slot_hour_usd_enterprise")
 
 
+def edition_commit_rate(prices: Mapping | None, edition: str | None) -> float:
+    """1-Year committed baseline slot-hour rate for an edition.
+    STANDARD edition does NOT offer 1-yr / 3-yr commitments (always billed at PAYG $0.04)."""
+    e = (edition or "ENTERPRISE").upper().replace("-", "_").replace(" ", "_")
+    if e == "STANDARD":
+        return rate(prices, "slot_hour_usd_standard")
+    if e == "ENTERPRISE_PLUS":
+        payg_ep = rate(prices, "slot_hour_usd_enterprise_plus")
+        return rate(prices, "slot_hour_usd_enterprise_plus_1yr", default=round(payg_ep * 0.8, 4))
+    return rate(prices, "slot_hour_usd_enterprise_1yr")
+
+
 def realization(c: Any) -> float:
     """Share of a slot-time reduction that becomes cash (config
     pricing.reservation_savings_realization, 0..1, default 1.0).
@@ -280,7 +292,7 @@ def spend_kind(item: Mapping) -> str | None:
         key = str(sm.get("pool_key") or "")
         if key.startswith("storage:"):
             return STORAGE
-        if key.startswith(("table:", "query:", "billing:")):
+        if key.startswith(("table:", "query:", "billing:", "reservation:")):
             return COMPUTE
     rules = item.get("rule_ids")
     if rules is None:
@@ -363,7 +375,7 @@ def deoverlap_total(items: Iterable[Mapping], value_key: str = "net_monthly_valu
         if len(p["values"]) > 1:
             overlapping += len(p["values"])
         combined = combine_savings(p["values"], p["spend"])
-        if key.startswith("billing:"):
+        if key.startswith(("billing:", "reservation:")):
             billing.append({"project": p["project"] or key.split(":", 1)[1],
                             "savings": combined, "spend": p["spend"]})
             continue

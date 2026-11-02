@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
-  AlertTriangle, Calculator, CheckCircle2, ChevronRight, GitPullRequest, History, Landmark, ShieldCheck, Users, X, XCircle,
+  AlertTriangle, Calculator, CheckCircle2, ChevronRight, ExternalLink, GitPullRequest, History, Landmark, ShieldCheck, Users, X, XCircle,
 } from "lucide-react";
 import type { ChangeSet, Dashboard, SavingsMath } from "@/lib/api";
 import { useDecide } from "@/lib/store";
 import {
-  CLASS_META, cn, ddlFor, fmtDate, fullPath, isW01, isW02, needsTwo, targetLabel, titleize, usd,
+  CLASS_META, cn, ddlFor, fmtDate, fullPath, isW01, isW02, isW03, needsTwo, safeConsoleUrl, targetLabel, titleize, usd,
 } from "@/lib/utils";
 import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
@@ -92,8 +92,11 @@ export function CardDetail({
   const decide = useDecide();
   const w01 = isW01(c);
   const w02 = isW02(c);
+  const w03 = isW03(c);
+  const wCap = w01 || w03;
   const ev = c.evidence || {};
   const pr = c.proposed || {};
+  const estimatorUrl = safeConsoleUrl(ev.slot_estimator_url);
   const [opt, setOpt] = useState<number>(Number(pr.selected_option) || 1);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [reason, setReason] = useState(data.reasons[0] || "OTHER");
@@ -105,7 +108,7 @@ export function CardDetail({
 
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const hasOpt2 = !!pr.generated_ddl_option2;
-  const headline = w01
+  const headline = wCap
     ? num(opt === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd) || num(c.net_monthly_value_usd)
     : num(c.net_monthly_value_usd);
   const ddl = hasOpt2 && opt === 2 ? pr.generated_ddl_option2 : ddlFor(c);
@@ -121,18 +124,37 @@ export function CardDetail({
       : "Approve Change";
   const optLabels = w02
     ? ["Option 1: 50-Slot Human Sandbox + 50 GB Cap", "Option 2: Audit SQL"]
-    : ["Option 1: Baseline + Autoscale", "Option 2: 0-Baseline Autoscale"];
+    : [
+        String(ev.option_1_label || "Option 1: Baseline + Autoscale"),
+        String(ev.option_2_label || "Option 2: 0-Baseline Autoscale"),
+      ];
 
   const bullets = useMemo(() => {
     if (w01) {
       const base = pr.recommended_baseline_slots ?? data.w01?.baseline;
       const max = pr.recommended_autoscale_max_slots ?? data.w01?.max;
       const src = ev.capacity_sizing?.source || ev.capacity_sizing?.method;
+      const winDays = Number(ev.sizing_window_days || 30);
       return [
-        `On-demand today: ${usd(ev.on_demand_spend_monthly)}/mo for ${num(ev.bytes_scanned_tib_30d).toLocaleString()} TiB scanned (30d).`,
-        `Option 1 (1-yr commit): ${usd(ev.option_1_monthly_cost_usd)}/mo → saves ${usd(ev.option_1_savings_usd)}/mo.`,
-        `Option 2 (0-baseline autoscale): ${usd(ev.option_2_monthly_cost_usd)}/mo → saves ${usd(ev.option_2_savings_usd)}/mo.`,
-        `Sized from real slot telemetry: baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`,
+        `On-demand today: ${usd(ev.on_demand_spend_monthly)}/mo for ${num(ev.bytes_scanned_tib_30d).toLocaleString()} TiB/mo (${winDays}d history).`,
+        `Option 1 (1-yr commit target): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
+        `Option 2 (0-baseline autoscale): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
+        `Sized from historical slot telemetry: baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`,
+      ];
+    }
+    if (w03) {
+      const curBase = ev.current_baseline_slots ?? pr.current_baseline_slots ?? 0;
+      const curAuto = ev.current_autoscale_add_slots ?? pr.current_autoscale_max_slots ?? 0;
+      const recBase = pr.recommended_baseline_slots ?? 0;
+      const recMax = pr.recommended_autoscale_max_slots ?? 0;
+      const src = ev.capacity_sizing?.source;
+      const winDays = Number(ev.sizing_window_days || 30);
+      const opt2Mode = ev.option_2_mode === "ON_DEMAND" ? "Return to On-Demand ($6.25/TiB)" : `0-baseline autoscale (0 → ${recMax})`;
+      return [
+        `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${usd(ev.current_reservation_spend_monthly)}/mo).`,
+        `Option 1 (${recBase} baseline → ${recMax} max): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
+        `Option 2 (${opt2Mode}): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
+        `Sized from ${winDays}d historical slot telemetry${src ? ` (${src})` : ""}.`,
       ];
     }
     if (w02) {
@@ -148,13 +170,13 @@ export function CardDetail({
     if (ev.gemini_ai_diagnosis) out.push(`Gemini diagnosis: ${ev.gemini_ai_diagnosis}`);
     if (ev.dry_run_verification) out.push(`Dry run: ${ev.dry_run_verification}`);
     return out;
-  }, [c, w01, w02, ev, pr, data.w01]);
+  }, [c, w01, w02, w03, ev, pr, data.w01]);
 
   const approve = () =>
     decide.mutate({
       change_set_id: c.change_set_id,
       action: "approve",
-      ...(w01 || hasOpt2 ? { selected_option: opt } : {}),
+      ...(wCap || hasOpt2 ? { selected_option: opt } : {}),
     });
   const reject = () =>
     decide.mutate(
@@ -206,7 +228,7 @@ export function CardDetail({
               <AnimatedNumber value={headline} format={(n) => usd(n)} />
             </div>
             <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-              net / month{w01 ? ` · option ${opt}` : ""}
+              net / month{wCap ? ` · option ${opt}` : ""}
             </div>
           </div>
         </div>
@@ -214,25 +236,38 @@ export function CardDetail({
 
       {/* body */}
       <div className="flex-1 space-y-6 overflow-y-auto p-5">
-        {(w01 || hasOpt2) && (
-          <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-[#0c0c0f]">
-            {[1, 2].map((o) => (
-              <button
-                key={o}
-                onClick={() => setOpt(o)}
-                className={cn(
-                  "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
-                  opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
-                )}
+        {(wCap || hasOpt2) && (
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-[#0c0c0f]">
+              {[1, 2].map((o) => (
+                <button
+                  key={o}
+                  onClick={() => setOpt(o)}
+                  className={cn(
+                    "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
+                    opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
+                  )}
+                >
+                  {optLabels[o - 1]}
+                  {wCap && (
+                    <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
+                      est. {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+            {estimatorUrl && (
+              <a
+                href={estimatorUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/30 bg-sky-500/5 px-2.5 py-1 text-[11px] font-medium text-sky-600 hover:bg-sky-500/10 dark:text-sky-300"
               >
-                {optLabels[o - 1]}
-                {w01 && (
-                  <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
-                    saves {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo
-                  </div>
-                )}
-              </button>
-            ))}
+                <ExternalLink className="h-3 w-3" />
+                Verify slot simulation &amp; CUD commitments in GCP Slot Estimator
+              </a>
+            )}
           </div>
         )}
 

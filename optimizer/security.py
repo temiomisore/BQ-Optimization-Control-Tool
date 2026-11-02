@@ -632,6 +632,10 @@ _DDL_PATTERNS: dict[str, re.Pattern[str]] = {
         r"^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:`[^`]+`|[A-Za-z0-9_.\-:]+)\s+",
         re.IGNORECASE,
     ),
+    "ALTER_RESERVATION": re.compile(
+        r"^ALTER\s+RESERVATION\s+(?:`[^`]+`|[A-Za-z0-9_.\-:]+)\s+SET\s+OPTIONS\s*\(",
+        re.IGNORECASE,
+    ),
     "CREATE_MATERIALIZED_VIEW": re.compile(
         r"^CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
         r"(?:`[^`]+`|[A-Za-z0-9_.\-:]+)\b",

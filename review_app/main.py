@@ -393,6 +393,7 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             'PR_HANDED_OFF', 'VERIFYING', 'VERIFIED', 'ROLLING_BACK'
         )
            OR 'W-01' IN UNNEST(rule_ids)
+           OR 'W-03' IN UNNEST(rule_ids)
     """
     dir_sql = f"""
         SELECT change_set_id, director_name, department,
@@ -459,12 +460,15 @@ def _fetch_dashboard_data_uncached(c) -> dict:
     handoff_cards = []
     receipt_candidates = []
     w01_candidates = []
+    w03_candidates = []
 
     for r in raw_rows:
         st = r.get("state")
         r_ids = r.get("rule_ids") or []
         if "W-01" in r_ids:
             w01_candidates.append(r)
+        if "W-03" in r_ids:
+            w03_candidates.append(r)
         if st in ("VERIFYING", "VERIFIED", "REGRESSED", "ROLLING_BACK", "ROLLED_BACK"):
             receipt_candidates.append(r)
 
@@ -597,10 +601,43 @@ def _fetch_dashboard_data_uncached(c) -> dict:
             "max": int(pr.get("recommended_autoscale_max_slots") or 0),
             "recommended_option": ev.get("recommended_option") or pr.get("selected_option"),
             "billing_aware": isinstance(ev.get("savings_math"), dict),
+            "sizing_window_days": int(ev.get("sizing_window_days") or 30),
+            "slot_estimator_url": ev.get("slot_estimator_url"),
+        }
+
+    w03 = None
+    w03_live = [r for r in w03_candidates if r.get("state") not in ("SUPERSEDED", "EXPIRED")]
+    if w03_live:
+        w03_live.sort(
+            key=lambda x: (float(x.get("net_monthly_value_usd") or 0.0), str(x.get("created_at") or "")),
+            reverse=True,
+        )
+        top_w3 = w03_live[0]
+        ev3 = bq.loads(top_w3.get("evidence_json")) or {}
+        pr3 = bq.loads(top_w3.get("proposed_change_json")) or {}
+        cur_c = float(ev3.get("current_reservation_spend_monthly") or ev3.get("on_demand_spend_monthly") or 0.0)
+        o1_3 = float(ev3.get("option_1_monthly_cost_usd") or 0.0)
+        o2_3 = float(ev3.get("option_2_monthly_cost_usd") or 0.0)
+        w03 = {
+            "count": len(w03_live),
+            "reservation_name": str(ev3.get("reservation_name") or top_w3.get("target_table") or ""),
+            "edition": str(ev3.get("edition") or pr3.get("edition") or "ENTERPRISE"),
+            "cur_cost": cur_c,
+            "o1": o1_3,
+            "o2": o2_3,
+            "cur_baseline": int(ev3.get("current_baseline_slots") or pr3.get("current_baseline_slots") or 0),
+            "cur_max": int(ev3.get("current_max_slots") or 0),
+            "rec_baseline": int(pr3.get("recommended_baseline_slots") or 0),
+            "rec_max": int(pr3.get("recommended_autoscale_max_slots") or 0),
+            "option_2_mode": str(ev3.get("option_2_mode") or pr3.get("option_2_mode") or "PURE_AUTOSCALE"),
+            "recommended_option": ev3.get("recommended_option") or pr3.get("selected_option") or 1,
+            "sizing_window_days": int(ev3.get("sizing_window_days") or 30),
+            "slot_estimator_url": ev3.get("slot_estimator_url"),
         }
 
     data = dict(
         w01=w01,
+        w03=w03,
         cards=cards,
         blocked_cards=blocked_cards,
         regressed_cards=regressed_cards,
@@ -754,6 +791,7 @@ def _scope_for_viewer(c, data: dict, ident: dict) -> dict:
                         ho[sql_k] = security.scrub_sql_pii(ho[sql_k])
     if not is_finops:
         data["w01"] = None
+        data["w03"] = None
         if isinstance(data.get("regions"), dict):
             reg_scope = str(data["regions"].get("scope") or "")
             if reg_scope.startswith("organizations/"):
@@ -1340,13 +1378,20 @@ _COPILOT_REFERENCE = {
         "3. **🤖 Service Accounts 100% Exempt**: All `*.iam.gserviceaccount.com` ETL pipelines run **uncapped** on your dedicated production reservation (`enterprise-prod-pool`), guaranteeing **0% pipeline breakage**."
     ),
     "W-01": (
-        "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison:**\n\n"
-        "• Compares the project's On-Demand spend ($6.25/TiB scanned) with two Enterprise reservation options.\n"
-        "• **Sizing comes from real per-minute slot usage** in `INFORMATION_SCHEMA.JOBS_TIMELINE` (30 days): "
+        "🏢 **Rule `W-01` BigQuery Enterprise Edition Sizing Comparison (On-Demand → Slots):**\n\n"
+        "• Compares a project's On-Demand spend ($6.25/TiB scanned) per region against two Enterprise reservation options.\n"
+        "• **Sizing comes from real per-minute slot usage** in `INFORMATION_SCHEMA.JOBS_TIMELINE` across up to **180 days** (`pricing.capacity_sizing_days`, normalized to 30d): "
         "baseline = median slots across ALL minutes (idle = 0) rounded down to 50; max = p99 busy-minute slots rounded up to 50.\n"
         "• **🏢 Option 1**: baseline slots (always billed) + autoscale up to the max. Best for steady 24/7 load.\n"
-        "• **⚡ Option 2**: 0 baseline + autoscale up to the max — $0 idle cost, no commitment. Best for spiky workloads.\n"
-        "• Use the live card's evidence (`capacity_sizing`, `option_1/2_monthly_cost_usd`, `option_1/2_savings_usd`) for exact numbers."
+        "• **⚡ Option 2**: 0 baseline + autoscale up to the max — $0 idle cost, no commitment lock-in. Best for spiky workloads.\n"
+        "• Includes a direct **GCP Console Slot Estimator** link for manual CUD commitment verification."
+    ),
+    "W-03": (
+        "⚖️ **Rule `W-03` Existing Reservation Right-Sizing & Slot-vs-On-Demand Fit:**\n\n"
+        "• Audits every active BigQuery reservation (`STANDARD`, `ENTERPRISE`, `ENTERPRISE_PLUS`) using up to **180 days** of `JOBS_TIMELINE` / `jobs_hourly_slots` telemetry plus `CAPACITY_COMMITMENTS` coverage.\n"
+        "• Catches over-provisioned idle baselines, under-provisioned baselines spilling into expensive PAYG autoscale, uncovered baseline PAYG slots, and tiny reservations that cost less on `$6.25/TiB` On-Demand.\n"
+        "• **🏢 Option 1 (`ALTER RESERVATION`)**: right-sizes `slot_capacity` + `autoscale_max_slots`.\n"
+        "• **⚡ Option 2**: switches to `0`-Baseline Pure Autoscale OR returns assigned `QUERY` workloads to On-Demand when `$6.25/TiB` is more cost-efficient."
     ),
     "CLASS4_ENGINES": (
         "⚡ **How Our Tri-Engine Class 4 SQL Anti-Pattern Pipeline Works:**\n\n"
@@ -1358,8 +1403,8 @@ _COPILOT_REFERENCE = {
         "Apply classes: Class 1 = in-place metadata DDL (clustering, require_partition_filter, expirations, "
         "storage billing model, W-02 guardrail); Class 2 = additive objects (materialized views with max_staleness "
         "+ cost watchdog); Class 3 = structural rebuilds via the S0-S9 copy-swap-rebind state machine "
-        "(repartitioning, shard consolidation, archive) and W-01 reservation sizing; Class 4 = SQL anti-pattern "
-        "rewrites delivered as CI pull requests (route CI_PULL_REQUEST), never applied directly to BigQuery."
+        "(repartitioning, shard consolidation, archive) plus W-01 On-Demand->Editions sizing and W-03 existing reservation right-sizing; "
+        "Class 4 = SQL anti-pattern rewrites delivered as CI pull requests (route CI_PULL_REQUEST), never applied directly to BigQuery."
     ),
 }
 
@@ -1446,6 +1491,8 @@ def _copilot_offline_answer(c, cards: list[dict], q: str, ceilings: dict | None 
         return f"You have **{by_class.get(k, 0)} Class {k}** change set(s) pending review (out of {len(cards)} total)." + note
     if any(k in ql for k in ("w-02", "service account")):
         return _COPILOT_REFERENCE["W-02"] + note
+    if any(k in ql for k in ("w-03", "right-siz", "rightsiz", "existing reservation")):
+        return _COPILOT_REFERENCE["W-03"] + note
     if any(k in ql for k in ("w-01", "option 1", "option 2", "edition")):
         return _COPILOT_REFERENCE["W-01"] + note
     if "class 4" in ql and any(k in ql for k in ("engine", "zetasql", "how do", "how does", "work")):
@@ -1627,9 +1674,9 @@ def _apply_decision(c, form, ident: dict) -> dict:
             target_obj = cs.get("target_table") or cs.get("target_dataset") or "rule"
             claim_note = f"CLAIMED:projects/{c.project_id}/locations/{cs.get('target_region') or 'us'}/recommenders/optimizer.{rule_id}/recommendations/rec-{target_obj}-001"
 
-        # Capacity migrations (W-01) carry two options; persist the one the reviewer picked
+        # Capacity migrations (W-01) and reservation right-sizing (W-03) carry two options; persist the reviewer's choice
         change = bq.loads(cs.get("proposed_change_json")) or {}
-        if change.get("action") == "CAPACITY_PRICING_MIGRATION":
+        if change.get("action") in ("CAPACITY_PRICING_MIGRATION", "RESIZE_RESERVATION"):
             try:
                 opt = int(form.get("selected_option") or change.get("selected_option") or 1)
             except (TypeError, ValueError):

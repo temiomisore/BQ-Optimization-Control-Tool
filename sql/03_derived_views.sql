@@ -55,7 +55,10 @@ SELECT
 FROM parsed p
 CROSS JOIN optimizer_ops.v_config c
 WHERE p.reservation_name IS NOT NULL
-QUALIFY ROW_NUMBER() OVER (PARTITION BY p.admin_project, p.reservation_name ORDER BY p.region) = 1;
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY p.admin_project, LOWER(COALESCE(p.region, '')), p.reservation_name
+  ORDER BY p.region
+) = 1;
 
 -- -----------------------------------------------------------------------------
 -- Costed jobs. NOTE the billing-mode honesty rule: est_on_demand_usd is only a
@@ -89,6 +92,7 @@ CROSS JOIN optimizer_ops.v_config c
 LEFT JOIN optimizer_ops.v_reservation_rates rr
   ON  rr.admin_project    = LOWER(REGEXP_EXTRACT(j.reservation_id, r'^(.+):[^:]+$'))
   AND rr.reservation_name = LOWER(REGEXP_EXTRACT(j.reservation_id, r'\.([^.:]+)$'))
+  AND LOWER(COALESCE(rr.region, '')) = LOWER(COALESCE(REGEXP_EXTRACT(j.reservation_id, r':([^.:]+)\.[^.:]+$'), j.region, ''))
 WHERE j.job_type = 'QUERY'
   AND j.statement_type != 'SCRIPT';   -- parents double-count their children
 

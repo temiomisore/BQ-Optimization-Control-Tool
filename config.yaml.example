@@ -16,8 +16,8 @@ region_alert_days: 7                       # how long a newly discovered region 
 # Scope: JOBS (this project) or JOBS_BY_ORGANIZATION (needs org perms)
 jobs_view: "JOBS"
 
-# Reservation admin project (or null to skip capacity telemetry). Set it: reservation
-# jobs are priced at their reservation's edition slot rate, which is read from there.
+# Reservation admin project (optional override). Even when null, the collector auto-discovers
+# reservation admin projects from jobs_events.reservation_id so W-03 can right-size existing pools.
 reservation_admin_project: null
 
 # Enterprise Enterprise Governance & Billing Placeholders:
@@ -55,6 +55,7 @@ pricing:
   # Share of a reservation slot-time cut that becomes cash. 1.0 = autoscale slots you stop
   # paying for; lower it (e.g. 0.3) when most capacity is committed baseline that won't shrink.
   reservation_savings_realization: 1.0
+  capacity_sizing_days: 180                # W-01 & W-03 slot sizing window (up to 180d history, normalized to 30d/mo)
   w01_min_on_demand_tib_30d: 100           # W-01 only for projects scanning >= this on-demand / 30d
 
 # FinOps / governance: billing, commitment, reservation and project-level cards are visible

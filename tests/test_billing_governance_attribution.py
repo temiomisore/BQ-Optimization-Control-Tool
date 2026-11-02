@@ -523,5 +523,297 @@ class TestOwnerRouting(unittest.TestCase):
         self.assertIn("TOP_WRITER_IS_UNMAPPED_SERVICE_ACCOUNT", f["risk_notes"])
 
 
+class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
+    PRICES = dict(pricing.DEFAULT_PRICES)
+
+    def test_180d_capacity_window_default_on_real_config(self):
+        from optimizer import config as cfg_mod
+        real_cfg = cfg_mod.Config({
+            **cfg_mod._DEFAULTS,
+            "project_id": "acme-analytics-prod",
+            "ops_dataset": "optimizer_ops",
+        })
+        self.assertEqual(rules._capacity_sizing_days(real_cfg), 180)
+        sql_w01 = rules._sql_editions_fit(real_cfg)
+        self.assertIn("INTERVAL 180 DAY", sql_w01)
+        self.assertIn("30.0 / active_days", sql_w01)
+        sql_w03 = rules._sql_reservation_rightsizing(real_cfg)
+        self.assertIn("INTERVAL 180 DAY", sql_w03)
+        self.assertIn("CAPACITY_COMMITMENT", sql_w03)
+
+    def test_w01_multi_region_target_table_and_slot_estimator_link(self):
+        cfg_180 = {
+            "demo_mode": False,
+            "location": "US",
+            "pricing": {"capacity_sizing_days": 180},
+        }
+        prof = {
+            "p50_all": 120.0, "p95_all": 260.0, "p99_busy": 340.0, "peak": 400.0,
+            "busy_minutes": 100000.0, "total_minutes": 259200.0, "active_days": 180.0,
+            "slot_hours": 90000.0, "autoscale_slot_hours": 115000.0,
+            "autoscale_slot_hours_above_baseline": 28000.0,
+            "source_label": "JOBS_TIMELINE_180D",
+        }
+        row = {
+            "project_id": "acme-analytics-prod",
+            "region": "us-east4",
+            "active_days": 180.0,
+            "od_bytes_billed_30d": 2000 * TIB,
+            "od_slot_ms_30d": 90000 * 3_600_000,
+            "od_jobs_30d": 1500,
+            "resv_jobs_30d": 0,
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof) as m_prof:
+            f = rules._map_editions_fit(row, self.PRICES, cfg_180)
+        self.assertIsNotNone(f)
+        m_prof.assert_called_once_with(cfg_180, "acme-analytics-prod", "us-east4", days=180)
+        self.assertEqual(f["target_table"], "ALL_DATASETS_AND_TABLES_US_EAST4")
+        self.assertEqual(f["observation_days"], 180)
+        self.assertEqual(
+            f["evidence"]["slot_estimator_url"],
+            "https://console.cloud.google.com/bigquery/admin/reservations;region=us-east4"
+            "/slot-estimator;source=EDITION_UNSPECIFIED;resourceType=PROJECT;resource=acme-analytics-prod"
+            "?project=acme-analytics-prod",
+        )
+
+    def test_w03_overprovisioned_baseline_rightsizing_and_cud_lockin_warning(self):
+        cfg_180 = {"demo_mode": False, "location": "US", "pricing": {"capacity_sizing_days": 180}}
+        prof = {
+            "p50_all": 110.0, "p95_all": 220.0, "p99_busy": 290.0, "peak": 350.0,
+            "busy_minutes": 120000.0, "total_minutes": 259200.0, "active_days": 180.0,
+            "slot_hours": 80000.0, "autoscale_slot_hours": 105000.0,
+            "autoscale_slot_hours_above_baseline": 12000.0,
+            "current_burst_slot_hours": 0.0,
+            "source_label": "JOBS_TIMELINE_180D",
+        }
+        row = {
+            "admin_project": "acme-slot-admin",
+            "region": "us-east4",
+            "reservation_name": "prod-edw-pool",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 500,
+            "autoscale_max_slots": 500,
+            "edition_total_baseline_slots": 500,
+            "committed_slots": 500,
+            "active_days": 180.0,
+            "jobs_window": 24000,
+            "jobs_30d": 4000,
+            "slot_ms_30d": 80000 * 3_600_000,
+            "bytes_billed_30d": 3000 * TIB,
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof):
+            f = rules._map_reservation_rightsizing(row, self.PRICES, cfg_180)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["rule_id"], "W-03")
+        self.assertEqual(f["apply_class"], 3)
+        self.assertEqual(f["target_dataset"], "RESERVATION_CAPACITY")
+        self.assertEqual(f["target_table"], "prod-edw-pool")
+        self.assertEqual(f["proposed_change"]["action"], "RESIZE_RESERVATION")
+        self.assertEqual(f["proposed_change"]["recommended_baseline_slots"], 100)
+        self.assertEqual(f["proposed_change"]["recommended_autoscale_max_slots"], 300)
+        self.assertEqual(f["evidence"]["diagnosis_kind"], "OVERPROVISIONED_BASELINE")
+        self.assertIn("COMMITTED_SLOTS_CONTINUE_UNTIL_EXPIRY", f["risk_notes"])
+        self.assertIn("ALTER RESERVATION `acme-slot-admin.region-us-east4.prod-edw-pool`",
+                      f["proposed_change"]["generated_ddl"])
+
+    def test_w03_underprovisioned_baseline_and_uncovered_payg_slots(self):
+        cfg_180 = {"demo_mode": False, "location": "US", "pricing": {"capacity_sizing_days": 180}}
+        prof = {
+            "p50_all": 260.0, "p95_all": 340.0, "p99_busy": 390.0, "peak": 450.0,
+            "busy_minutes": 240000.0, "total_minutes": 259200.0, "active_days": 180.0,
+            "slot_hours": 190000.0, "autoscale_slot_hours": 225000.0,
+            "autoscale_slot_hours_above_baseline": 15000.0,
+            "current_burst_slot_hours": 185000.0,
+            "source_label": "JOBS_TIMELINE_180D",
+        }
+        row = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "etl-heavy-pool",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 100,
+            "autoscale_max_slots": 500,
+            "edition_total_baseline_slots": 100,
+            "committed_slots": 0,  # 100 baseline slots are uncovered PAYG!
+            "active_days": 180.0,
+            "jobs_window": 90000,
+            "jobs_30d": 15000,
+            "slot_ms_30d": 190000 * 3_600_000,
+            "bytes_billed_30d": 4500 * TIB,
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof):
+            f = rules._map_reservation_rightsizing(row, self.PRICES, cfg_180)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["evidence"]["diagnosis_kind"], "UNDERPROVISIONED_BASELINE_HEAVY_AUTOSCALE")
+        self.assertEqual(f["proposed_change"]["recommended_baseline_slots"], 250)
+        self.assertEqual(f["proposed_change"]["recommended_autoscale_max_slots"], 400)
+        self.assertEqual(f["proposed_change"]["selected_option"], 1)
+        self.assertIn("UNCOVERED_BASELINE_PAYG_SLOTS", f["risk_notes"])
+        self.assertIn("CUD_PURCHASE_MANUAL_IN_CONSOLE", f["risk_notes"])
+
+    def test_w03_tiny_reservation_recommends_returning_to_on_demand(self):
+        cfg_180 = {"demo_mode": False, "location": "US", "pricing": {"capacity_sizing_days": 180}}
+        prof = {
+            "p50_all": 0.0, "p95_all": 0.0, "p99_busy": 80.0, "peak": 90.0,
+            "busy_minutes": 3000.0, "total_minutes": 259200.0, "active_days": 180.0,
+            "slot_hours": 400.0, "autoscale_slot_hours": 500.0,
+            "autoscale_slot_hours_above_baseline": 500.0,
+            "current_burst_slot_hours": 0.0,
+            "source_label": "JOBS_TIMELINE_180D",
+        }
+        row = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "dev-tiny-pool",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 100,
+            "autoscale_max_slots": 100,
+            "edition_total_baseline_slots": 100,
+            "committed_slots": 0,
+            "assignment_ids": ["assign-dev"],
+            "active_days": 180.0,
+            "jobs_window": 600,
+            "jobs_30d": 100,
+            "slot_ms_30d": 400 * 3_600_000,
+            "bytes_billed_30d": 2 * TIB,  # $12.50/mo on On-Demand vs $30.00/mo pure autoscale vs $4,380/mo baseline!
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof):
+            f = rules._map_reservation_rightsizing(row, self.PRICES, cfg_180)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["evidence"]["option_2_mode"], "ON_DEMAND")
+        self.assertEqual(f["proposed_change"]["selected_option"], 2)
+        self.assertEqual(f["savings_basis"], "BYTES_ON_DEMAND")
+        self.assertIn("DROP ASSIGNMENT IF EXISTS `acme-slot-admin.region-us.dev-tiny-pool.assign-dev`",
+                      f["proposed_change"]["generated_ddl_option2"])
+
+    def test_w03_standard_edition_never_uses_cud_discount_and_caps_at_1600(self):
+        self.assertAlmostEqual(pricing.edition_commit_rate(self.PRICES, "STANDARD"), 0.04)
+        self.assertAlmostEqual(pricing.edition_slot_rate(self.PRICES, "STANDARD"), 0.04)
+        cfg_180 = {"demo_mode": False, "location": "US", "pricing": {"capacity_sizing_days": 180}}
+        prof = {
+            "p50_all": 0.0, "p95_all": 200.0, "p99_busy": 1900.0, "peak": 2100.0,
+            "busy_minutes": 20000.0, "total_minutes": 259200.0, "active_days": 180.0,
+            "slot_hours": 2000.0, "autoscale_slot_hours": 2600.0,
+            "autoscale_slot_hours_above_baseline": 2600.0,
+            "current_burst_slot_hours": 0.0,
+        }
+        row = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "std-pool",
+            "edition": "STANDARD",
+            "baseline_slots": 400,
+            "autoscale_max_slots": 0,
+            "active_days": 180.0,
+            "jobs_window": 1200,
+            "jobs_30d": 200,
+            "slot_ms_30d": 2000 * 3_600_000,
+            "bytes_billed_30d": 500 * TIB,
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof):
+            f = rules._map_reservation_rightsizing(row, self.PRICES, cfg_180)
+        self.assertIsNotNone(f)
+        self.assertEqual(f["proposed_change"]["recommended_autoscale_max_slots"], 1600)
+        self.assertNotIn("UNCOVERED_BASELINE_PAYG_SLOTS", f["risk_notes"])
+        self.assertNotIn("CUD_PURCHASE_MANUAL_IN_CONSOLE", f["risk_notes"])
+
+    def test_governance_deoverlap_and_class3_executor_resize_and_rollback(self):
+        from optimizer.executor import class3
+        from optimizer import collector_driver, cli as cli_mod
+        from optimizer import config as cfg_mod
+
+        w03_card = {
+            "change_set_id": "cs-w03-1",
+            "rule_ids": ["W-03"],
+            "apply_class": 3,
+            "target_project": "acme-slot-admin",
+            "target_dataset": "RESERVATION_CAPACITY",
+            "target_table": "dev-tiny-pool",
+            "target_region": "us-east4",
+            "net_monthly_value_usd": 1200.0,
+            "evidence": {
+                "savings_math": {
+                    "pool_key": "reservation:acme-slot-admin:us-east4:dev-tiny-pool",
+                    "pool_spend_usd": 1500.0,
+                }
+            },
+        }
+        self.assertTrue(governance.is_finops_card(w03_card, GOV))
+        self.assertTrue(cli_mod._in_scope(w03_card, "analytics_mart"))
+        deov = pricing.deoverlap_total([w03_card], ceilings={"compute": 1000.0})
+        self.assertEqual(deov["total"], 1000.0)
+        self.assertIn("compute", deov["ceiling_applied"])
+
+        # Executor apply + rollback for Option 2 ON_DEMAND return
+        exec_cfg = cfg_mod.Config({
+            **cfg_mod._DEFAULTS,
+            "project_id": "acme-slot-admin",
+            "ops_dataset": "optimizer_ops",
+            "executor": {**cfg_mod._DEFAULTS["executor"], "enable_class3": True, "enable_reservation_changes": True},
+        })
+        change = {
+            "action": "RESIZE_RESERVATION",
+            "reservation_name": "dev-tiny-pool",
+            "edition": "ENTERPRISE",
+            "recommended_baseline_slots": 0,
+            "recommended_autoscale_max_slots": 100,
+            "option_2_mode": "ON_DEMAND",
+            "selected_option": 2,
+        }
+        cs_row = dict(w03_card, proposed_change_json=json.dumps(change), progress_json=None)
+        executed_sql: list[tuple[str, str | None]] = []
+
+        def fake_query(_c, sql, params=None, location=None):
+            if "INFORMATION_SCHEMA.RESERVATIONS" in sql:
+                return [{"reservation_name": "dev-tiny-pool", "edition": "ENTERPRISE",
+                         "slot_capacity": 100, "autoscale_max_slots": 50}]
+            if "INFORMATION_SCHEMA.ASSIGNMENTS" in sql:
+                return [{"assignment_id": "assign-dev", "assignee_type": "PROJECT", "assignee_id": "acme-dev-proj"}]
+            return []
+
+        def fake_execute(_c, sql, params=None, location=None):
+            executed_sql.append((sql, location))
+            return 1
+
+        with mock.patch("optimizer.bq.query", side_effect=fake_query), \
+             mock.patch("optimizer.bq.execute", side_effect=fake_execute):
+            plan = class3.run(exec_cfg, cs_row)
+            self.assertTrue(plan["return_to_on_demand"])
+            self.assertEqual(plan["prior_baseline_slots"], 100)
+            self.assertEqual(plan["prior_autoscale_max_slots"], 50)
+            ddl_calls = [s for s, _ in executed_sql if not s.strip().startswith("UPDATE")]
+            self.assertTrue(any("DROP ASSIGNMENT IF EXISTS `acme-slot-admin.region-us-east4.dev-tiny-pool.assign-dev`" in s for s in ddl_calls))
+            self.assertTrue(any("ALTER RESERVATION `acme-slot-admin.region-us-east4.dev-tiny-pool`" in s and "slot_capacity = 0" in s for s in ddl_calls))
+
+            executed_sql.clear()
+            cs_row["rollback_plan_json"] = json.dumps(plan)
+            class3.rollback(exec_cfg, cs_row)
+            rb_ddls = [s for s, _ in executed_sql if not s.strip().startswith("UPDATE")]
+            # Must restore slot capacity BEFORE recreating QUERY assignment
+            self.assertIn("ALTER RESERVATION `acme-slot-admin.region-us-east4.dev-tiny-pool`", rb_ddls[0])
+            self.assertIn("slot_capacity = 100, autoscale_max_slots = 50", rb_ddls[0])
+            self.assertIn("CREATE ASSIGNMENT `acme-slot-admin.region-us-east4.dev-tiny-pool.assign-dev`", rb_ddls[1])
+            self.assertIn("assignee = 'projects/acme-dev-proj'", rb_ddls[1])
+
+        # Collector driver reservation auto-discovery when reservation_admin_project is None
+        disc_queries: list[str] = []
+
+        def fake_disc_query(_c, sql, params=None, location=None):
+            disc_queries.append(sql)
+            if "FROM `acme-slot-admin.optimizer_ops.jobs_events`" in sql:
+                return [{"admin_project": "central-slots-prod", "res_region": "us-east4"}]
+            if "FROM `acme-slot-admin.optimizer_ops.object_state_raw_daily`" in sql:
+                return []
+            if "INFORMATION_SCHEMA.RESERVATIONS" in sql:
+                return [{"raw_json": '{"reservation_name":"pool1","slot_capacity":200}'}]
+            return []
+
+        with mock.patch("optimizer.bq.query", side_effect=fake_disc_query), \
+             mock.patch("optimizer.bq.execute", return_value=1):
+            snap_n = collector_driver.snapshot_reservations(exec_cfg)
+        self.assertGreaterEqual(snap_n, 1)
+        self.assertTrue(any("`central-slots-prod.region-us-east4`.INFORMATION_SCHEMA.RESERVATIONS" in q for q in disc_queries))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,13 +53,13 @@ What `scripts/install.sh` sets up automatically (~4 minutes):
 | `sql/04_change_sets.sql` | **3 governance tables** (`change_sets`, `rule_accuracy`, `cost_watchdogs`) + **3 queue/receipt views** (`v_pending_review`, `v_approved_ready`, `v_receipts`) |
 | `optimizer/regions.py` & `optimizer/remote_collector.py` | Cloud Asset Inventory **region + multi-project discovery** (`regions_seen`), cross-region & cross-project courier (`_stg_*` 24h staging + `MERGE`), org-mode **`1b_query_previews` SQL text hydration**, and `TABLE_STORAGE_BY_ORGANIZATION` → per-project `TABLE_STORAGE` fallback |
 | `optimizer/schema_guard.py` | Stamps a DDL `schema_version` hash label on `v_jobs_costed` and automatically self-heals `optimizer_ops` views/tables whenever code upgrades |
-| `optimizer/rules.py` | 14 infra & billing rules (`W-01` Option 1 vs Option 2 Editions Sizing, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** (Regex + ZetaSQL `.jar` + **Vertex AI `gemini-3.8-flash`** + cross-project schema-stub `dry_run=True` byte-reduction verifier) |
+| `optimizer/rules.py` | 15 infra & billing rules (**`W-01` 180-Day On-Demand → Editions Slot Sizing** per `(project, region)`, **`W-03` 180-Day Existing Reservation Right-Sizing & Slot-vs-On-Demand Fit** with `CAPACITY_COMMITMENTS` CUD coverage checks, **`W-02` Proactive Cost Guardrail with Human Ad-Hoc vs. Service Account / ETL Separation**, **`C2-01` Smart-Tuned Materialized Views with `max_staleness = INTERVAL '4' HOUR`**) + **Tri-Engine Class-4 SQL Anti-Pattern Pipeline** (Regex + ZetaSQL `.jar` + **Vertex AI `gemini-3.8-flash`** + cross-project schema-stub `dry_run=True` byte-reduction verifier) |
 | `optimizer/scoring.py` & `optimizer/compiler.py` | Net value × confidence ÷ risk, **subquery-summation cap**, partition+cluster merge, conflict resolution, and **money-losing card suppression (`min_card_net_monthly_usd`)** |
-| `optimizer/pricing.py` | **Billing-aware money**: on-demand jobs at bytes × \$/TiB, reservation jobs at slot-hours × edition rate; compounding of overlapping cards; headline capped at actual 30d compute spend |
+| `optimizer/pricing.py` | **Billing-aware money**: on-demand jobs at bytes × \$/TiB, reservation jobs at slot-hours × edition rate (`STANDARD` PAYG, `ENTERPRISE` / `ENTERPRISE_PLUS` PAYG vs 1-Yr Commit); compounding of overlapping cards; headline capped at actual 30d compute spend |
 | `optimizer/governance.py` & `optimizer/attribution.py` | **FinOps gate** (server-side 403 + executor re-check, verified IAP JWT identity) and configurable HR + **service-account → human owner → Director** view shims |
-| `optimizer/setup_check.py`, `settings_catalog.py`, `settings_options.py`, `settings_store.py` | **In-app `/#settings` backend**: 14-probe read-only Setup Check with copy-pasteable `gcloud`/`bq` fixes, 54-setting catalog, live schema/region/teammate dropdown discovery, and append-only `settings_changes` store with 1-click Undo |
+| `optimizer/setup_check.py`, `settings_catalog.py`, `settings_options.py`, `settings_store.py` | **In-app `/#settings` backend**: 14-probe read-only Setup Check with copy-pasteable `gcloud`/`bq` fixes, 55-setting catalog (incl. `pricing.capacity_sizing_days` up to 180d), live schema/region/teammate dropdown discovery, and append-only `settings_changes` store with 1-click Undo |
 | `optimizer/scan_runner.py` | Read-only **Run scan now** engine (`collect` → `rules`, never `execute`) triggered from the Review UI via Cloud Run Job with automatic in-process fallback |
-| `optimizer/executor/` | Router + change-window deferral (`OutsideChangeWindow`), per-region Class 1/2/3 applies (`W-01` & `W-02` governance, **Class 3 S0–S9 copy-swap-rebind**), **Class 4 `pr_handoff.py` (`PR_HANDED_OFF`)**, and Recommender write-back |
+| `optimizer/executor/` | Router + change-window deferral (`OutsideChangeWindow`), per-region Class 1/2/3 applies (`W-01`, `W-02` & `W-03` `ALTER RESERVATION` + rollback governance, **Class 3 S0–S9 copy-swap-rebind**), **Class 4 `pr_handoff.py` (`PR_HANDED_OFF`)**, and Recommender write-back |
 | `optimizer/verifier.py` | Baseline freeze at approval, Day-14 receipts, regression → rollback path, `rule_accuracy` learning, MV watchdogs, and **Slack/Teams Webhook Alerts** |
 | `review_app/` & `frontend/` | React + Flask FinOps Control Plane UI with **Project / Dataset / Region / Owner / Confidence / Min-value filters**, clickable **`RegionsBar` & `RegionBadge`**, **`SettingsPage` (`/#settings`)**, **Ask Gemini Copilot (`gemini-3.8-flash`)**, **PR hand-offs**, OWASP security headers, and `/healthz` |
 | `.deploystack/`, `app.json`, `scripts/install.sh`, `docs/INSTALL.md` | **Zero-paste 1-click Cloud Shell installer** (`gcr.io/ds-artifacts-cloudshell/deploystack_custom_image`, interactive `↑`/`↓` project picker, local Docker build acceleration, Direct Cloud Run `--iap`, nightly Cloud Run Job + `03:00 UTC` Scheduler) |
@@ -103,13 +103,17 @@ python -m optimizer.cli verify       # after verify_window_days: receipts + regr
 - Every card shows its formula ("How this saving is calculated"). Synthetic demo minimums exist
   only with `demo_mode: true` (sandbox only) and are explicitly badged on the card.
 
-**2. Billing controls live in a separate FinOps view.** `W-01`/`W-02`, storage billing model,
+**2. Billing controls live in a separate FinOps view.** `W-01`/`W-02`/`W-03`, storage billing model,
 reservations/commitments, and project-level cards are shown and approvable only for
-`governance.finops_approvers` (plus env `BQOPT_FINOPS_APPROVERS`). Others get HTTP 403
-(`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the `W-01` panel, or the org-wide
-spend figure. `execute` re-checks approvers and sends a card back to review if needed. Identity
-comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker is honored only
-with `trust_client_identity: true` (demo only).
+`governance.finops_approvers` (plus env `BQOPT_FINOPS_APPROVERS`). Both `W-01` (On-Demand → Slots)
+and `W-03` (Existing Reservation Right-Sizing & Slot-vs-On-Demand Fit) size `slot_capacity`
+(baseline) and `autoscale_max_slots` from up to **180 days** (`pricing.capacity_sizing_days`) of
+historical `INFORMATION_SCHEMA` slot telemetry, auto-discovering slot-admin projects directly from
+`jobs_events.reservation_id` and linking to the **GCP Console Slot Estimator** for manual CUD review.
+Others get HTTP 403 (`FINOPS_PERMISSION_REQUIRED`) and never receive those cards, the `W-01`/`W-03`
+panel, or the org-wide spend figure. `execute` re-checks approvers and sends a card back to review
+if needed. Identity comes from a verified IAP JWT (`governance.iap_audience`); the UI persona picker
+is honored only with `trust_client_identity: true` (demo only).
 
 **3. Service-account spend rolls up to a human owner.** Pick your HR table (`employee_hierarchy_table`)
 and service-account mapping table (`service_account_owner_table`) plus column mappings directly from

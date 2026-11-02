@@ -44,6 +44,7 @@ export const CLASS_META: Record<number, { label: string; short: string; color: s
 export function targetLabel(c: Pick<ChangeSet, "target_project" | "target_dataset" | "target_table" | "rule_ids">) {
   const ds = c.target_dataset;
   if ((c.rule_ids || []).includes("W-02") || ds === "HUMAN_ADHOC_GOVERNANCE") return `${c.target_project} · Human ad-hoc guardrail`;
+  if ((c.rule_ids || []).includes("W-03") || ds === "RESERVATION_CAPACITY") return `${c.target_project} · Reservation ${c.target_table || ""}`.trim();
   if (!ds || ds === "None" || ds === "PROJECT_WIDE_BILLING") return `${c.target_project} · Project-wide billing`;
   const t = c.target_table && c.target_table !== "None" ? `.${c.target_table}` : "";
   return `${ds}${t}`;
@@ -111,7 +112,19 @@ export const regionName = (r?: string | null) => (r && REGION_NAMES[r]) || "";
 
 export const isW01 = (c: ChangeSet) => (c.rule_ids || []).includes("W-01") || c.proposed?.action === "CAPACITY_PRICING_MIGRATION";
 export const isW02 = (c: ChangeSet) => (c.rule_ids || []).includes("W-02");
+export const isW03 = (c: ChangeSet) => (c.rule_ids || []).includes("W-03") || c.proposed?.action === "RESIZE_RESERVATION";
 export const needsTwo = (c: ChangeSet) => c.apply_class === 3 || (c.risk_notes || []).includes("REQUIRES_TWO_PERSON_APPROVAL");
+
+export function safeConsoleUrl(raw?: unknown): string | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    const u = new URL(raw.trim());
+    if (u.protocol === "https:" && u.hostname === "console.cloud.google.com") return u.toString();
+  } catch {
+    /* invalid URL */
+  }
+  return null;
+}
 
 export function ddlFor(c: ChangeSet): string | null {
   return c.proposed?.generated_ddl || c.proposed?.sql || c.evidence?.underlying_sql || c.evidence?.optimized_query_sql || null;
