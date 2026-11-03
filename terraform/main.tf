@@ -28,10 +28,12 @@ resource "google_service_account" "scheduler" {
 locals {
   collector_roles = [
     "roles/bigquery.jobUser",
+    "roles/bigquery.user",
     "roles/bigquery.metadataViewer",
     "roles/bigquery.resourceViewer",
     "roles/recommender.bigqueryPartitionClusterViewer",
     "roles/aiplatform.user", # Required for Engine 3 (Vertex AI Gemini 3.8 Flash SQL Judge)
+    "roles/logging.viewer",  # Allows UI scan_runner to surface Cloud Run Job stderr on failure
   ]
 }
 resource "google_project_iam_member" "collector" {

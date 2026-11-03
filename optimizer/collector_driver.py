@@ -31,8 +31,11 @@ def backfill_storage_billing_model(c: Config) -> int:
         except Exception:
             refs = []
         if not refs:
-            refs = [(c["project_id"], item.dataset_id)
-                    for item in cli.list_datasets(project=c["project_id"])]
+            try:
+                refs = [(c["project_id"], item.dataset_id)
+                        for item in cli.list_datasets(project=c["project_id"])]
+            except Exception:
+                refs = []
 
     by_model: dict[str, list[str]] = {}
     for proj, ds_id in refs:
@@ -59,11 +62,10 @@ def snapshot_transfer_configs(c: Config) -> int:
         from google.cloud import bigquery_datatransfer_v1 as dts
     except ImportError:
         return 0
-    dcli = dts.DataTransferServiceClient()
-    n = 0
-    bq.execute(c, f"""
-        DELETE FROM `{c.ops}.object_state_raw_daily`
-        WHERE snapshot_date = CURRENT_DATE() AND kind = 'SCHEDULED_QUERY'""")
+    dcli = dts.DataTransferServiceClient(
+        credentials=getattr(bq.client(c), "_credentials", None)
+    )
+    rows_to_insert: list[tuple[str | None, str | None, str]] = []
     for tc in dcli.list_transfer_configs(parent=f"projects/{c['project_id']}"):
         raw = json.dumps({
             "name": tc.name, "display_name": tc.display_name,
@@ -72,14 +74,17 @@ def snapshot_transfer_configs(c: Config) -> int:
             "disabled": tc.disabled, "owner": getattr(tc, "owner_info", None) and tc.owner_info.email,
             "params": dict(tc.params) if tc.params else {},
         }, default=str)
+        rows_to_insert.append((tc.destination_dataset_id, tc.display_name, raw))
+    bq.execute(c, f"""
+        DELETE FROM `{c.ops}.object_state_raw_daily`
+        WHERE snapshot_date = CURRENT_DATE() AND kind = 'SCHEDULED_QUERY'""")
+    for dest_ds, disp_name, raw in rows_to_insert:
         bq.execute(c, f"""
             INSERT INTO `{c.ops}.object_state_raw_daily`
               (snapshot_date, region, kind, project_id, dataset_id, object_id, raw_json, run_id)
             VALUES (CURRENT_DATE(), NULL, 'SCHEDULED_QUERY', @p, @d, @o, @raw, 'driver')""",
-            {"p": c["project_id"], "d": tc.destination_dataset_id,
-             "o": tc.display_name, "raw": raw})
-        n += 1
-    return n
+            {"p": c["project_id"], "d": dest_ds, "o": disp_name, "raw": raw})
+    return len(rows_to_insert)
 
 
 def snapshot_reservations(c: Config) -> int:
@@ -189,11 +194,27 @@ def snapshot_reservations(c: Config) -> int:
     return total
 
 
+def _short_err(exc: Exception) -> str:
+    txt = str(exc).strip()
+    return txt.splitlines()[0][:200] if txt else type(exc).__name__
+
+
 def run(c: Config) -> dict:
-    out = {"billing_model_rows": backfill_storage_billing_model(c),
-           "transfer_configs": snapshot_transfer_configs(c)}
+    out: dict[str, int] = {
+        "billing_model_rows": 0,
+        "transfer_configs": 0,
+        "reservation_rows": 0,
+    }
+    try:
+        out["billing_model_rows"] = backfill_storage_billing_model(c)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [!] Skipped storage_billing_model backfill (optional): {_short_err(e)}")
+    try:
+        out["transfer_configs"] = snapshot_transfer_configs(c)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [!] Skipped scheduled-query (DTS) snapshot (optional — grant roles/bigquery.user to enable): {_short_err(e)}")
     try:
         out["reservation_rows"] = snapshot_reservations(c)
-    except Exception:
-        out["reservation_rows"] = 0
+    except Exception as e:  # noqa: BLE001
+        print(f"  [!] Skipped reservation metadata snapshot (optional): {_short_err(e)}")
     return out

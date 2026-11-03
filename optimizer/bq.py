@@ -49,8 +49,8 @@ def client(c: Config, location: str | None = None):
     if cached and (now - cached[0]) < _CACHE_TTL_SEC:
         return cached[1]
 
-    # 1. On Cloud Run (K_SERVICE is set), use native Metadata Server ADC directly
-    if os.environ.get("K_SERVICE"):
+    # 1. On Cloud Run Service or Job, use native Metadata Server ADC directly
+    if os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"):
         cl = bigquery.Client(project=c["project_id"], location=default_loc)
         _CLIENT_CACHE[key] = (now, cl)
         return cl

@@ -662,6 +662,7 @@ PY
     cloudbuild.googleapis.com
     artifactregistry.googleapis.com
     cloudscheduler.googleapis.com
+    logging.googleapis.com
     iap.googleapis.com
     aiplatform.googleapis.com
   )
@@ -745,11 +746,13 @@ PY
     "roles/run.builder"
     "roles/storage.objectViewer"
     "roles/bigquery.jobUser"
+    "roles/bigquery.user"
     "roles/bigquery.dataEditor"
     "roles/bigquery.metadataViewer"
     "roles/bigquery.resourceViewer"
     "roles/recommender.bigqueryPartitionClusterViewer"
     "roles/aiplatform.user"
+    "roles/logging.viewer"
   )
   for ROLE in "${PROJECT_ROLES[@]}"; do
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \

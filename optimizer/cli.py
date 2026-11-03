@@ -351,28 +351,34 @@ def cmd_scan(c) -> None:
     the Review UI is safe at any hour and never alters customer tables or reservations.
     """
     from . import schema_guard
-    client = bq.client(c)
-    ds_id = f"{c['project_id']}.{c['ops_dataset']}"
     try:
-        client.get_dataset(ds_id)
-        schema_guard.ensure_current(c, max_age_sec=0)
-    except Exception:
-        print(f"[*] Control plane dataset '{ds_id}' not found. Auto-initializing schema...")
-        cmd_init(c)
+        client = bq.client(c)
+        ds_id = f"{c['project_id']}.{c['ops_dataset']}"
+        try:
+            client.get_dataset(ds_id)
+            schema_guard.ensure_current(c, max_age_sec=0)
+        except Exception:
+            print(f"[*] Control plane dataset '{ds_id}' not found. Auto-initializing schema...")
+            cmd_init(c)
 
-    print("=" * 60)
-    print("▶ STEP 1/2: COLLECTOR (Ingesting metadata & telemetry)")
-    print("=" * 60)
-    cmd_collect(c)
+        print("=" * 60)
+        print("▶ STEP 1/2: COLLECTOR (Ingesting metadata & telemetry)")
+        print("=" * 60)
+        cmd_collect(c)
 
-    print("\n" + "=" * 60)
-    print("▶ STEP 2/2: RULES ENGINE (Analyzing patterns & generating findings)")
-    print("=" * 60)
-    cmd_rules(c)
+        print("\n" + "=" * 60)
+        print("▶ STEP 2/2: RULES ENGINE (Analyzing patterns & generating findings)")
+        print("=" * 60)
+        cmd_rules(c)
 
-    print("\n" + "=" * 60)
-    print("✅ ON-DEMAND SCAN COMPLETED SUCCESSFULLY!")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("✅ ON-DEMAND SCAN COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+    except Exception as e:
+        first_line = str(e).strip().splitlines()[0][:260] if str(e).strip() else ""
+        summary = f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
+        print(f"SCAN_ERROR: {summary}", file=sys.stderr, flush=True)
+        raise
 
 
 def cmd_pipeline(c) -> None:

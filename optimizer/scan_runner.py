@@ -28,6 +28,15 @@ _EXEC_NAME_RE = re.compile(
     r"^projects/[a-z][a-z0-9.:-]{0,62}/locations/[a-z][a-z0-9-]{1,39}"
     r"/jobs/[a-zA-Z0-9_-]{1,63}/executions/[a-zA-Z0-9_-]{1,63}\Z"
 )
+_EXEC_PARTS_RE = re.compile(
+    r"^projects/([a-z][a-z0-9.:-]{0,62})/locations/([a-z][a-z0-9-]{1,39})"
+    r"/jobs/([a-zA-Z0-9_-]{1,63})/executions/([a-zA-Z0-9_-]{1,63})\Z"
+)
+_PY_ERR_LINE_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:Error|Exception|Denied|Forbidden|NotFound|Exhausted|Timeout|Conflict|"
+    r"InvalidArgument|Unauthenticated|Unauthorized):\s+.+"
+)
 _JOB_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}\Z")
 _WAITERS_LOCK = threading.Lock()
 _ACTIVE_WAITERS = 0
@@ -170,6 +179,82 @@ def _trigger_cloud_run_job(project_id: str, region: str, job_name: str) -> dict[
     return {"execution_name": exec_name, "log_uri": log_uri}
 
 
+def _extract_cloud_run_error(lines: list[str]) -> str | None:
+    """Extract the most informative single-line error message from Cloud Run Job log lines."""
+    for ln in reversed(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        idx = s.find("SCAN_ERROR:")
+        if idx >= 0:
+            detail = s[idx + len("SCAN_ERROR:"):].strip()
+            if detail:
+                return detail[:280]
+    for ln in reversed(lines):
+        s = ln.strip()
+        if not s or ln.startswith((" ", "\t")) or s.startswith(("Traceback ", 'File "')):
+            continue
+        if _PY_ERR_LINE_RE.match(s):
+            return s[:280]
+        if s.upper().startswith(("ERROR:", "CRITICAL:", "FATAL:")):
+            return s[:280]
+    return None
+
+
+def _fetch_cloud_run_job_logs(sess: Any, exec_name: str) -> tuple[list[str], str | None]:
+    """Best-effort fetch of stdout/stderr lines and root-cause error from Cloud Logging."""
+    m = _EXEC_PARTS_RE.fullmatch(str(exec_name or "").lstrip("/"))
+    if not m:
+        return [], None
+    proj, loc, job_name, exec_short = m.groups()
+    flt = (
+        f'resource.type="cloud_run_job" '
+        f'AND resource.labels.job_name="{job_name}" '
+        f'AND resource.labels.location="{loc}" '
+        f'AND labels."run.googleapis.com/execution_name"="{exec_short}" '
+        f'AND (logName:"/logs/run.googleapis.com%2Fstdout" '
+        f'OR logName:"/logs/run.googleapis.com%2Fstderr")'
+    )
+    try:
+        resp = sess.post(
+            "https://logging.googleapis.com/v2/entries:list",
+            json={
+                "resourceNames": [f"projects/{proj}"],
+                "filter": flt,
+                "orderBy": "timestamp desc",
+                "pageSize": 60,
+            },
+            timeout=6,
+        )
+        if resp.status_code >= 400:
+            return [], None
+        payload = resp.json() if resp.content else {}
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            return [], None
+    except Exception:
+        return [], None
+
+    lines: list[str] = []
+    for ent in reversed(entries):
+        if not isinstance(ent, dict):
+            continue
+        raw = ent.get("textPayload")
+        if not raw and isinstance(ent.get("jsonPayload"), dict):
+            raw = ent["jsonPayload"].get("message") or ent["jsonPayload"].get("error")
+        if not raw:
+            continue
+        for sub in str(raw).splitlines():
+            clean = security.sanitize_log_value(sub.rstrip(), max_len=240)
+            if clean.strip():
+                lines.append(clean)
+
+    err_detail = _extract_cloud_run_error(lines)
+    if len(lines) > _MAX_LOG_LINES - 1:
+        lines = lines[-(_MAX_LOG_LINES - 1):]
+    return lines, err_detail
+
+
 def _poll_cloud_run_execution() -> None:
     """Refresh `_STATE` from Cloud Run v2 Execution status when mode == cloud_run_job."""
     with _LOCK:
@@ -193,6 +278,10 @@ def _poll_cloud_run_execution() -> None:
     cancelled = int(ex.get("cancelledCount") or 0)
     completion_time = ex.get("completionTime")
     log_uri = _safe_log_uri(ex.get("logUri"))
+    job_lines: list[str] = []
+    job_err: str | None = None
+    if succeeded > 0 or failed > 0 or cancelled > 0:
+        job_lines, job_err = _fetch_cloud_run_job_logs(sess, exec_name)
 
     finished_now = False
     with _LOCK:
@@ -200,6 +289,11 @@ def _poll_cloud_run_execution() -> None:
             return
         if log_uri and not _STATE.get("log_uri"):
             _STATE["log_uri"] = log_uri
+        if job_lines:
+            cur_tail = list(_STATE.get("log_tail") or [])
+            header = cur_tail[:1] if cur_tail else []
+            merged = header + [ln for ln in job_lines if ln not in header]
+            _STATE["log_tail"] = merged[-_MAX_LOG_LINES:]
         if succeeded > 0:
             _bump_locked(
                 state="succeeded",
@@ -209,11 +303,13 @@ def _poll_cloud_run_execution() -> None:
             )
             finished_now = True
         elif failed > 0 or cancelled > 0:
-            msg = "Cloud Run scan job failed."
+            cond_msg = "Cloud Run scan job failed."
             for cond in ex.get("conditions") or []:
                 if cond.get("state") == "CONDITION_FAILED" and cond.get("message"):
-                    msg = str(cond["message"])[:300]
+                    cond_msg = security.sanitize_log_value(str(cond["message"]), max_len=300)
                     break
+            exec_short = str(exec_name).rsplit("/", 1)[-1]
+            msg = f"{job_err} ({exec_short})"[:300] if job_err else cond_msg
             _bump_locked(
                 state="failed",
                 step="done",
@@ -225,7 +321,7 @@ def _poll_cloud_run_execution() -> None:
         else:
             # Estimate visual progress smoothly while the Cloud Run Job executes
             _STATE["step"] = "collect"
-            _STATE["step_label"] = "Scanning BigQuery regions & running 14 optimization rules (Cloud Run job)…"
+            _STATE["step_label"] = "Scanning BigQuery regions & running 15 optimization rules (Cloud Run job)…"
 
     if finished_now:
         invalidate_telemetry_cache()

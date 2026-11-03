@@ -150,6 +150,122 @@ class TestScanRunner(unittest.TestCase):
             cli.cmd_scan(c)
         self.assertEqual(order, ["get_dataset", "guard", "collect", "rules"])
 
+    def test_cloud_run_job_failure_surfaces_cloud_logging_error_and_fallback(self):
+        c = _cfg()
+        exec_path = "projects/test-proj/locations/us-central1/jobs/bqopt-nightly-pipeline/executions/exec-fail1"
+
+        class _FakeResp:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+                self.content = b"{}"
+                self.text = str(payload)
+
+            def json(self):
+                return self._payload
+
+        # 1) Python exception logged to Cloud Logging -> surfaces exact error + log_tail
+        class _LoggingSession:
+            def post(self, url, json=None, timeout=None):
+                if "logging.googleapis.com/v2/entries:list" in url:
+                    return _FakeResp(200, {
+                        "entries": [
+                            {
+                                "textPayload": "SCAN_ERROR: PermissionDenied: 403 User does not have bigquery.transfers.get permission",
+                            },
+                            {
+                                "textPayload": "▶ STEP 1/2: COLLECTOR (Ingesting metadata & telemetry)\n  + Indexed 255 jobs",
+                            },
+                        ]
+                    })
+                return _FakeResp(200, {"metadata": {"name": exec_path, "logUri": "https://console.cloud.google.com/logs"}})
+
+            def get(self, url, timeout=None):
+                return _FakeResp(200, {
+                    "failedCount": 1,
+                    "completionTime": "2026-11-03T17:40:00Z",
+                    "conditions": [{
+                        "state": "CONDITION_FAILED",
+                        "message": "Task exec-fail1-task0 failed with exit code: 1 and message: The container exited with an error.",
+                    }],
+                })
+
+        with mock.patch.dict(os.environ, {"BQOPT_PIPELINE_JOB": "bqopt-nightly-pipeline", "BQOPT_JOB_REGION": "us-central1"}, clear=False), \
+                mock.patch.object(scan_runner, "_authed_session", return_value=_LoggingSession()), \
+                mock.patch.object(scan_runner.bq, "query", return_value=[{"cnt": 255, "latest": "2026-11-03T17:39:00Z"}]):
+            scan_runner.start_scan(c, triggered_by="admin@acme.com")
+            polled = scan_runner.get_status(c)
+            self.assertEqual(polled["state"], "failed")
+            self.assertIn("PermissionDenied: 403 User does not have bigquery.transfers.get permission", polled["error"])
+            self.assertIn("(exec-fail1)", polled["error"])
+            self.assertTrue(any("Indexed 255 jobs" in ln for ln in polled["log_tail"]))
+
+        # 2) OOM / signal kill with no Python exception line -> falls back to CONDITION_FAILED message
+        self.setUp()
+
+        class _OomSession(_LoggingSession):
+            def post(self, url, json=None, timeout=None):
+                if "logging.googleapis.com/v2/entries:list" in url:
+                    return _FakeResp(200, {
+                        "entries": [{"textPayload": "[*] Collecting remote region us-east4..."}]
+                    })
+                return super().post(url, json=json, timeout=timeout)
+
+            def get(self, url, timeout=None):
+                return _FakeResp(200, {
+                    "failedCount": 1,
+                    "completionTime": "2026-11-03T17:41:00Z",
+                    "conditions": [{
+                        "state": "CONDITION_FAILED",
+                        "message": "Memory limit of 2 GiB exceeded with 2060 MiB used.",
+                    }],
+                })
+
+        with mock.patch.dict(os.environ, {"BQOPT_PIPELINE_JOB": "bqopt-nightly-pipeline", "BQOPT_JOB_REGION": "us-central1"}, clear=False), \
+                mock.patch.object(scan_runner, "_authed_session", return_value=_OomSession()), \
+                mock.patch.object(scan_runner.bq, "query", return_value=[]):
+            scan_runner.start_scan(c, triggered_by="admin@acme.com")
+            polled_oom = scan_runner.get_status(c)
+            self.assertEqual(polled_oom["state"], "failed")
+            self.assertEqual(polled_oom["error"], "Memory limit of 2 GiB exceeded with 2060 MiB used.")
+            self.assertTrue(any("Collecting remote region us-east4" in ln for ln in polled_oom["log_tail"]))
+
+    def test_collector_driver_survives_dts_permission_denied_without_aborting_scan(self):
+        import io
+        from optimizer import collector_driver
+
+        c = _cfg()
+        executed_sql: list[str] = []
+
+        class _DeniedDtsClient:
+            def __init__(self, **_kw):
+                pass
+
+            def list_transfer_configs(self, **_kw):
+                raise PermissionError("403 User does not have bigquery.transfers.get permission")
+
+        fake_dts = mock.MagicMock()
+        fake_dts.DataTransferServiceClient = _DeniedDtsClient
+
+        with mock.patch.dict("sys.modules", {"google.cloud.bigquery_datatransfer_v1": fake_dts}), \
+                mock.patch.object(collector_driver.bq, "client", return_value=mock.MagicMock(_credentials=None)), \
+                mock.patch.object(collector_driver.bq, "execute", side_effect=lambda _c, q, *_a, **_k: executed_sql.append(q) or 0), \
+                mock.patch.object(collector_driver, "backfill_storage_billing_model", return_value=3), \
+                mock.patch.object(collector_driver, "snapshot_reservations", return_value=2):
+            res = collector_driver.run(c)
+
+        self.assertEqual(res, {"billing_model_rows": 3, "transfer_configs": 0, "reservation_rows": 2})
+        # When list_transfer_configs fails with 403, we must NOT wipe existing SCHEDULED_QUERY snapshots
+        self.assertFalse(any("DELETE FROM" in q and "SCHEDULED_QUERY" in q for q in executed_sql))
+
+        # Also verify cmd_scan emits SCAN_ERROR: to stderr when a hard failure does occur
+        err_buf = io.StringIO()
+        with mock.patch.object(cli.bq, "client", side_effect=RuntimeError("boom connection lost")), \
+                mock.patch("sys.stderr", err_buf):
+            with self.assertRaisesRegex(RuntimeError, "boom connection lost"):
+                cli.cmd_scan(c)
+        self.assertIn("SCAN_ERROR: RuntimeError: boom connection lost", err_buf.getvalue())
+
 
 class TestScanEndpointsAndInstaller(unittest.TestCase):
     def test_scan_api_enforces_editor_permission_and_dynamic_check_command(self):
@@ -246,9 +362,17 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
             script_text = f.read()
         self.assertIn("roles/run.builder", script_text)
         self.assertIn("roles/storage.objectViewer", script_text)
+        self.assertIn("roles/bigquery.user", script_text)
+        self.assertIn("roles/logging.viewer", script_text)
         self.assertIn("gs://run-sources-${PROJECT_ID}-${RUN_REGION}", script_text)
         self.assertIn("--build-service-account=", script_text)
         self.assertIn("spec.template.spec.containers[0].image", script_text)
+
+        tf_main = os.path.join(repo_root, "terraform", "main.tf")
+        with open(tf_main, encoding="utf-8") as f:
+            tf_text = f.read()
+        self.assertIn("roles/bigquery.user", tf_text)
+        self.assertIn("roles/logging.viewer", tf_text)
 
         # Validate app.json strictly against GoogleCloudPlatform/cloud-run-button's
         # `appFile` schema (which uses `json.Decoder.DisallowUnknownFields()`).
