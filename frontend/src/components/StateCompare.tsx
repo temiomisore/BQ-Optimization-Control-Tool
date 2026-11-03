@@ -29,7 +29,38 @@ export function Rich({ text }: { text: string }) {
   );
 }
 
-function Value({ v, tone }: { v: unknown; tone: "rose" | "emerald" }) {
+export interface StateCompareItem {
+  label: string;
+  value: unknown;
+  badge?: string;
+  badgeTone?: "emerald" | "sky" | "amber";
+  muted?: boolean;
+}
+
+const KEY_ORDER: Record<string, number> = {
+  table: 1,
+  dataset: 2,
+  reservation: 3,
+  billing_model: 4,
+  partition_granularity: 5,
+  provisioned_capacity: 6,
+  "30d_bytes_scanned": 7,
+  observed_demand: 8,
+  commitment_coverage: 9,
+  already_on_reservation: 10,
+  current_monthly_bill: 11,
+  cost_driver: 12,
+  status: 20,
+  recommended_option_1: 21,
+  recommended_option_2: 22,
+  projected_net_savings: 23,
+  net_savings: 24,
+  fallback_option_1: 25,
+  fallback_option_1_stay_on_slots: 26,
+  fallback_option_2: 27,
+};
+
+function Value({ v, tone }: { v: unknown; tone: "rose" | "emerald" | "muted" }) {
   // nested objects / arrays -> sub-bullets
   if (Array.isArray(v)) {
     return (
@@ -54,13 +85,18 @@ function Value({ v, tone }: { v: unknown; tone: "rose" | "emerald" }) {
   }
 
   const s = String(v ?? "—");
-  const strong = tone === "emerald" ? "text-emerald-600 dark:text-emerald-300" : "text-rose-600 dark:text-rose-300";
+  const strong =
+    tone === "emerald"
+      ? "text-emerald-600 dark:text-emerald-300"
+      : tone === "rose"
+        ? "text-rose-600 dark:text-rose-300"
+        : "text-zinc-600 dark:text-zinc-400";
 
-  // cost formula: "A + B = Total"
+  // Top-level cost formula: "A + B = $Total / month" (never match " = $" nested inside parentheses)
   const eq = s.lastIndexOf(" = ");
-  if (eq > 0 && /\$\d/.test(s.slice(eq))) {
+  const rhs = eq > 0 ? s.slice(eq + 3).trim() : "";
+  if (eq > 0 && /^\$[\d,.]+(?:\s*\/\s*[A-Za-z]+)?$/.test(rhs)) {
     const lhs = s.slice(0, eq);
-    const total = s.slice(eq + 3);
     const parts = lhs.split(/\s\+\s/);
     return (
       <div className="mt-1 space-y-1">
@@ -73,20 +109,33 @@ function Value({ v, tone }: { v: unknown; tone: "rose" | "emerald" }) {
           ))}
         </ul>
         <div className={cn("flex items-center gap-1.5 font-mono text-sm font-semibold", strong)}>
-          <ArrowRight className="h-3.5 w-3.5" /> {total}
+          <ArrowRight className="h-3.5 w-3.5" /> {rhs}
         </div>
       </div>
     );
   }
 
   const [main, note] = splitNote(s);
-  const looksMoney = /\$\d/.test(main);
+  const looksMoney = tone !== "muted" && /^\s*\$[\d,.]/.test(main);
   return (
     <div className="mt-0.5">
-      <div className={cn("text-sm leading-snug", looksMoney ? cn("font-mono font-semibold", strong) : "text-zinc-800 dark:text-zinc-200")}><Rich text={main} /></div>
+      <div
+        className={cn(
+          tone === "muted" ? "text-xs leading-snug text-zinc-600 dark:text-zinc-400" : "text-sm leading-snug",
+          looksMoney ? cn("font-mono font-semibold", strong) : tone === "muted" ? "" : "text-zinc-800 dark:text-zinc-200",
+        )}
+      >
+        <Rich text={main} />
+      </div>
       {note && <div className="mt-0.5 text-xs leading-snug text-zinc-500"><Rich text={note} /></div>}
     </div>
   );
+}
+
+function badgeClass(tone?: "emerald" | "sky" | "amber") {
+  if (tone === "sky") return "bg-sky-500/15 text-sky-600 dark:text-sky-300";
+  if (tone === "amber") return "bg-amber-500/15 text-amber-600 dark:text-amber-300";
+  return "bg-emerald-500/15 text-emerald-600 dark:text-emerald-300";
 }
 
 function StateList({ obj, tone }: { obj: unknown; tone: "rose" | "emerald" }) {
@@ -94,17 +143,58 @@ function StateList({ obj, tone }: { obj: unknown; tone: "rose" | "emerald" }) {
   if (!obj || typeof obj !== "object") {
     return <p className="text-sm text-zinc-600 dark:text-zinc-300">{String(obj ?? "—")}</p>;
   }
+  if (Array.isArray(obj)) {
+    const items = obj as StateCompareItem[];
+    return (
+      <ul className="space-y-3">
+        {items.map((item, idx) => {
+          const itemTone = item.muted ? "muted" : tone;
+          return (
+            <li
+              key={`${item.label}-${idx}`}
+              className={cn(
+                "flex gap-2.5",
+                item.muted && idx > 0 && "border-t border-zinc-200/80 pt-2.5 dark:border-white/10",
+              )}
+            >
+              <CircleDot className={cn("mt-0.5 h-3.5 w-3.5 shrink-0", item.muted ? "text-zinc-400 dark:text-zinc-500" : dot)} />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">{item.label}</span>
+                  {item.badge && (
+                    <span className={cn("rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider", badgeClass(item.badgeTone))}>
+                      {item.badge}
+                    </span>
+                  )}
+                </div>
+                <Value v={item.value} tone={itemTone} />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    );
+  }
+  const entries = Object.entries(obj as Record<string, unknown>).sort(
+    ([a], [b]) => (KEY_ORDER[a] ?? 999) - (KEY_ORDER[b] ?? 999),
+  );
   return (
     <ul className="space-y-3">
-      {Object.entries(obj as Record<string, unknown>).map(([k, v]) => (
-        <li key={k} className="flex gap-2.5">
-          <CircleDot className={cn("mt-0.5 h-3.5 w-3.5 shrink-0", dot)} />
-          <div className="min-w-0 flex-1">
-            <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">{label(k)}</div>
-            <Value v={v} tone={tone} />
-          </div>
-        </li>
-      ))}
+      {entries.map(([k, v]) => {
+        const isFallback = k.startsWith("fallback_");
+        return (
+          <li
+            key={k}
+            className={cn("flex gap-2.5", isFallback && "border-t border-zinc-200/80 pt-2.5 dark:border-white/10")}
+          >
+            <CircleDot className={cn("mt-0.5 h-3.5 w-3.5 shrink-0", isFallback ? "text-zinc-400 dark:text-zinc-500" : dot)} />
+            <div className="min-w-0 flex-1">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">{label(k)}</div>
+              <Value v={v} tone={isFallback ? "muted" : tone} />
+            </div>
+          </li>
+        );
+      })}
     </ul>
   );
 }

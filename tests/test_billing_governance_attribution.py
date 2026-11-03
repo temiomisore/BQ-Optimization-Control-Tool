@@ -1056,6 +1056,92 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
             f_unassigned = rules._map_reservation_rightsizing(row_unassigned, prices, c)
         self.assertIsNone(f_unassigned)
 
+    def test_180d_scan_on_young_reservation_reports_180d_scan_and_winner_first_proposed_state(self):
+        from optimizer import config as cfg_mod
+
+        c = cfg_mod.Config({
+            **cfg_mod._DEFAULTS,
+            "project_id": "acme-slot-admin",
+            "ops_dataset": "optimizer_ops",
+            "location": "US",
+            "jobs_view": "JOBS_BY_ORGANIZATION",
+            "pricing": {**cfg_mod._DEFAULTS["pricing"], "capacity_sizing_days": 180},
+        })
+        fake_tl_row = [{
+            "p50_all": 0.0,
+            "p95_all": 5.2,
+            "p50_busy": 1.9,
+            "p99_busy": 24.8,
+            "peak": 29.5,
+            "busy_minutes": 8_040.0,
+            "total_minutes": 43_200.0,   # 30d floor prevents 30/13 over-extrapolation
+            "observed_span_days": 13.2,  # Reservation created 13 days ago inside 180d scan
+            "slot_hours": 616.6,
+            "autoscale_slot_hours": 15_631.3,
+            "autoscale_slot_hours_above_baseline": 15_631.3,
+            "current_burst_slot_hours": 15_631.3,
+        }]
+        with mock.patch("optimizer.bq.query", return_value=fake_tl_row), \
+             mock.patch.object(rules, "slot_usage_timeline", return_value=[]):
+            prof = rules._slot_profile(
+                c, "acme-slot-admin", "us", days=180,
+                reservation_id="acme-slot-admin:us.shared-300-slot-res",
+                current_baseline=0,
+            )
+
+        self.assertIsNotNone(prof)
+        self.assertEqual(prof["scan_window_days"], 180)
+        self.assertEqual(prof["observed_span_days"], 13.0)
+        self.assertEqual(prof["active_days"], 30.0)
+        self.assertEqual(prof["source_label"], "JOBS_TIMELINE_ORG_180D")
+        # 30-day floor denominator keeps 616.6 slot-hours at 1.0x (never extrapolated by 30/13)
+        self.assertAlmostEqual(prof["slot_hours"], 616.6, places=1)
+
+        row_young = {
+            "admin_project": "acme-slot-admin",
+            "region": "us",
+            "reservation_name": "shared-300-slot-res",
+            "edition": "ENTERPRISE",
+            "baseline_slots": 0,
+            "autoscale_max_slots": 300,
+            "edition_total_baseline_slots": 0,
+            "committed_slots": 0,
+            "query_assignments": 1,
+            "assignment_ids": ["assign_shared_1"],
+            "assignees": ["PROJECT:acme-analytics"],
+            "reservation_id": "acme-slot-admin:us.shared-300-slot-res",
+            "active_days": 30.0,
+            "observed_span_days": 13.2,
+            "jobs_window": 130_537,
+            "jobs_30d": 130_537,
+            "slot_ms_30d": 616.6 * 3_600_000.0,
+            "bytes_billed_30d": 3.4032 * TIB,
+            "distinct_projects": 1,
+            "projects": ["acme-analytics"],
+        }
+        with mock.patch.object(rules, "_slot_profile", return_value=prof):
+            f = rules._map_reservation_rightsizing(row_young, self.PRICES, c)
+
+        self.assertIsNotNone(f)
+        self.assertEqual(f["proposed_change"]["selected_option"], 2)
+        self.assertEqual(f["evidence"]["recommended_option"], 2)
+        self.assertEqual(f["evidence"]["scan_window_days"], 180)
+        self.assertEqual(f["evidence"]["observed_active_days"], 13)
+        self.assertEqual(f["evidence"]["sizing_window_days"], 30)
+        self.assertEqual(f["evidence"]["capacity_sizing"]["source"], "JOBS_TIMELINE_ORG_180D")
+        self.assertEqual(f["evidence"]["capacity_sizing"]["scan_window_days"], 180)
+        self.assertEqual(f["evidence"]["capacity_sizing"]["observed_active_days"], 13)
+        self.assertIn("180d scan · 13d active, normalized over 30d", f["evidence"]["current_state"]["observed_demand"])
+
+        ps = f["evidence"]["proposed_state"]
+        self.assertIn("recommended_option_2", ps)
+        self.assertNotIn("option_2_alternative", ps)
+        # 0-baseline Option 1 must NEVER claim 1-Yr Commit or CUD lock-in
+        ps_blob = " ".join(str(v) for v in ps.values())
+        self.assertNotIn("1-Yr Commit", ps_blob)
+        self.assertIn("no CUD lock-in", ps_blob)
+        self.assertNotIn("1-Yr Commit", f["proposed_change"]["generated_ddl"])
+
 
 if __name__ == "__main__":
     unittest.main()

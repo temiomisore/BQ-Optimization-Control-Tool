@@ -10,7 +10,7 @@ import {
 } from "@/lib/utils";
 import { AnimatedNumber, Badge, Button, Dialog, Meter } from "./ui";
 import { CodeBlock, CopyButton } from "./Code";
-import { Rich, StateCompare } from "./StateCompare";
+import { Rich, StateCompare, type StateCompareItem } from "./StateCompare";
 import { RegionBadge } from "./RegionBadge";
 import { SlotSizingChart } from "./SlotSizingChart";
 
@@ -110,6 +110,7 @@ export function CardDetail({
 
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const hasOpt2 = !!pr.generated_ddl_option2;
+  const recOpt = Number(ev.recommended_option || pr.selected_option || 1);
   const headline = propSized
     ? 0
     : wCap
@@ -134,16 +135,24 @@ export function CardDetail({
       ];
 
   const bullets = useMemo(() => {
+    const scanDays = Number(ev.scan_window_days || ev.capacity_sizing?.scan_window_days || ev.sizing_window_days || 30);
+    const activeDays = Number(ev.observed_active_days ?? ev.capacity_sizing?.observed_active_days ?? ev.sizing_window_days ?? scanDays);
+    const normDays = Number(ev.sizing_window_days || 30);
+    const hasYoungSpan = activeDays > 0 && scanDays > activeDays + 5;
     if (w01) {
-      const base = pr.recommended_baseline_slots ?? data.w01?.baseline;
-      const max = pr.recommended_autoscale_max_slots ?? data.w01?.max;
+      const base = pr.recommended_baseline_slots ?? data.w01?.baseline ?? 0;
+      const max = pr.recommended_autoscale_max_slots ?? data.w01?.max ?? 50;
       const src = ev.capacity_sizing?.source || ev.capacity_sizing?.method;
-      const winDays = Number(ev.sizing_window_days || 30);
+      const winNote = hasYoungSpan ? `${scanDays}d scan · ${activeDays}d active` : `${scanDays}d history`;
+      const opt1Tag = num(base) === 0 ? "0-baseline PAYG" : "1-yr commit target";
+      const sizedLine = hasYoungSpan
+        ? `Scanned ${scanDays}d INFORMATION_SCHEMA history (${activeDays}d active${activeDays < normDays ? `, normalized over ${normDays}d` : ""}): baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`
+        : `Sized from ${scanDays}d historical slot telemetry: baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`;
       return [
-        `On-demand today: ${usd(ev.on_demand_spend_monthly)}/mo for ${num(ev.bytes_scanned_tib_30d).toLocaleString()} TiB/mo (${winDays}d history).`,
-        `Option 1 (1-yr commit target): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
+        `On-demand today: ${usd(ev.on_demand_spend_monthly)}/mo for ${num(ev.bytes_scanned_tib_30d).toLocaleString()} TiB/mo (${winNote}).`,
+        `Option 1 (${opt1Tag}): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
         `Option 2 (0-baseline autoscale): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
-        `Sized from historical slot telemetry: baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`,
+        sizedLine,
       ];
     }
     if (w03) {
@@ -152,15 +161,17 @@ export function CardDetail({
       const recBase = pr.recommended_baseline_slots ?? 0;
       const recMax = pr.recommended_autoscale_max_slots ?? 0;
       const src = ev.capacity_sizing?.source;
-      const winDays = Number(ev.sizing_window_days || 30);
+      const sizedLine = hasYoungSpan
+        ? `Scanned ${scanDays}d INFORMATION_SCHEMA history — reservation active for ${activeDays}d${activeDays < normDays ? `, normalized over ${normDays}d` : ""}${src ? ` (${src})` : ""}.`
+        : `${propSized ? "Verified" : "Sized"} from ${scanDays}d historical slot telemetry${src ? ` (${src})` : ""}.`;
       if (propSized) {
         const p50 = ev.capacity_sizing?.p50_slots_all_minutes ?? 0;
         const p99 = ev.capacity_sizing?.p99_slots_busy_minutes ?? 0;
         return [
           `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${num(curBase) + num(curAuto)} max · ${usd(ev.current_reservation_spend_monthly)}/mo).`,
-          `Observed ${winDays}d slot consumption (median ${p50} slots · p99 busy ${p99} slots) aligns with your provisioned baseline & autoscale limit.`,
+          `Observed slot consumption (median ${p50} slots · p99 busy ${p99} slots) aligns with your provisioned baseline & autoscale limit.`,
           `No capacity resize or billing migration is needed ($0/mo change).`,
-          `Verified from ${winDays}d INFORMATION_SCHEMA slot history${src ? ` (${src})` : ""}.`,
+          sizedLine,
         ];
       }
       const opt2Mode = ev.option_2_mode === "ON_DEMAND" ? "Return to On-Demand ($6.25/TiB)" : `0-baseline autoscale (0 → ${recMax})`;
@@ -168,7 +179,7 @@ export function CardDetail({
         `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${usd(ev.current_reservation_spend_monthly)}/mo).`,
         `Option 1 (${recBase} baseline → ${recMax} max): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
         `Option 2 (${opt2Mode}): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
-        `Sized from ${winDays}d historical slot telemetry${src ? ` (${src})` : ""}.`,
+        sizedLine,
       ];
     }
     if (w02) {
@@ -185,6 +196,184 @@ export function CardDetail({
     if (ev.dry_run_verification) out.push(`Dry run: ${ev.dry_run_verification}`);
     return out;
   }, [c, w01, w02, w03, propSized, ev, pr, data.w01]);
+
+  const comparePanels = useMemo<{ before: unknown; after: unknown }>(() => {
+    const cs = (ev.current_state || {}) as Record<string, unknown>;
+    const ps = (ev.proposed_state || {}) as Record<string, unknown>;
+    if (!wCap || propSized) {
+      return { before: ev.current_state, after: ev.proposed_state };
+    }
+
+    if (w03) {
+      const beforeItems: StateCompareItem[] = [];
+      if (cs.reservation) beforeItems.push({ label: "Reservation", value: cs.reservation });
+      if (cs.provisioned_capacity) beforeItems.push({ label: "Provisioned capacity", value: cs.provisioned_capacity });
+      if (cs.observed_demand) beforeItems.push({ label: "Observed demand", value: cs.observed_demand });
+      if (cs.commitment_coverage) beforeItems.push({ label: "Commitment coverage", value: cs.commitment_coverage });
+      if (cs.current_monthly_bill) beforeItems.push({ label: "Current monthly bill", value: cs.current_monthly_bill });
+      if (cs.cost_driver) beforeItems.push({ label: "Cost driver", value: cs.cost_driver });
+
+      const recBase = num(pr.recommended_baseline_slots);
+      const recMax = num(pr.recommended_autoscale_max_slots);
+      const recAutoAdd = Math.max(0, recMax - recBase);
+      const curMax = num(
+        ev.current_max_slots ??
+          num(ev.current_baseline_slots ?? pr.current_baseline_slots) +
+            num(ev.current_autoscale_add_slots ?? pr.current_autoscale_max_slots),
+      );
+      const curBill = num(ev.current_reservation_spend_monthly || ev.on_demand_spend_monthly);
+      const opt1Cost = num(ev.option_1_monthly_cost_usd);
+      const opt1Sav = num(ev.option_1_savings_usd);
+      const opt1Pct = curBill > 0 ? Math.round((opt1Sav / curBill) * 100) : 0;
+      const opt2Cost = num(ev.option_2_monthly_cost_usd);
+      const opt2Sav = num(ev.option_2_savings_usd);
+      const opt2Pct = curBill > 0 ? Math.round((opt2Sav / curBill) * 100) : 0;
+      const ed = String(ev.edition || pr.edition || "ENTERPRISE").toUpperCase();
+      const covBase = num(ev.covered_baseline_slots);
+      const commSlots = ev.committed_slots_edition;
+
+      let opt1Note = "1-Yr Commit target rate; note CUD lock-in";
+      if (commSlots && recBase < covBase && ed !== "STANDARD") {
+        opt1Note = "note active CUD lock-in until expiry";
+      } else if (ed === "STANDARD") {
+        opt1Note = "Standard PAYG";
+      } else if (recBase === 0) {
+        opt1Note =
+          curMax > recMax
+            ? `caps burst ${curMax} → ${recMax} slots · 0-baseline PAYG, no CUD lock-in`
+            : "0-baseline PAYG autoscale · no CUD lock-in";
+      }
+
+      const opt1Plan = String(
+        ps.recommended_option_1 ||
+          ps.option_1_rightsized ||
+          `${recBase} Baseline Slots + up to ${recAutoAdd} Autoscaling Slots = ${usd(opt1Cost, 2)} / month`,
+      );
+      const opt1SavTxt = `${usd(opt1Sav, 2)} / month (${opt1Pct}% efficiency gain · ${opt1Note})`;
+
+      const isOdMode = ev.option_2_mode === "ON_DEMAND";
+      const opt2Plan = String(
+        ps.recommended_option_2 ||
+          ps.option_2_alternative ||
+          (isOdMode
+            ? `Unassign QUERY workloads → On-Demand (${num(ev.bytes_scanned_tib_30d).toFixed(1)} TiB/mo @ $6.25/TiB) + zero '${ev.reservation_name || c.target_table}' capacity = ${usd(opt2Cost, 2)} / month`
+            : `0 Baseline Slots ($0 fixed) + Pure Autoscaling up to ${recMax} Slots = ${usd(opt2Cost, 2)} / month`),
+      );
+      const opt2SavTxt = isOdMode
+        ? `${usd(opt2Sav, 2)} / month (${opt2Pct}% efficiency gain · pay per TiB scanned, $0 idle slots)`
+        : `${usd(opt2Sav, 2)} / month (${opt2Pct}% efficiency gain · $0 idle cost overnight & no lock-in)`;
+
+      const afterItems: StateCompareItem[] =
+        opt === 2
+          ? [
+              {
+                label: isOdMode ? "Option 2 · Return to On-Demand" : "Option 2 · 0-Baseline Autoscale",
+                badge: recOpt === 2 ? "Recommended" : "Selected",
+                badgeTone: recOpt === 2 ? "emerald" : "sky",
+                value: opt2Plan,
+              },
+              { label: "Projected net savings", value: opt2SavTxt },
+              {
+                label: recOpt === 1 ? "Recommended option · Option 1" : "Fallback if staying on slots · Option 1",
+                badge: recOpt === 1 ? "Saves more" : undefined,
+                badgeTone: "amber",
+                muted: recOpt !== 1,
+                value: `${recBase} Baseline + ${recAutoAdd} Autoscale (${recMax} max) → ${usd(opt1Cost, 2)}/mo (${usd(opt1Sav, 2)}/mo savings · ${opt1Note})`,
+              },
+            ]
+          : [
+              {
+                label: `Option 1 · Right-size reservation (${recBase} + ${recAutoAdd} slots)`,
+                badge: recOpt === 1 ? "Recommended" : "Selected",
+                badgeTone: recOpt === 1 ? "emerald" : "sky",
+                value: opt1Plan,
+              },
+              { label: "Projected net savings", value: opt1SavTxt },
+              {
+                label: recOpt === 2 ? "Recommended option · Option 2" : "Alternative · Option 2",
+                badge: recOpt === 2 ? "Saves more" : undefined,
+                badgeTone: "emerald",
+                muted: recOpt !== 2,
+                value: `${isOdMode ? "Return to On-Demand" : `0-Baseline Autoscale (0 → ${recMax})`} → ${usd(opt2Cost, 2)}/mo (saves ${usd(opt2Sav, 2)}/mo · ${opt2Pct}% efficiency gain)`,
+              },
+            ];
+
+      return { before: beforeItems.length ? beforeItems : ev.current_state, after: afterItems };
+    }
+
+    // W-01: On-Demand -> Enterprise Edition Slots
+    const beforeW01: StateCompareItem[] = [];
+    if (cs.billing_model) beforeW01.push({ label: "Current billing model", value: cs.billing_model });
+    if (cs["30d_bytes_scanned"]) beforeW01.push({ label: "Observed scan volume", value: cs["30d_bytes_scanned"] });
+    if (cs.already_on_reservation) beforeW01.push({ label: "Already on reservation", value: cs.already_on_reservation });
+    if (cs.current_monthly_bill) beforeW01.push({ label: "Current monthly bill", value: cs.current_monthly_bill });
+    if (cs.cost_driver) beforeW01.push({ label: "Cost driver", value: cs.cost_driver });
+
+    const recBase = num(pr.recommended_baseline_slots ?? data.w01?.baseline);
+    const recMax = num(pr.recommended_autoscale_max_slots ?? data.w01?.max);
+    const recAutoAdd = Math.max(0, recMax - recBase);
+    const odBill = num(ev.on_demand_spend_monthly);
+    const opt1Cost = num(ev.option_1_monthly_cost_usd);
+    const opt1Sav = num(ev.option_1_savings_usd);
+    const opt1Pct = odBill > 0 ? Math.round((opt1Sav / odBill) * 100) : 0;
+    const opt2Cost = num(ev.option_2_monthly_cost_usd);
+    const opt2Sav = num(ev.option_2_savings_usd);
+    const opt2Pct = odBill > 0 ? Math.round((opt2Sav / odBill) * 100) : 0;
+    const opt1RateNote = recBase === 0 ? "0-baseline PAYG autoscale · no CUD lock-in" : "1-Yr Commit rate; note commitment lock-in";
+    const opt1Plan = String(
+      ps.recommended_option_1 ||
+        ps.option_1_steady_24x7 ||
+        `${recBase} Baseline Slots + up to ${recAutoAdd} Autoscaling Slots = ${usd(opt1Cost, 2)} / month`,
+    );
+    const opt2Plan = String(
+      ps.recommended_option_2 ||
+        ps.option_2_spiky_0_baseline ||
+        `0 Baseline Slots ($0 fixed) + Pure Autoscaling up to ${recMax} Slots = ${usd(opt2Cost, 2)} / month`,
+    );
+
+    const afterW01: StateCompareItem[] =
+      opt === 2
+        ? [
+            {
+              label: `Option 2 · 0-Baseline Pure Autoscale (0 → ${recMax})`,
+              badge: recOpt === 2 ? "Recommended" : "Selected",
+              badgeTone: recOpt === 2 ? "emerald" : "sky",
+              value: opt2Plan,
+            },
+            {
+              label: "Projected net savings",
+              value: `${usd(opt2Sav, 2)} / month (${opt2Pct}% efficiency gain · $0 idle cost overnight & no lock-in)`,
+            },
+            {
+              label: recOpt === 1 ? "Recommended option · Option 1" : "Alternative · Option 1 (Steady 24/7)",
+              badge: recOpt === 1 ? "Saves more" : undefined,
+              badgeTone: "emerald",
+              muted: recOpt !== 1,
+              value: `${recBase} Baseline + ${recAutoAdd} Autoscale → ${usd(opt1Cost, 2)}/mo (saves ${usd(opt1Sav, 2)}/mo · ${opt1RateNote})`,
+            },
+          ]
+        : [
+            {
+              label: `Option 1 · ${recBase} Baseline + Autoscale to ${recMax}`,
+              badge: recOpt === 1 ? "Recommended" : "Selected",
+              badgeTone: recOpt === 1 ? "emerald" : "sky",
+              value: opt1Plan,
+            },
+            {
+              label: "Projected net savings",
+              value: `${usd(opt1Sav, 2)} / month (${opt1Pct}% efficiency gain · ${opt1RateNote})`,
+            },
+            {
+              label: recOpt === 2 ? "Recommended option · Option 2" : "Alternative · Option 2 (0-Baseline)",
+              badge: recOpt === 2 ? "Saves more" : undefined,
+              badgeTone: "emerald",
+              muted: recOpt !== 2,
+              value: `0-Baseline Pure Autoscale (0 → ${recMax}) → ${usd(opt2Cost, 2)}/mo (saves ${usd(opt2Sav, 2)}/mo · no lock-in)`,
+            },
+          ];
+
+    return { before: beforeW01.length ? beforeW01 : ev.current_state, after: afterW01 };
+  }, [wCap, propSized, w03, ev, pr, opt, recOpt, c.target_table, data.w01]);
 
   const approve = () =>
     decide.mutate({
@@ -268,7 +457,14 @@ export function CardDetail({
                       opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
                     )}
                   >
-                    {optLabels[o - 1]}
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span>{optLabels[o - 1]}</span>
+                      {wCap && o === recOpt && (
+                        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-300">
+                          Recommended
+                        </span>
+                      )}
+                    </div>
                     {wCap && (
                       <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
                         est. {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
@@ -346,7 +542,7 @@ export function CardDetail({
 
         {(ev.current_state || ev.proposed_state) && (
           <Section title="Before vs. after">
-            <StateCompare before={ev.current_state} after={ev.proposed_state} />
+            <StateCompare before={comparePanels.before} after={comparePanels.after} />
           </Section>
         )}
 

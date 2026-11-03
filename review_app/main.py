@@ -170,7 +170,19 @@ def _hydrate_capacity_sizing(
         ev["capacity_sizing"] = cap
         return cap
 
-    days = max(7, min(180, int(cap.get("sizing_window_days") or ev.get("sizing_window_days") or 30)))
+    days = max(
+        7,
+        min(
+            180,
+            int(
+                cap.get("scan_window_days")
+                or ev.get("scan_window_days")
+                or cap.get("sizing_window_days")
+                or ev.get("sizing_window_days")
+                or 30
+            ),
+        ),
+    )
     proj = str(target_project or c.get("project_id") or "").strip().lower()
     reg = str(target_region or c.get("location") or "us").strip().lower()
     if reg.startswith("region-"):

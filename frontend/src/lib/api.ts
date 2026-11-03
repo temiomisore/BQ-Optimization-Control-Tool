@@ -109,6 +109,8 @@ export interface CapacityTimelinePoint {
 /** evidence.capacity_sizing: minute-by-minute slot telemetry backing W-01 / W-03 sizing. */
 export interface CapacitySizing {
   source?: string;
+  scan_window_days?: number;
+  observed_active_days?: number;
   sizing_window_days?: number;
   method?: string;
   current_baseline_slots?: number;

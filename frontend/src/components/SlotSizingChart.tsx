@@ -169,6 +169,12 @@ export function SlotSizingChart({
   const busyPct = sizing?.busy_minutes_pct != null ? Number(sizing.busy_minutes_pct) : null;
   const idlePct = busyPct != null ? Math.max(0, Math.round((100 - busyPct) * 10) / 10) : null;
   const days = Number(sizing?.sizing_window_days || windowDays || 30);
+  const scanDays = Number(sizing?.scan_window_days || days);
+  const obsActiveDays = sizing?.observed_active_days != null ? Number(sizing.observed_active_days) : null;
+  const winBadge =
+    obsActiveDays != null && obsActiveDays > 0 && scanDays > obsActiveDays + 5
+      ? `${scanDays}d scan (${obsActiveDays}d active)`
+      : `${scanDays}d scan`;
 
   const realTimeline = sizing?.timeline && sizing.timeline.length >= 2 ? sizing.timeline : null;
   const points = useMemo<CapacityTimelinePoint[]>(() => {
@@ -710,7 +716,7 @@ export function SlotSizingChart({
           )}
           {!compact && (
             <span className="font-mono text-[10px] text-zinc-500">
-              {days}d window{busyPct != null ? ` · ${busyPct}% active / ${idlePct}% idle` : ""}
+              {winBadge}{busyPct != null ? ` · ${busyPct}% active / ${idlePct}% idle` : ""}
             </span>
           )}
         </div>

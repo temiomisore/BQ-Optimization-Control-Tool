@@ -860,6 +860,7 @@ def _sql_editions_fit(c: Config) -> str:
                  LEAST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, {days}.0),
                  LEAST({days}.0, 30.0)
                ) AS active_days,
+               ROUND(LEAST(GREATEST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, 1.0), {days}.0), 1) AS observed_span_days,
                SUM(IF(billing_mode = 'ON_DEMAND', total_bytes_billed, 0)) AS raw_od_bytes,
                SUM(IF(billing_mode = 'ON_DEMAND', total_slot_ms, 0))      AS raw_od_slot_ms,
                SUM(total_bytes_billed)                                    AS raw_total_bytes,
@@ -873,6 +874,7 @@ def _sql_editions_fit(c: Config) -> str:
       SELECT project_id,
              region,
              ROUND(active_days, 1)                                                       AS active_days,
+             observed_span_days,
              raw_od_bytes * (30.0 / active_days)                                         AS od_bytes_billed_30d,
              raw_od_slot_ms * (30.0 / active_days)                                       AS od_slot_ms_30d,
              raw_total_bytes * (30.0 / active_days)                                      AS total_bytes_billed_30d,
@@ -1184,6 +1186,7 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
                 (SELECT MAX(slots) FROM busy)                                     AS peak,
                 (SELECT COUNT(*) FROM busy)                                       AS busy_minutes,
                 (SELECT COUNT(*) FROM all_minutes)                                AS total_minutes,
+                (SELECT ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(minute), SECOND) / 86400.0, 1) FROM busy) AS observed_span_days,
                 (SELECT SUM(slots) / 60.0 FROM busy)                              AS slot_hours,
                 (SELECT SUM(CEIL(slots / 50) * 50) / 60.0 FROM busy)              AS autoscale_slot_hours,
                 (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50) / 60.0
@@ -1240,6 +1243,7 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
                 (SELECT MAX(slots) FROM busy)                                    AS peak,
                 (SELECT COUNT(*) * 60 FROM busy)                                 AS busy_minutes,
                 (SELECT COUNT(*) * 60 FROM all_hours)                            AS total_minutes,
+                (SELECT ROUND(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(hour_ts), SECOND) / 86400.0, 1) FROM busy) AS observed_span_days,
                 (SELECT SUM(slots) FROM busy)                                    AS slot_hours,
                 (SELECT SUM(CEIL(slots / 50) * 50) FROM busy)                    AS autoscale_slot_hours,
                 (SELECT SUM(CEIL(GREATEST(b.slots - base.baseline, 0) / 50) * 50)
@@ -1261,6 +1265,12 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
     # Normalize multi-month (up to 180d) cumulative slot-hours to a 30-day month (43,200 mins)
     month_scale = 43200.0 / max(total_mins, min_mins)
     active_d = max(1, int(round(total_mins / 1440.0)))
+    obs_span_raw = r.get("observed_span_days")
+    obs_span_d = (
+        max(1, min(d, int(round(float(obs_span_raw)))))
+        if obs_span_raw is not None and float(r.get("busy_minutes") or 0) > 0
+        else active_d
+    )
     out = {
         "p50_all": float(r.get("p50_all") or 0.0),
         "p95_all": float(r.get("p95_all") or 0.0),
@@ -1270,13 +1280,14 @@ def _slot_profile(c: Config, proj: str, region: str, days: int = 30, *,
         "busy_minutes": float(r.get("busy_minutes") or 0.0),
         "total_minutes": total_mins,
         "active_days": float(active_d),
+        "scan_window_days": d,
+        "observed_span_days": float(obs_span_d),
         "slot_hours": float(r.get("slot_hours") or 0.0) * month_scale,
         "autoscale_slot_hours": float(r.get("autoscale_slot_hours") or 0.0) * month_scale,
         "autoscale_slot_hours_above_baseline": float(r.get("autoscale_slot_hours_above_baseline") or 0.0) * month_scale,
         "current_burst_slot_hours": float(r.get("current_burst_slot_hours") or 0.0) * month_scale,
+        "source_label": f"{src_prefix}_{d}D",
     }
-    if d != 30 or src_prefix != "JOBS_TIMELINE":
-        out["source_label"] = f"{src_prefix}_{active_d}D"
     tl = slot_usage_timeline(c, proj, region, days=d, reservation_id=reservation_id)
     if tl:
         out["timeline"] = tl
@@ -1301,6 +1312,17 @@ def size_capacity(profile: dict | None) -> tuple[int, int, str]:
 def _rate_txt(x: float) -> str:
     """$ rate for display: 0.048 -> '$0.048', 0.06 -> '$0.06', 6.25 -> '$6.25'."""
     return f"${float(x):.4g}"
+
+
+def _capacity_window_desc(scan_days: int, norm_days: int, span_days: int) -> str:
+    """Human-readable telemetry window phrase distinguishing lookback scan vs active resource age."""
+    if scan_days > span_days + 5 and span_days < norm_days:
+        return f"{scan_days}d scan · {span_days}d active, normalized over {norm_days}d"
+    if scan_days > span_days + 5:
+        return f"{scan_days}d scan · {span_days}d active, normalized to 30d"
+    if norm_days != 30:
+        return f"{norm_days}d history normalized to 30d"
+    return "30d"
 
 
 def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
@@ -1340,6 +1362,10 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     rec_baseline, rec_max, sizing_source = size_capacity(profile)
     rec_autoscale_add = rec_max - rec_baseline
     profile_days = max(1, int(round(_f((profile or {}).get("active_days"), float(obs_days)))))
+    span_raw = (profile or {}).get("observed_span_days") if profile else None
+    if span_raw is None:
+        span_raw = row.get("observed_span_days")
+    actual_span_days = max(1, min(days, int(round(_f(span_raw, float(obs_days))))))
 
     commit_rate = pricing.rate(prices, "slot_hour_usd_enterprise_1yr")
     payg_rate = pricing.rate(prices, "slot_hour_usd_enterprise")
@@ -1402,24 +1428,32 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
     estimator_url = _slot_estimator_url(proj, region)
 
+    opt1_base_ddl_note = (
+        "0 Slots ($0.00/mo fixed — no CUD commitment needed)"
+        if rec_baseline == 0
+        else f"{rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ {cr}/slot-hr 1-Yr Commit)"
+    )
     ddl_opt1 = (
-        f"-- OPTION 1 (Recommended for Steady 24/7 Enterprise Workloads)\n"
-        f"--   Baseline: {rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ {cr}/slot-hr 1-Yr Commit)\n"
+        f"-- OPTION 1 ({'Recommended' if recommended == 1 else 'Alternative'} — Baseline + Autoscaling Enterprise Pool)\n"
+        f"--   Baseline: {opt1_base_ddl_note}\n"
         f"--   Autoscaling Burst: +{rec_autoscale_add} Slots up to {rec_max} Max (${autoscale_monthly_cost:,.2f}/mo est. burst @ {pr_}/slot-hr)\n"
         f"--   Total Projected Spend: ${opt1_cost:,.2f}/mo (Est. ${opt1_savings:,.2f}/mo bill optimization vs On-Demand)\n"
-        f"--   Note: 1-Yr/3-Yr commitments carry a lock-in period; verify in GCP Slot Estimator before purchasing CUDs manually.\n"
-        f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-prod-pool`\n"
-        f"OPTIONS (\n"
-        f"  edition = 'ENTERPRISE',\n"
-        f"  slot_capacity = {rec_baseline},\n"
-        f"  autoscale_max_slots = {rec_autoscale_add}  -- burst on top of baseline -> {rec_max} max\n"
-        f");\n\n"
-        f"-- Assign Project '{proj}' to the Reservation\n"
-        f"CREATE ASSIGNMENT `{proj}.region-{region.lower()}.enterprise-prod-pool.assign-project`\n"
-        f"OPTIONS (\n"
-        f"  assignee = 'projects/{proj}',\n"
-        f"  job_type = 'QUERY'\n"
-        f");"
+        + (
+            "--   Note: 1-Yr/3-Yr commitments carry a lock-in period; verify in GCP Slot Estimator before purchasing CUDs manually.\n"
+            if rec_baseline > 0 else ""
+        )
+        + f"CREATE RESERVATION `{proj}.region-{region.lower()}.enterprise-prod-pool`\n"
+          f"OPTIONS (\n"
+          f"  edition = 'ENTERPRISE',\n"
+          f"  slot_capacity = {rec_baseline},\n"
+          f"  autoscale_max_slots = {rec_autoscale_add}  -- burst on top of baseline -> {rec_max} max\n"
+          f");\n\n"
+          f"-- Assign Project '{proj}' to the Reservation\n"
+          f"CREATE ASSIGNMENT `{proj}.region-{region.lower()}.enterprise-prod-pool.assign-project`\n"
+          f"OPTIONS (\n"
+          f"  assignee = 'projects/{proj}',\n"
+          f"  job_type = 'QUERY'\n"
+          f");"
     )
 
     ddl_opt2 = (
@@ -1471,13 +1505,15 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         slot_telemetry_plausible=not implausible,
         reservation_jobs_excluded_30d=resv_jobs,
         sizing_window_days=obs_days,
+        scan_window_days=days,
+        observed_active_days=actual_span_days,
         pool_key=pool_key, pool_spend_usd=on_demand_cost)
     if floors:
         math["demo_floor_applied"] = True
         math["demo_floor_inputs"] = floors
         risk_notes.append("DEMO_SYNTHETIC_FLOOR_APPLIED")
 
-    win_desc = f"{obs_days}d history normalized to 30d" if obs_days != 30 else "30d"
+    win_desc = _capacity_window_desc(days, obs_days, actual_span_days)
     current_state = {
         "billing_model": f"On-Demand ({odr} per TiB scanned)",
         "30d_bytes_scanned": f"{bytes_tib:,.1f} TiB/mo billed on-demand ({win_desc})",
@@ -1488,6 +1524,32 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         current_state["already_on_reservation"] = (
             f"{resv_jobs} jobs/mo already ran on a reservation "
             f"({', '.join(row.get('reservations') or []) or 'reservation'}); they are excluded here")
+
+    opt1_plan_desc = (
+        f"{rec_baseline} Baseline Slots (${baseline_monthly_cost:,.0f}/mo) + up to "
+        f"{rec_autoscale_add} Autoscaling Slots (${autoscale_monthly_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
+    )
+    opt1_rate_note = (
+        "0-baseline PAYG autoscale · no CUD lock-in"
+        if rec_baseline == 0
+        else "1-Yr Commit rate; note commitment lock-in"
+    )
+    opt1_sav_desc = f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain · {opt1_rate_note})"
+    opt2_plan_desc = f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month"
+    opt2_sav_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)"
+    w01_proposed_state = (
+        {
+            "recommended_option_1": opt1_plan_desc,
+            "projected_net_savings": opt1_sav_desc,
+            "fallback_option_2": f"{opt2_plan_desc} (saves ${opt2_savings:,.2f}/mo · $0 idle cost & no lock-in)",
+        }
+        if recommended == 1
+        else {
+            "recommended_option_2": opt2_plan_desc,
+            "projected_net_savings": opt2_sav_desc,
+            "fallback_option_1": f"{opt1_plan_desc} (saves ${opt1_savings:,.2f}/mo · {opt1_rate_note})",
+        }
+    )
 
     return {
         "rule_id": "W-01",
@@ -1517,10 +1579,14 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
             "option_2_label": f"Option 2 · 0-Baseline Pure Autoscale (0 → {rec_max})",
             "recommended_option": recommended,
             "reservation_jobs_30d": resv_jobs,
+            "scan_window_days": days,
+            "observed_active_days": actual_span_days,
             "sizing_window_days": obs_days,
             "slot_estimator_url": estimator_url,
             "capacity_sizing": {
                 "source": sizing_source,
+                "scan_window_days": days,
+                "observed_active_days": actual_span_days,
                 "sizing_window_days": profile_days,
                 "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
                            "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
@@ -1539,13 +1605,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
             },
             "recommended_pricing_model": "BigQuery Enterprise Edition (Option 1: Baseline+Autoscale OR Option 2: 0-Baseline Autoscale)",
             "current_state": current_state,
-            "proposed_state": {
-                "option_1_steady_24x7": (f"{rec_baseline} Baseline Slots (${baseline_monthly_cost:,.0f}/mo) + up to "
-                                         f"{rec_autoscale_add} Autoscaling Slots (${autoscale_monthly_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"),
-                "option_1_net_savings": f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain · 1-Yr Commit rate; note commitment lock-in)",
-                "option_2_spiky_0_baseline": f"0 Baseline Slots ($0 fixed) + Pure Autoscaling up to {rec_max} Slots = ${opt2_cost:,.2f} / month",
-                "option_2_net_savings": f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · $0 idle cost overnight & no lock-in)",
-            },
+            "proposed_state": w01_proposed_state,
             "savings_math": math,
         },
         "observation_days": obs_days,
@@ -1598,6 +1658,7 @@ def _sql_reservation_rightsizing(c: Config) -> str:
                  LEAST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, {days}.0),
                  LEAST({days}.0, 30.0)
                )                                                              AS active_days,
+               ROUND(LEAST(GREATEST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), MIN(creation_time), SECOND) / 86400.0, 1.0), {days}.0), 1) AS observed_span_days,
                COUNT(*)                                                       AS raw_jobs,
                SUM(total_slot_ms)                                             AS raw_slot_ms,
                SUM(total_bytes_billed)                                        AS raw_bytes_billed,
@@ -1663,6 +1724,7 @@ def _sql_reservation_rightsizing(c: Config) -> str:
              a.assignees                                                         AS assignees,
              u.reservation_id                                                    AS reservation_id,
              ROUND(COALESCE(u.active_days, {days}.0), 1)                         AS active_days,
+             ROUND(COALESCE(u.observed_span_days, 0.0), 1)                       AS observed_span_days,
              COALESCE(u.raw_jobs, 0)                                             AS jobs_window,
              IF(COALESCE(u.raw_jobs, 0) > 0,
                 GREATEST(1, CAST(ROUND(u.raw_jobs * (30.0 / COALESCE(u.active_days, 30.0))) AS INT64)),
@@ -1800,10 +1862,13 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             "p50_all": 0.0, "p95_all": 0.0, "p99_busy": 0.0, "peak": 0.0,
             "busy_minutes": 0.0, "total_minutes": float(obs_days) * 1440.0,
             "active_days": float(obs_days),
+            "scan_window_days": days,
+            "observed_span_days": 0.0,
             "slot_hours": 0.0, "autoscale_slot_hours": 0.0,
             "autoscale_slot_hours_above_baseline": 0.0, "current_burst_slot_hours": 0.0,
         }
-        rec_baseline, rec_max, sizing_source = 0, 50, f"IDLE_RESERVATION_{obs_days}D"
+        rec_baseline, rec_max, sizing_source = 0, 50, f"IDLE_RESERVATION_{days}D"
+        actual_span_days = 0
     else:
         profile = _slot_profile(
             c, admin_proj, region, days=days,
@@ -1817,8 +1882,12 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             rec_max = max(_ceil50(max(avg_slots * 3.0, float(rec_baseline + 50))), 50)
             if cur_max > 0:
                 rec_max = min(rec_max, max(cur_max, rec_baseline + 50))
-            sizing_source = f"JOBS_SUMMARY_{obs_days}D"
+            sizing_source = f"JOBS_SUMMARY_{days}D"
             profile = None
+        span_raw = (profile or {}).get("observed_span_days") if profile else None
+        if span_raw is None:
+            span_raw = meta.get("observed_span_days")
+        actual_span_days = max(1, min(days, int(round(_f(span_raw, float(obs_days))))))
 
     if edition == "STANDARD":
         rec_max = min(rec_max, 1600)
@@ -2012,15 +2081,21 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         opt2_state_desc = ""
         opt2_savings_desc = ""
     else:
+        opt1_base_ddl = (
+            "0 Baseline ($0.00/mo fixed)"
+            if rec_baseline == 0
+            else f"{rec_baseline} Baseline ({cr}/slot-hr {cud_rate_lbl})"
+        )
+        show_cud_ddl_note = edition != "STANDARD" and (rec_baseline > 0 or bool(comm_slots and covered_baseline > 0))
         ddl_opt1 = (
-            f"-- OPTION 1 (Right-Size {edition} Reservation '{res_name}')\n"
+            f"-- OPTION 1 ({'Recommended' if recommended == 1 else 'Fallback — Stay on Slots'} · Right-Size {edition} Reservation '{res_name}')\n"
             f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
-            f"--   Proposed: {rec_baseline} Baseline ({cr}/slot-hr {cud_rate_lbl}) + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
+            f"--   Proposed: {opt1_base_ddl} + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
             f"--   Estimated Bill Optimization: ${opt1_savings:,.2f}/mo ({opt1_pct}% improvement)\n"
             + (
                 "--   Note: 1-Yr/3-Yr capacity commitments carry a lock-in period and are never purchased automatically;\n"
                 "--   verify commitment coverage in the GCP Console Slot Estimator before buying or renewing CUDs.\n"
-                if edition != "STANDARD" else ""
+                if show_cud_ddl_note else ""
             )
             + f"ALTER RESERVATION `{res_fq}`\n"
               f"SET OPTIONS (\n"
@@ -2089,6 +2164,8 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         recommended_option=recommended,
         option_2_mode=option_2_mode,
         sizing_window_days=obs_days,
+        scan_window_days=days,
+        observed_active_days=actual_span_days,
         covered_baseline_slots=covered_baseline,
         uncovered_baseline_slots=uncovered_baseline,
         committed_slots_edition=comm_slots,
@@ -2096,7 +2173,11 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         pool_spend_usd=cur_monthly_cost,
     )
 
-    win_desc = f"{obs_days}d history normalized to 30d" if obs_days != 30 else "30d"
+    win_desc = (
+        _capacity_window_desc(days, obs_days, actual_span_days)
+        if actual_span_days > 0
+        else f"{days}d scan · 0 active jobs"
+    )
     current_state = {
         "reservation": f"{res_fq} ({edition})",
         "provisioned_capacity": f"{cur_baseline} Baseline Slots + {cur_autoscale_add} Autoscale Slots ({cur_max} max)",
@@ -2144,19 +2225,35 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         rec_pricing_model = (
             f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"
         )
-        proposed_state = {
-            "option_1_rightsized": (
-                f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
-                f"{rec_autoscale_add} Autoscaling Slots (${opt1_autoscale_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
-            ),
-            "option_1_net_savings": (
-                f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain"
-                + (" · note active CUD lock-in until expiry)" if (comm_slots and rec_baseline < covered_baseline and edition != "STANDARD")
-                   else (" · Standard PAYG)" if edition == "STANDARD" else " · 1-Yr Commit target rate; note CUD lock-in)"))
-            ),
-            "option_2_alternative": opt2_state_desc,
-            "option_2_net_savings": opt2_savings_desc,
-        }
+        opt1_state_desc = (
+            f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
+            f"{rec_autoscale_add} Autoscaling Slots (${opt1_autoscale_cost:,.0f}/mo) = ${opt1_cost:,.2f} / month"
+        )
+        if comm_slots and rec_baseline < covered_baseline and edition != "STANDARD":
+            opt1_sav_note = "note active CUD lock-in until expiry"
+        elif edition == "STANDARD":
+            opt1_sav_note = "Standard PAYG"
+        elif rec_baseline == 0:
+            opt1_sav_note = (
+                f"caps burst {cur_max} → {rec_max} slots · 0-baseline PAYG, no CUD lock-in"
+                if cur_max > rec_max
+                else "0-baseline PAYG autoscale · no CUD lock-in"
+            )
+        else:
+            opt1_sav_note = "1-Yr Commit target rate; note CUD lock-in"
+        opt1_savings_desc = f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain · {opt1_sav_note})"
+        if recommended == 2:
+            proposed_state = {
+                "recommended_option_2": opt2_state_desc,
+                "projected_net_savings": opt2_savings_desc,
+                "fallback_option_1_stay_on_slots": f"{opt1_state_desc} ({opt1_savings_desc})",
+            }
+        else:
+            proposed_state = {
+                "recommended_option_1": opt1_state_desc,
+                "projected_net_savings": opt1_savings_desc,
+                "fallback_option_2": f"{opt2_state_desc} ({opt2_savings_desc})",
+            }
 
     proposed_change: dict[str, object] = {
         "action": "RESIZE_RESERVATION",
@@ -2212,10 +2309,14 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             "option_2_label": opt2_label,
             "option_2_mode": option_2_mode,
             "recommended_option": recommended,
+            "scan_window_days": days,
+            "observed_active_days": actual_span_days,
             "sizing_window_days": obs_days,
             "slot_estimator_url": estimator_url,
             "capacity_sizing": {
                 "source": sizing_source,
+                "scan_window_days": days,
+                "observed_active_days": actual_span_days,
                 "sizing_window_days": profile_days,
                 "method": ("baseline = median per-minute slots over ALL minutes (idle = 0), rounded down to 50; "
                            "max = p99 of busy-minute slots, rounded up to 50 (min 50, <= 2x peak)"),
