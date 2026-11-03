@@ -1422,7 +1422,12 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     implausible = slot_h_per_tib is not None and slot_h_per_tib < _MIN_PLAUSIBLE_SLOT_H_PER_TIB
 
     # Claim the cheaper option, and pre-select it so the executor applies what the card claims.
+    # Display rank always numbers the recommended winner "Option 1" and the alternative "Option 2",
+    # while `selected_option` / `recommended_option` (1 = Baseline+Autoscale, 2 = 0-Baseline) identify
+    # the concrete execution plan for `executor/class3.py`.
     recommended = 1 if opt1_savings >= opt2_savings else 2
+    p1_rank = 1 if recommended == 1 else 2
+    p2_rank = 1 if recommended == 2 else 2
     gross = opt1_savings if recommended == 1 else opt2_savings
     is_editions_better = gross > 0
     cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
@@ -1434,7 +1439,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         else f"{rec_baseline} Slots 24/7 (${baseline_monthly_cost:,.2f}/mo @ {cr}/slot-hr 1-Yr Commit)"
     )
     ddl_opt1 = (
-        f"-- OPTION 1 ({'Recommended' if recommended == 1 else 'Alternative'} — Baseline + Autoscaling Enterprise Pool)\n"
+        f"-- OPTION {p1_rank} ({'Recommended' if recommended == 1 else 'Alternative'} — Baseline + Autoscaling Enterprise Pool)\n"
         f"--   Baseline: {opt1_base_ddl_note}\n"
         f"--   Autoscaling Burst: +{rec_autoscale_add} Slots up to {rec_max} Max (${autoscale_monthly_cost:,.2f}/mo est. burst @ {pr_}/slot-hr)\n"
         f"--   Total Projected Spend: ${opt1_cost:,.2f}/mo (Est. ${opt1_savings:,.2f}/mo bill optimization vs On-Demand)\n"
@@ -1457,7 +1462,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     )
 
     ddl_opt2 = (
-        f"-- OPTION 2 (Recommended for Spiky / Daytime-Only Workloads — $0 Idle Cost)\n"
+        f"-- OPTION {p2_rank} ({'Recommended' if recommended == 2 else 'Alternative'} — 0-Baseline Pure Autoscaling Pool · $0 Idle Cost)\n"
         f"--   Baseline: 0 Slots ($0.00/mo fixed cost when no queries are running)\n"
         f"--   Pure Autoscaling Burst: Scales 0 -> {rec_max} Slots on demand (~{opt2_billed_slot_hours:,.0f} burst slot-hrs @ {pr_}/slot-hr PAYG)\n"
         f"--   Total Projected Spend: ${opt2_cost:,.2f}/mo (Est. ${opt2_savings:,.2f}/mo bill optimization vs On-Demand · No Annual Lock-In)\n"
@@ -1483,8 +1488,13 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
     if not profile:
         risk_notes.append("AUTOSCALE_COST_NOT_CHECKED_AGAINST_JOBS_TIMELINE")
     opt_cost = opt1_cost if recommended == 1 else opt2_cost
+    win_plan_lbl = (
+        f"{rec_baseline}-Slot Baseline + Autoscale"
+        if recommended == 1
+        else f"0-Baseline Pure Autoscale 0→{rec_max}"
+    )
     formula = (f"on-demand {bytes_tib:,.1f} TiB x {odr}/TiB = ${on_demand_cost:,.2f}/mo today; "
-               f"Option {recommended} = ${opt_cost:,.2f}/mo "
+               f"Option 1 ({win_plan_lbl}) = ${opt_cost:,.2f}/mo "
                + (f"({rec_baseline} baseline slots x 730 h x {cr} + "
                   f"{autoscale_burst_hours:,.0f} burst slot-h x {pr_}; {burst_note})" if recommended == 1 else
                   f"({opt2_billed_slot_hours:,.0f} billed slot-h x {pr_}; {opt2_note})")
@@ -1545,11 +1555,14 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         }
         if recommended == 1
         else {
-            "recommended_option_2": opt2_plan_desc,
+            "recommended_option_1": opt2_plan_desc,
             "projected_net_savings": opt2_sav_desc,
-            "fallback_option_1": f"{opt1_plan_desc} (saves ${opt1_savings:,.2f}/mo · {opt1_rate_note})",
+            "fallback_option_2": f"{opt1_plan_desc} (saves ${opt1_savings:,.2f}/mo · {opt1_rate_note})",
         }
     )
+    p1_summary = f"{rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain)"
+    p2_summary = f"0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → est. ${opt2_savings:,.0f}/mo efficiency gain)"
+    first_summary, second_summary = (p1_summary, p2_summary) if recommended == 1 else (p2_summary, p1_summary)
 
     return {
         "rule_id": "W-01",
@@ -1562,9 +1575,7 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
         "target_region": region,
         "finding_summary": (
             f"On-demand workload billed {bytes_tib:,.0f} TiB/mo ({win_desc}, ${on_demand_cost:,.0f}/mo). "
-            f"Option 1: {rec_baseline}-Slot Baseline + Autoscaling to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
-            f"OR Option 2: 0-Baseline Pure Autoscaling to {rec_max} (${opt2_cost:,.0f}/mo → est. ${opt2_savings:,.0f}/mo efficiency gain). "
-            f"Recommended: Option {recommended}."
+            f"Option 1 (Recommended): {first_summary} OR Option 2: {second_summary}."
         ),
         "evidence": {
             "bytes_scanned_tib_30d": round(bytes_tib, 1),
@@ -1573,10 +1584,10 @@ def _map_editions_fit(row: dict, prices: dict, c: Config) -> Finding | None:
             "estimated_editions_spend_monthly": opt_cost,
             "option_1_monthly_cost_usd": opt1_cost,
             "option_1_savings_usd": opt1_savings,
-            "option_1_label": f"Option 1 · {rec_baseline} Baseline + Autoscale to {rec_max}",
+            "option_1_label": f"Option {p1_rank} · {rec_baseline} Baseline + Autoscale to {rec_max}",
             "option_2_monthly_cost_usd": opt2_cost,
             "option_2_savings_usd": opt2_savings,
-            "option_2_label": f"Option 2 · 0-Baseline Pure Autoscale (0 → {rec_max})",
+            "option_2_label": f"Option {p2_rank} · 0-Baseline Pure Autoscale (0 → {rec_max})",
             "recommended_option": recommended,
             "reservation_jobs_30d": resv_jobs,
             "scan_window_days": days,
@@ -1952,15 +1963,14 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             and od_equiv_cost < cur_monthly_cost):
         option_2_mode = "ON_DEMAND"
         opt2_cost = od_equiv_cost
-        opt2_label = f"Option 2 · Return to On-Demand ({_rate_txt(on_demand_rate)}/TiB)"
+        opt2_desc_core = f"Return to On-Demand ({_rate_txt(on_demand_rate)}/TiB)"
     else:
         option_2_mode = "PURE_AUTOSCALE"
         opt2_cost = pure_autoscale_cost
-        opt2_label = f"Option 2 · 0-Baseline Pure Autoscale (0 → {rec_max})"
+        opt2_desc_core = f"0-Baseline Pure Autoscale (0 → {rec_max})"
 
     opt2_savings = round(max(cur_monthly_cost - opt2_cost, 0.0), 2)
     opt2_pct = int(round((opt2_savings / max(cur_monthly_cost, 1.0)) * 100))
-    opt1_label = f"Option 1 · {rec_baseline} Baseline + Autoscale to {rec_max}"
 
     # When current reservation is already within $10/mo of optimal:
     # - Unassigned / idle 0-baseline leftover pools (query_assignments == 0 or jobs_window == 0) stay suppressed.
@@ -1992,19 +2002,25 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             opt1_pct = 0
             opt2_savings = 0.0
             opt2_pct = 0
-            opt1_label = f"Current Sizing · {cur_baseline} Baseline + Autoscale to {cur_max} (Optimal)"
 
     if properly_sized:
         recommended = 1
+        p1_rank, p2_rank = 1, 2
         gross = 0.0
         opt_cost = cur_monthly_cost
+        opt1_label = f"Current Sizing · {cur_baseline} Baseline + Autoscale to {cur_max} (Optimal)"
+        opt2_label = f"Option 2 · {opt2_desc_core}"
     else:
         if opt1_savings != opt2_savings:
             recommended = 1 if opt1_savings > opt2_savings else 2
         else:
             recommended = 1 if opt1_cost <= opt2_cost else 2
+        p1_rank = 1 if recommended == 1 else 2
+        p2_rank = 1 if recommended == 2 else 2
         gross = opt1_savings if recommended == 1 else opt2_savings
         opt_cost = opt1_cost if recommended == 1 else opt2_cost
+        opt1_label = f"Option {p1_rank} · {rec_baseline} Baseline + Autoscale to {rec_max}"
+        opt2_label = f"Option {p2_rank} · {opt2_desc_core}"
 
     cr, pr_, odr = _rate_txt(commit_rate), _rate_txt(payg_rate), _rate_txt(on_demand_rate)
     estimator_url = _slot_estimator_url(admin_proj, region, edition=edition)
@@ -2088,7 +2104,7 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         )
         show_cud_ddl_note = edition != "STANDARD" and (rec_baseline > 0 or bool(comm_slots and covered_baseline > 0))
         ddl_opt1 = (
-            f"-- OPTION 1 ({'Recommended' if recommended == 1 else 'Fallback — Stay on Slots'} · Right-Size {edition} Reservation '{res_name}')\n"
+            f"-- OPTION {p1_rank} ({'Recommended' if recommended == 1 else 'Alternative — Stay on Slots'} · Right-Size {edition} Reservation '{res_name}')\n"
             f"--   Current: {cur_baseline} Baseline + {cur_autoscale_add} Autoscale ({cur_max} max) = ${cur_monthly_cost:,.2f}/mo\n"
             f"--   Proposed: {opt1_base_ddl} + {rec_autoscale_add} Autoscale ({pr_}/slot-hr) = ${opt1_cost:,.2f}/mo\n"
             f"--   Estimated Bill Optimization: ${opt1_savings:,.2f}/mo ({opt1_pct}% improvement)\n"
@@ -2113,7 +2129,7 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             else:
                 drop_lines = f"-- Executor enumerates and drops active QUERY assignments on `{res_fq}` before zeroing slots\n"
             ddl_opt2 = (
-                f"-- OPTION 2 (Return Assigned Workloads to On-Demand Billing — {odr}/TiB)\n"
+                f"-- OPTION {p2_rank} ({'Recommended' if recommended == 2 else 'Alternative'} · Return Assigned Workloads to On-Demand Billing — {odr}/TiB)\n"
                 f"--   Current Reservation Spend: ${cur_monthly_cost:,.2f}/mo vs Projected On-Demand: ${opt2_cost:,.2f}/mo ({bytes_tib_30d:,.1f} TiB/mo)\n"
                 f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · $0 idle slot cost)\n"
                 f"{drop_lines}"
@@ -2130,7 +2146,7 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             opt2_savings_desc = f"${opt2_savings:,.2f} / month ({opt2_pct}% efficiency gain · pay per TiB scanned, $0 idle slots)"
         else:
             ddl_opt2 = (
-                f"-- OPTION 2 (0-Baseline Pure Autoscaling on '{res_name}' — $0 Idle Cost)\n"
+                f"-- OPTION {p2_rank} ({'Recommended' if recommended == 2 else 'Alternative'} · 0-Baseline Pure Autoscaling on '{res_name}' — $0 Idle Cost)\n"
                 f"--   Baseline: 0 Slots ($0.00/mo fixed when idle) + Autoscale 0 -> {rec_max} Slots (~{pure_autoscale_hours:,.0f} billed slot-h @ {pr_}/slot-hr)\n"
                 f"--   Estimated Bill Optimization: ${opt2_savings:,.2f}/mo ({opt2_pct}% improvement · no commitment lock-in)\n"
                 f"ALTER RESERVATION `{res_fq}`\n"
@@ -2150,9 +2166,14 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             f"${cur_monthly_cost:,.2f}/mo) is already within optimal {obs_days}d slot & billing bounds ($0.00/mo change needed)"
         )
     else:
+        win_plan_lbl = (
+            f"Right-Size to {rec_baseline}+{rec_autoscale_add} Slots"
+            if recommended == 1
+            else ("Return to On-Demand" if option_2_mode == "ON_DEMAND" else f"0-Baseline Autoscale 0→{rec_max}")
+        )
         formula = (
             f"current {edition} reservation '{res_name}' ({cur_baseline} baseline + {cur_autoscale_add} autoscale) = "
-            f"${cur_monthly_cost:,.2f}/mo; Option {recommended} = ${opt_cost:,.2f}/mo; "
+            f"${cur_monthly_cost:,.2f}/mo; Option 1 ({win_plan_lbl}) = ${opt_cost:,.2f}/mo; "
             f"optimizing bill by ${gross:,.2f}/mo"
         )
     math = _savings_math(
@@ -2215,15 +2236,18 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
             "net_savings": "$0.00 / month (already within optimal slot & billing range · no action needed)",
         }
     else:
+        p1_summary = f"{rec_baseline} Baseline + Autoscale to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain)"
+        p2_summary = f"{opt2_short} (→ est. ${opt2_savings:,.0f}/mo efficiency gain)"
+        first_summary, second_summary = (p1_summary, p2_summary) if recommended == 1 else (p2_summary, p1_summary)
         finding_summary = (
             f"Reservation '{res_name}' ({edition}, {cur_baseline} baseline + {cur_autoscale_add} autoscale = "
             f"${cur_monthly_cost:,.0f}/mo) can be right-sized from {win_desc}: "
-            f"Option 1: {rec_baseline} Baseline + Autoscale to {rec_max} (${opt1_cost:,.0f}/mo → est. ${opt1_savings:,.0f}/mo efficiency gain) "
-            f"OR Option 2: {opt2_short} (→ est. ${opt2_savings:,.0f}/mo efficiency gain). "
-            f"Recommended: Option {recommended}."
+            f"Option 1 (Recommended): {first_summary} OR Option 2: {second_summary}."
         )
         rec_pricing_model = (
-            f"Right-Size {edition} Reservation '{res_name}' (Option 1) or {opt2_label.split('·', 1)[-1].strip()} (Option 2)"
+            f"Right-Size {edition} Reservation '{res_name}' (Option 1 Recommended) or {opt2_desc_core} (Option 2)"
+            if recommended == 1
+            else f"{opt2_desc_core} (Option 1 Recommended) or Right-Size {edition} Reservation '{res_name}' (Option 2)"
         )
         opt1_state_desc = (
             f"{rec_baseline} Baseline Slots (${opt1_baseline_cost:,.0f}/mo) + up to "
@@ -2244,9 +2268,9 @@ def _map_reservation_rightsizing(row: dict, prices: dict, c: Config) -> Finding 
         opt1_savings_desc = f"${opt1_savings:,.2f} / month ({opt1_pct}% efficiency gain · {opt1_sav_note})"
         if recommended == 2:
             proposed_state = {
-                "recommended_option_2": opt2_state_desc,
+                "recommended_option_1": opt2_state_desc,
                 "projected_net_savings": opt2_savings_desc,
-                "fallback_option_1_stay_on_slots": f"{opt1_state_desc} ({opt1_savings_desc})",
+                "fallback_option_2_stay_on_slots": f"{opt1_state_desc} ({opt1_savings_desc})",
             }
         else:
             proposed_state = {

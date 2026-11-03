@@ -58,6 +58,7 @@ const KEY_ORDER: Record<string, number> = {
   fallback_option_1: 25,
   fallback_option_1_stay_on_slots: 26,
   fallback_option_2: 27,
+  fallback_option_2_stay_on_slots: 28,
 };
 
 function Value({ v, tone }: { v: unknown; tone: "rose" | "emerald" | "muted" }) {

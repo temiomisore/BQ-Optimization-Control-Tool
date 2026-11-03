@@ -110,13 +110,20 @@ export function CardDetail({
 
   const meta = CLASS_META[c.apply_class] || CLASS_META[1];
   const hasOpt2 = !!pr.generated_ddl_option2;
-  const recOpt = Number(ev.recommended_option || pr.selected_option || 1);
+  const recOpt = wCap ? (Number(ev.recommended_option || pr.selected_option || 1) === 2 ? 2 : 1) : 1;
+  // Always display the Recommended winner first on the left as "Option 1" and the runner-up on the
+  // right as "Option 2", while `opt` (1 | 2) preserves the backend execution plan ID for `/api/decide`.
+  const orderedPlans: [number, number] = wCap && !propSized && recOpt === 2 ? [2, 1] : [1, 2];
+  const p1Rank: 1 | 2 = orderedPlans[0] === 1 ? 1 : 2;
+  const p2Rank: 1 | 2 = orderedPlans[0] === 2 ? 1 : 2;
+  const activeRank: 1 | 2 = orderedPlans[0] === opt ? 1 : 2;
   const headline = propSized
     ? 0
     : wCap
       ? num(opt === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd) || num(c.net_monthly_value_usd)
       : num(c.net_monthly_value_usd);
-  const ddl = hasOpt2 && opt === 2 ? pr.generated_ddl_option2 : ddlFor(c);
+  const rawDdl = hasOpt2 && opt === 2 ? pr.generated_ddl_option2 || "" : ddlFor(c);
+  const ddl = wCap && !propSized ? rawDdl.replace(/^(\s*--\s*OPTION\s+)[12]\b/i, `$1${activeRank}`) : rawDdl;
   const isPr = c.apply_class === 4 || c.execution_route === "CI_PULL_REQUEST";
   const approvals = c.approvals || [];
   const two = needsTwo(c);
@@ -127,12 +134,17 @@ export function CardDetail({
     : isPr
       ? "Approve for PR hand-off"
       : "Approve Change";
-  const optLabels = w02
-    ? ["Option 1: 50-Slot Human Sandbox + 50 GB Cap", "Option 2: Audit SQL"]
-    : [
-        String(ev.option_1_label || "Option 1: Baseline + Autoscale"),
-        String(ev.option_2_label || "Option 2: 0-Baseline Autoscale"),
-      ];
+  const stripOptPrefix = (s: string) => s.replace(/^Option\s*[12]\s*[·:—-]\s*/i, "").trim();
+  const planTitleFor = (planId: number, displayRank: number): string => {
+    if (w02) {
+      return planId === 1 ? "Option 1: 50-Slot Human Sandbox + 50 GB Cap" : "Option 2: Audit SQL";
+    }
+    const raw =
+      planId === 1
+        ? String(ev.option_1_label || "Baseline + Autoscale")
+        : String(ev.option_2_label || "0-Baseline Autoscale");
+    return `Option ${displayRank} · ${stripOptPrefix(raw)}`;
+  };
 
   const bullets = useMemo(() => {
     const scanDays = Number(ev.scan_window_days || ev.capacity_sizing?.scan_window_days || ev.sizing_window_days || 30);
@@ -148,10 +160,14 @@ export function CardDetail({
       const sizedLine = hasYoungSpan
         ? `Scanned ${scanDays}d INFORMATION_SCHEMA history (${activeDays}d active${activeDays < normDays ? `, normalized over ${normDays}d` : ""}): baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`
         : `Sized from ${scanDays}d historical slot telemetry: baseline ${base} · max ${max} slots${src ? ` (${src})` : ""}.`;
+      const p1Line = `(${opt1Tag}): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`;
+      const p2Line = `(0-baseline autoscale): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`;
+      const firstLine = recOpt === 2 ? p2Line : p1Line;
+      const secondLine = recOpt === 2 ? p1Line : p2Line;
       return [
         `On-demand today: ${usd(ev.on_demand_spend_monthly)}/mo for ${num(ev.bytes_scanned_tib_30d).toLocaleString()} TiB/mo (${winNote}).`,
-        `Option 1 (${opt1Tag}): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
-        `Option 2 (0-baseline autoscale): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
+        `Option 1 — Recommended ${firstLine}`,
+        `Option 2 — Alternative ${secondLine}`,
         sizedLine,
       ];
     }
@@ -175,10 +191,14 @@ export function CardDetail({
         ];
       }
       const opt2Mode = ev.option_2_mode === "ON_DEMAND" ? "Return to On-Demand ($6.25/TiB)" : `0-baseline autoscale (0 → ${recMax})`;
+      const p1Line = `(${recBase} baseline → ${recMax} max): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`;
+      const p2Line = `(${opt2Mode}): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`;
+      const firstLine = recOpt === 2 ? p2Line : p1Line;
+      const secondLine = recOpt === 2 ? p1Line : p2Line;
       return [
         `Current ${ev.edition || "ENTERPRISE"} reservation '${ev.reservation_name || c.target_table}': ${curBase} baseline + ${curAuto} autoscale slots (${usd(ev.current_reservation_spend_monthly)}/mo).`,
-        `Option 1 (${recBase} baseline → ${recMax} max): ${usd(ev.option_1_monthly_cost_usd)}/mo → est. ${usd(ev.option_1_savings_usd)}/mo efficiency gain.`,
-        `Option 2 (${opt2Mode}): ${usd(ev.option_2_monthly_cost_usd)}/mo → est. ${usd(ev.option_2_savings_usd)}/mo efficiency gain.`,
+        `Option 1 — Recommended ${firstLine}`,
+        `Option 2 — Alternative ${secondLine}`,
         sizedLine,
       ];
     }
@@ -195,7 +215,7 @@ export function CardDetail({
     if (ev.gemini_ai_diagnosis) out.push(`Gemini diagnosis: ${ev.gemini_ai_diagnosis}`);
     if (ev.dry_run_verification) out.push(`Dry run: ${ev.dry_run_verification}`);
     return out;
-  }, [c, w01, w02, w03, propSized, ev, pr, data.w01]);
+  }, [c, w01, w02, w03, propSized, ev, pr, recOpt, data.w01]);
 
   const comparePanels = useMemo<{ before: unknown; after: unknown }>(() => {
     const cs = (ev.current_state || {}) as Record<string, unknown>;
@@ -245,7 +265,7 @@ export function CardDetail({
       }
 
       const opt1Plan = String(
-        ps.recommended_option_1 ||
+        (recOpt === 1 ? ps.recommended_option_1 : undefined) ||
           ps.option_1_rightsized ||
           `${recBase} Baseline Slots + up to ${recAutoAdd} Autoscaling Slots = ${usd(opt1Cost, 2)} / month`,
       );
@@ -253,7 +273,7 @@ export function CardDetail({
 
       const isOdMode = ev.option_2_mode === "ON_DEMAND";
       const opt2Plan = String(
-        ps.recommended_option_2 ||
+        (recOpt === 2 ? ps.recommended_option_1 || ps.recommended_option_2 : undefined) ||
           ps.option_2_alternative ||
           (isOdMode
             ? `Unassign QUERY workloads → On-Demand (${num(ev.bytes_scanned_tib_30d).toFixed(1)} TiB/mo @ $6.25/TiB) + zero '${ev.reservation_name || c.target_table}' capacity = ${usd(opt2Cost, 2)} / month`
@@ -267,30 +287,30 @@ export function CardDetail({
         opt === 2
           ? [
               {
-                label: isOdMode ? "Option 2 · Return to On-Demand" : "Option 2 · 0-Baseline Autoscale",
+                label: `Option ${p2Rank} · ${isOdMode ? "Return to On-Demand" : "0-Baseline Autoscale"}`,
                 badge: recOpt === 2 ? "Recommended" : "Selected",
                 badgeTone: recOpt === 2 ? "emerald" : "sky",
                 value: opt2Plan,
               },
               { label: "Projected net savings", value: opt2SavTxt },
               {
-                label: recOpt === 1 ? "Recommended option · Option 1" : "Fallback if staying on slots · Option 1",
+                label: recOpt === 1 ? "Recommended · Option 1" : `Fallback if staying on slots · Option ${p1Rank}`,
                 badge: recOpt === 1 ? "Saves more" : undefined,
-                badgeTone: "amber",
+                badgeTone: "emerald",
                 muted: recOpt !== 1,
                 value: `${recBase} Baseline + ${recAutoAdd} Autoscale (${recMax} max) → ${usd(opt1Cost, 2)}/mo (${usd(opt1Sav, 2)}/mo savings · ${opt1Note})`,
               },
             ]
           : [
               {
-                label: `Option 1 · Right-size reservation (${recBase} + ${recAutoAdd} slots)`,
+                label: `Option ${p1Rank} · Right-size reservation (${recBase} + ${recAutoAdd} slots)`,
                 badge: recOpt === 1 ? "Recommended" : "Selected",
                 badgeTone: recOpt === 1 ? "emerald" : "sky",
                 value: opt1Plan,
               },
               { label: "Projected net savings", value: opt1SavTxt },
               {
-                label: recOpt === 2 ? "Recommended option · Option 2" : "Alternative · Option 2",
+                label: recOpt === 2 ? "Recommended · Option 1" : `Alternative · Option ${p2Rank}`,
                 badge: recOpt === 2 ? "Saves more" : undefined,
                 badgeTone: "emerald",
                 muted: recOpt !== 2,
@@ -321,12 +341,12 @@ export function CardDetail({
     const opt2Pct = odBill > 0 ? Math.round((opt2Sav / odBill) * 100) : 0;
     const opt1RateNote = recBase === 0 ? "0-baseline PAYG autoscale · no CUD lock-in" : "1-Yr Commit rate; note commitment lock-in";
     const opt1Plan = String(
-      ps.recommended_option_1 ||
+      (recOpt === 1 ? ps.recommended_option_1 : undefined) ||
         ps.option_1_steady_24x7 ||
         `${recBase} Baseline Slots + up to ${recAutoAdd} Autoscaling Slots = ${usd(opt1Cost, 2)} / month`,
     );
     const opt2Plan = String(
-      ps.recommended_option_2 ||
+      (recOpt === 2 ? ps.recommended_option_1 || ps.recommended_option_2 : undefined) ||
         ps.option_2_spiky_0_baseline ||
         `0 Baseline Slots ($0 fixed) + Pure Autoscaling up to ${recMax} Slots = ${usd(opt2Cost, 2)} / month`,
     );
@@ -335,7 +355,7 @@ export function CardDetail({
       opt === 2
         ? [
             {
-              label: `Option 2 · 0-Baseline Pure Autoscale (0 → ${recMax})`,
+              label: `Option ${p2Rank} · 0-Baseline Pure Autoscale (0 → ${recMax})`,
               badge: recOpt === 2 ? "Recommended" : "Selected",
               badgeTone: recOpt === 2 ? "emerald" : "sky",
               value: opt2Plan,
@@ -345,7 +365,7 @@ export function CardDetail({
               value: `${usd(opt2Sav, 2)} / month (${opt2Pct}% efficiency gain · $0 idle cost overnight & no lock-in)`,
             },
             {
-              label: recOpt === 1 ? "Recommended option · Option 1" : "Alternative · Option 1 (Steady 24/7)",
+              label: recOpt === 1 ? "Recommended · Option 1" : `Alternative · Option ${p1Rank} (Steady 24/7)`,
               badge: recOpt === 1 ? "Saves more" : undefined,
               badgeTone: "emerald",
               muted: recOpt !== 1,
@@ -354,7 +374,7 @@ export function CardDetail({
           ]
         : [
             {
-              label: `Option 1 · ${recBase} Baseline + Autoscale to ${recMax}`,
+              label: `Option ${p1Rank} · ${recBase} Baseline + Autoscale to ${recMax}`,
               badge: recOpt === 1 ? "Recommended" : "Selected",
               badgeTone: recOpt === 1 ? "emerald" : "sky",
               value: opt1Plan,
@@ -364,7 +384,7 @@ export function CardDetail({
               value: `${usd(opt1Sav, 2)} / month (${opt1Pct}% efficiency gain · ${opt1RateNote})`,
             },
             {
-              label: recOpt === 2 ? "Recommended option · Option 2" : "Alternative · Option 2 (0-Baseline)",
+              label: recOpt === 2 ? "Recommended · Option 1" : `Alternative · Option ${p2Rank} (0-Baseline)`,
               badge: recOpt === 2 ? "Saves more" : undefined,
               badgeTone: "emerald",
               muted: recOpt !== 2,
@@ -373,7 +393,7 @@ export function CardDetail({
           ];
 
     return { before: beforeW01.length ? beforeW01 : ev.current_state, after: afterW01 };
-  }, [wCap, propSized, w03, ev, pr, opt, recOpt, c.target_table, data.w01]);
+  }, [wCap, propSized, w03, ev, pr, opt, recOpt, p1Rank, p2Rank, c.target_table, data.w01]);
 
   const approve = () =>
     decide.mutate({
@@ -436,7 +456,7 @@ export function CardDetail({
               <AnimatedNumber value={headline} format={(n) => usd(n)} />
             </div>
             <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-              {propSized ? "no change needed · optimal" : `net / month${wCap ? ` · option ${opt}` : ""}`}
+              {propSized ? "no change needed · optimal" : `net / month${wCap ? ` · option ${activeRank}` : ""}`}
             </div>
           </div>
         </div>
@@ -448,30 +468,33 @@ export function CardDetail({
           <div className="space-y-2">
             {!propSized && (
               <div className="grid grid-cols-2 gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-[#0c0c0f]">
-                {[1, 2].map((o) => (
-                  <button
-                    key={o}
-                    onClick={() => setOpt(o)}
-                    className={cn(
-                      "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
-                      opt === o ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
-                    )}
-                  >
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span>{optLabels[o - 1]}</span>
-                      {wCap && o === recOpt && (
-                        <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-300">
-                          Recommended
-                        </span>
+                {orderedPlans.map((planId, idx) => {
+                  const displayRank = idx + 1;
+                  return (
+                    <button
+                      key={planId}
+                      onClick={() => setOpt(planId)}
+                      className={cn(
+                        "rounded-md px-3 py-2 text-left text-xs font-medium transition-all",
+                        opt === planId ? "bg-white text-sky-600 shadow-sm dark:bg-zinc-800 dark:text-sky-300" : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200",
                       )}
-                    </div>
-                    {wCap && (
-                      <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
-                        est. {usd(o === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span>{planTitleFor(planId, displayRank)}</span>
+                        {wCap && planId === recOpt && (
+                          <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-emerald-600 dark:text-emerald-300">
+                            Recommended
+                          </span>
+                        )}
                       </div>
-                    )}
-                  </button>
-                ))}
+                      {wCap && (
+                        <div className="mt-0.5 font-mono text-[11px] text-emerald-500">
+                          est. {usd(planId === 2 ? ev.option_2_savings_usd : ev.option_1_savings_usd)}/mo efficiency
+                        </div>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             )}
             {estimatorUrl && (
@@ -511,6 +534,7 @@ export function CardDetail({
               }
               isReservation={w03}
               selectedOption={opt}
+              recommendedOption={recOpt}
               option2Mode={String(ev.option_2_mode || pr.option_2_mode || "PURE_AUTOSCALE")}
               bytesTib30d={ev.bytes_scanned_tib_30d != null ? num(ev.bytes_scanned_tib_30d) : null}
               windowDays={num(ev.sizing_window_days || 30)}

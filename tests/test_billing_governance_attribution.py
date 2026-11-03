@@ -1134,9 +1134,18 @@ class TestReservationRightsizingAnd180dCapacity(unittest.TestCase):
         self.assertIn("180d scan · 13d active, normalized over 30d", f["evidence"]["current_state"]["observed_demand"])
 
         ps = f["evidence"]["proposed_state"]
-        self.assertIn("recommended_option_2", ps)
+        # Recommended winner is ALWAYS numbered Option 1 in human-facing labels, summaries, and DDL comments
+        self.assertIn("recommended_option_1", ps)
+        self.assertIn("On-Demand", ps["recommended_option_1"])
         self.assertNotIn("option_2_alternative", ps)
-        # 0-baseline Option 1 must NEVER claim 1-Yr Commit or CUD lock-in
+        self.assertTrue(str(f["evidence"]["option_2_label"]).startswith("Option 1 · Return to On-Demand"))
+        self.assertTrue(str(f["evidence"]["option_1_label"]).startswith("Option 2 · 0 Baseline + Autoscale to 50"))
+        self.assertIn("Option 1 (Recommended): Return to On-Demand", f["finding_summary"])
+        self.assertIn("-- OPTION 1 (Recommended · Return Assigned Workloads to On-Demand Billing",
+                      f["proposed_change"]["generated_ddl_option2"])
+        self.assertIn("-- OPTION 2 (Alternative — Stay on Slots",
+                      f["proposed_change"]["generated_ddl"])
+        # 0-baseline slot fallback must NEVER claim 1-Yr Commit or CUD lock-in
         ps_blob = " ".join(str(v) for v in ps.values())
         self.assertNotIn("1-Yr Commit", ps_blob)
         self.assertIn("no CUD lock-in", ps_blob)

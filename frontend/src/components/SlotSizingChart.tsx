@@ -103,6 +103,7 @@ export interface SlotSizingChartProps {
   committedSlots?: number | null;
   isReservation?: boolean;
   selectedOption?: number;
+  recommendedOption?: number;
   option2Mode?: string;
   bytesTib30d?: number | null;
   windowDays?: number;
@@ -126,6 +127,7 @@ export function SlotSizingChart({
   committedSlots,
   isReservation = false,
   selectedOption = 1,
+  recommendedOption = 1,
   option2Mode = "PURE_AUTOSCALE",
   bytesTib30d,
   windowDays,
@@ -146,8 +148,11 @@ export function SlotSizingChart({
 
   const isOpt2 = selectedOption === 2;
   const isReturnToOd = isOpt2 && option2Mode === "ON_DEMAND";
+  const recPlan = Number(recommendedOption || 1) === 2 ? 2 : 1;
+  const plan1Rank = recPlan === 1 ? 1 : 2;
+  const plan2Rank = recPlan === 2 ? 1 : 2;
 
-  // Even when Option 2 = Return to On-Demand is pre-selected as cheaper, we still plot the
+  // Even when Return to On-Demand is pre-selected as cheaper, we still plot the
   // consumption-based slot lines (safeBase + safeMax) so reviewers immediately see what their
   // slot baseline & autoscale limit SHOULD be based on usage.
   const dispBase = isOpt2 && !isReturnToOd ? 0 : safeBase;
@@ -777,15 +782,15 @@ export function SlotSizingChart({
             <div className="flex items-center justify-between gap-2 font-medium text-sky-600 dark:text-sky-300">
               <span>Baseline line: {dispBase.toLocaleString()} slots</span>
               <span className="rounded bg-sky-500/15 px-1.5 py-0.5 font-mono text-[10px]">
-                {isOpt2 && !isReturnToOd ? "Opt 2 = 0" : `p50 = ${fmtSlots(p50)} → ${safeBase}`}
+                {isOpt2 && !isReturnToOd ? `Opt ${plan2Rank} = 0` : `p50 = ${fmtSlots(p50)} → ${safeBase}`}
               </span>
             </div>
             <p className="mt-1 text-[11px] leading-relaxed text-zinc-600 dark:text-zinc-400">
               {isOpt2 && !isReturnToOd ? (
                 <>
-                  Option 2 sets <b>0 baseline slots</b> so you pay <b>$0/hr</b> during the{" "}
+                  Option {plan2Rank} sets <b>0 baseline slots</b> so you pay <b>$0/hr</b> during the{" "}
                   {idlePct != null ? `${idlePct}% of minutes that sit idle` : "idle hours & weekends"}.
-                  {safeBase > 0 ? ` (Option 1 sizes ${safeBase} steady baseline slots from p50 = ${fmtSlots(p50)}.)` : ""}
+                  {safeBase > 0 ? ` (Option ${plan1Rank} sizes ${safeBase} steady baseline slots from p50 = ${fmtSlots(p50)}.)` : ""}
                 </>
               ) : safeBase === 0 ? (
                 <>
@@ -817,7 +822,7 @@ export function SlotSizingChart({
                 <>
                   {" "}
                   <span className="font-medium text-emerald-600 dark:text-emerald-300">
-                    Option 2 skips even a 50-slot pool because On-Demand ($6.25/TiB
+                    Option {plan2Rank} skips even a 50-slot pool because On-Demand ($6.25/TiB
                     {bytesTib30d != null ? ` · ${bytesTib30d.toLocaleString()} TiB/mo` : ""}) costs less.
                   </span>
                 </>

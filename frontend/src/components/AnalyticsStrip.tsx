@@ -94,32 +94,52 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
 
   const w = data.w01;
   const w3 = data.w03;
-  const capChart = w
-    ? {
+  const capChart = (() => {
+    if (w) {
+      const rec = Number(w.recommended_option || 1) === 2 ? 2 : 1;
+      const p1 = { desc: `${w.baseline}+→${w.max}`, val: w.o1, pct: Math.max(0, 100 - w.o1_pct) };
+      const p2 = { desc: `0→${w.max}`, val: w.o2, pct: Math.max(0, 100 - w.o2_pct) };
+      const win = rec === 2 ? p2 : p1;
+      const alt = rec === 2 ? p1 : p2;
+      return {
         curLabel: "On-Demand",
         curVal: w.od,
-        opt1Label: `Opt 1 · ${w.baseline}+→${w.max}`,
-        opt1Val: w.o1,
-        opt2Label: `Opt 2 · 0→${w.max}`,
-        opt2Val: w.o2,
-        opt1Pct: Math.max(0, 100 - w.o1_pct),
-        opt2Pct: Math.max(0, 100 - w.o2_pct),
-      }
-    : w3
-      ? {
-          curLabel: `${w3.reservation_name} (${w3.cur_baseline}+)`,
-          curVal: w3.cur_cost,
-          opt1Label: w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED"
-            ? `Optimal · ${w3.cur_baseline}+→${w3.cur_max}`
-            : `Opt 1 · ${w3.rec_baseline}+→${w3.rec_max}`,
-          opt1Val: w3.o1,
-          opt2Label: w3.option_2_mode === "ON_DEMAND" ? "Opt 2 · On-Demand" : `Opt 2 · 0→${w3.rec_max}`,
-          opt2Val: w3.o2,
-          opt1Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o1)) / w3.cur_cost)) : 0,
-          opt2Pct: w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o2)) / w3.cur_cost)) : 0,
-          properlySized: Boolean(w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED"),
-        }
-      : null;
+        opt1Label: `Opt 1 · ${win.desc}`,
+        opt1Val: win.val,
+        opt1Pct: win.pct,
+        opt2Label: `Opt 2 · ${alt.desc}`,
+        opt2Val: alt.val,
+        opt2Pct: alt.pct,
+        properlySized: false,
+      };
+    }
+    if (w3) {
+      const propSized = Boolean(w3.no_op || w3.diagnosis_kind === "PROPERLY_SIZED");
+      const rec = Number(w3.recommended_option || 1) === 2 ? 2 : 1;
+      const p1Pct = w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o1)) / w3.cur_cost)) : 0;
+      const p2Pct = w3.cur_cost > 0 ? Math.max(0, Math.round((100 * (w3.cur_cost - w3.o2)) / w3.cur_cost)) : 0;
+      const p1 = { desc: `${w3.rec_baseline}+→${w3.rec_max}`, val: w3.o1, pct: p1Pct };
+      const p2 = {
+        desc: w3.option_2_mode === "ON_DEMAND" ? "On-Demand" : `0→${w3.rec_max}`,
+        val: w3.o2,
+        pct: p2Pct,
+      };
+      const win = !propSized && rec === 2 ? p2 : p1;
+      const alt = !propSized && rec === 2 ? p1 : p2;
+      return {
+        curLabel: `${w3.reservation_name} (${w3.cur_baseline}+)`,
+        curVal: w3.cur_cost,
+        opt1Label: propSized ? `Optimal · ${w3.cur_baseline}+→${w3.cur_max}` : `Opt 1 · ${win.desc}`,
+        opt1Val: win.val,
+        opt1Pct: win.pct,
+        opt2Label: `Opt 2 · ${alt.desc}`,
+        opt2Val: alt.val,
+        opt2Pct: alt.pct,
+        properlySized: propSized,
+      };
+    }
+    return null;
+  })();
 
   const bars = capChart && {
     ...baseTheme(dark),
@@ -142,8 +162,8 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
         label: { show: true, position: "right", formatter: (p: any) => usd(p.value), fontFamily: "JetBrains Mono", fontSize: 11, color: dark ? "#e4e4e7" : "#27272a" },
         data: [
           { value: Math.round(capChart.curVal), itemStyle: { color: "#f43f5e" } },
-          { value: Math.round(capChart.opt1Val), itemStyle: { color: "#38bdf8" } },
-          { value: Math.round(capChart.opt2Val), itemStyle: { color: "#10b981" } },
+          { value: Math.round(capChart.opt1Val), itemStyle: { color: "#10b981" } },
+          { value: Math.round(capChart.opt2Val), itemStyle: { color: "#38bdf8" } },
         ],
       },
     ],
@@ -234,6 +254,7 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
                 curMax={!w && w3 ? w3.cur_max : undefined}
                 isReservation={!w && !!w3}
                 selectedOption={Number((w ? w.recommended_option : w3?.recommended_option) || 1)}
+                recommendedOption={Number((w ? w.recommended_option : w3?.recommended_option) || 1)}
                 option2Mode={!w && w3 ? w3.option_2_mode : "PURE_AUTOSCALE"}
                 bytesTib30d={w ? w.tib : undefined}
                 windowDays={(w ? w.sizing_window_days : w3?.sizing_window_days) || 30}
@@ -242,7 +263,7 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
               <ReactECharts option={bars} style={{ height: w && w3 ? 150 : 170 }} notMerge />
             )}
             <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-              {!w && (capChart as { properlySized?: boolean }).properlySized ? (
+              {!w && capChart.properlySized ? (
                 <>
                   <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">
                     Current · {w3?.cur_baseline ?? 0} Base / {w3?.cur_max ?? 0} Max
@@ -253,8 +274,12 @@ export function AnalyticsStrip({ data, onClass }: { data: Dashboard; onClass: (c
                 </>
               ) : (
                 <>
-                  <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">Option 1 · {capChart.opt1Pct}% lower</div>
-                  <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 text-emerald-600 dark:text-emerald-300">Option 2 · {capChart.opt2Pct}% lower</div>
+                  <div className="rounded-lg bg-emerald-500/10 px-2.5 py-1.5 font-medium text-emerald-600 dark:text-emerald-300">
+                    Option 1 · {capChart.opt1Pct}% lower
+                  </div>
+                  <div className="rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-sky-600 dark:text-sky-300">
+                    Option 2 · {capChart.opt2Pct}% lower
+                  </div>
                 </>
               )}
             </div>
