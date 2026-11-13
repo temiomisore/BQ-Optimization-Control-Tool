@@ -1361,7 +1361,7 @@ function SettingsPanel() {
 const SCAN_STEPS: { id: "init" | "collect" | "rules"; label: string }[] = [
   { id: "init", label: "1. Schema check" },
   { id: "collect", label: "2. Collect regions & queries" },
-  { id: "rules", label: "3. Score 14 rules" },
+  { id: "rules", label: "3. Score 18 rules" },
 ];
 
 function stepRank(step: ScanStatus["step"]): number {
@@ -1476,7 +1476,7 @@ export function ScanNowPanel({
           <p className="mt-0.5 max-w-3xl text-xs leading-relaxed text-zinc-500">
             {compact
               ? "Review your permissions and optional owner tables in Settings, or click Run scan now to pull BigQuery query history and generate savings cards."
-              : "Discovers your BigQuery regions, pulls query & table history, and runs all 14 optimization rules using the settings saved on this page. Read-only on your tables — nothing is changed until you approve a card."}
+              : "Discovers your BigQuery regions, pulls query & table history, and runs all 18 optimization rules using the settings saved on this page. Read-only on your tables — nothing is changed until you approve a card."}
           </p>
         </div>
 

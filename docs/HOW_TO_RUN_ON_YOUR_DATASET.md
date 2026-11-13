@@ -262,7 +262,7 @@ expired=0 findings=3 inserted=3 suppressed=0 refreshed=2 retired=1
 ```
 
 ### What happens under the hood:
-* **Evaluates 14 Infra/Billing Rules + Tri-Engine Class 4 SQL Pipeline**:
+* **Evaluates 17 Infra/Billing Rules + Tri-Engine Class 4 SQL Pipeline**:
   * `C1-01`..`C1-10`, `W-01`, `W-02`: Clustering, `require_partition_filter`, staging expirations, time-travel tuning, physical storage flips, PK/FK join constraints, Editions sizing, and human-only ad-hoc cost guardrails.
   * `C2-01`..`C2-02`: Smart-Tuned Materialized Views (`max_staleness = INTERVAL '4' HOUR`) and Search Indexes with recurring-cost watchdogs.
   * `C3-01`..`C3-05`: Partitioning rebuilds, date-shard consolidation, partition granularity tuning, and cold-table archival.

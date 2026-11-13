@@ -321,7 +321,7 @@ def _poll_cloud_run_execution() -> None:
         else:
             # Estimate visual progress smoothly while the Cloud Run Job executes
             _STATE["step"] = "collect"
-            _STATE["step_label"] = "Scanning BigQuery regions & running 15 optimization rules (Cloud Run job)…"
+            _STATE["step_label"] = "Scanning BigQuery regions & running 18 optimization rules (Cloud Run job)…"
 
     if finished_now:
         invalidate_telemetry_cache()
@@ -357,7 +357,7 @@ def _run_in_process(run_id: str) -> None:
         cli.cmd_collect(cfg())
 
         with _LOCK:
-            _bump_locked(step="rules", step_label="Step 3/3 · Running 14 optimization rules & pricing savings…")
+            _bump_locked(step="rules", step_label="Step 3/3 · Running 18 optimization rules & pricing savings…")
         cli.cmd_rules(cfg())
 
         with _LOCK:

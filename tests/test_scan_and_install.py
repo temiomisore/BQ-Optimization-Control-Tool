@@ -420,6 +420,32 @@ class TestScanEndpointsAndInstaller(unittest.TestCase):
         self.assertNotIn("cloudshell_tutorial=", rd_text)
         self.assertNotIn("https://shell.cloud.google.com/cloudshell/editor", rd_text)
 
+    def test_rule_count_labels_match_rules_registry(self):
+        """Every place that states how many rules run must match optimizer.rules.RULES."""
+        import re
+        from optimizer import rules
+
+        total = len(rules.RULES)
+        infra = sum(1 for sql_fn, _ in rules.RULES if sql_fn.__name__ != "_sql_c4_antipatterns")
+        self.assertEqual(infra, total - 1, "exactly one registry entry is the Class 4 SQL anti-pattern check")
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        # file -> (pattern that captures the stated count, expected count, minimum matches)
+        checks = [
+            ("optimizer/scan_runner.py", r"[Rr]unning (\d+) optimization rules", total, 2),
+            ("frontend/src/components/SettingsPage.tsx", r"Score (\d+) rules", total, 1),
+            ("frontend/src/components/SettingsPage.tsx", r"runs all (\d+) optimization rules", total, 1),
+            ("README.md", r"(\d+) infra ?(?:/|&) ?billing rules", infra, 2),
+            ("docs/HOW_TO_RUN_ON_YOUR_DATASET.md", r"(\d+) Infra/Billing Rules", infra, 1),
+            ("docs/STEP_BY_STEP_OPTIMIZATION_GUIDE.md", r"(\d+) infra/billing rules", infra, 1),
+        ]
+        for rel, pattern, expected, min_hits in checks:
+            with open(os.path.join(repo_root, rel), encoding="utf-8") as f:
+                found = re.findall(pattern, f.read())
+            self.assertGreaterEqual(len(found), min_hits, f"{rel}: expected a rule-count label matching {pattern!r}")
+            for n in found:
+                self.assertEqual(int(n), expected, f"{rel}: says {n} rules, the registry has {expected}")
+
     def test_cloudrun_button_hook_phases_fresh_and_redeploy(self):
         import shutil
         import tempfile

@@ -316,7 +316,7 @@ Click **Open in Cloud Shell** in [`README.md`](../README.md) (which runs `script
 # Runs sequentially inside bqopt-nightly-pipeline at 03:00 UTC (loads saved /#settings overrides first):
 python -m optimizer.cli pipeline
 #   Step 1/4: collect  (multi-region + multi-project telemetry & hydrated SQL previews)
-#   Step 2/4: rules    (14 infra/billing rules + Tri-Engine Class 4 + money-losing filter)
+#   Step 2/4: rules    (17 infra/billing rules + Tri-Engine Class 4 + money-losing filter)
 #   Step 3/4: execute  (applies human-APPROVED cards inside 03:00-09:00 UTC; Class 4 -> PR_HANDED_OFF)
 #   Step 4/4: verify   (checks Day-14 post-apply receipts + daily MV cost watchdogs)
 ```
