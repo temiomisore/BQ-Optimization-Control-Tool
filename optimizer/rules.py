@@ -250,6 +250,7 @@ def _map_native_pc(row: dict, prices: dict, c: Config) -> Finding | None:
             "underlying_sql": action.get("generated_ddl"),
             "recommender": row["recommender"],
             "raw_active_assist_claim": f"${claim_usd:,.2f} / month",
+            "active_assist_reduction": round(reduction, 4) if reduction is not None else None,
             "savings_math": math,
         },
         "observation_days": 30,

@@ -38,8 +38,38 @@ def apply_summation_cap(f: Finding, table_spend: dict[tuple, float],
                 # Keep "How this saving is calculated" truthful about the final number.
                 sm["cap_applied"] = (f"capped at {float(max_scan_reduction):.0%} of the table's "
                                      f"${spend:,.2f}/mo read spend: ${gross:,.2f} -> ${ceiling:,.2f}/mo")
+            _restate_capped_text(f, gross=gross, ceiling=ceiling, spend=spend,
+                                 max_scan_reduction=float(max_scan_reduction))
             return 0.5
     return 1.0
+
+
+def _restate_capped_text(f: Finding, *, gross: float, ceiling: float, spend: float,
+                         max_scan_reduction: float) -> None:
+    """After the cap, make "Why this matters" and "Before vs. after" show the capped number
+    (the one on the card) instead of the uncapped Active Assist estimate."""
+    raw_txt = f"${gross:,.2f}/mo"
+    cap_txt = f"${ceiling:,.2f}/mo"
+    note = (f" (Google's Active Assist estimated {raw_txt}; capped at "
+            f"{max_scan_reduction:.0%} of this table's ${spend:,.2f}/mo read spend.)")
+    summary = str(f.get("finding_summary") or "")
+    if f"~{raw_txt}" in summary:
+        f["finding_summary"] = summary.replace(f"~{raw_txt}", f"~{cap_txt}", 1).rstrip() + note
+    elif summary:
+        f["finding_summary"] = summary.rstrip() + note
+
+    ps = (f.get("evidence") or {}).get("proposed_state")
+    if not isinstance(ps, dict):
+        return
+    if "net_monthly_savings" in ps:
+        ps["net_monthly_savings"] = f"${ceiling:,.2f} / month (capped from Active Assist's ${gross:,.2f})"
+    if "projected_monthly_spend" in ps:
+        ps["projected_monthly_spend"] = f"${max(spend - ceiling, 0.0):,.2f} / month"
+    if "expected_reduction" in ps:
+        aa = (f.get("evidence") or {}).get("active_assist_reduction")
+        aa_txt = f"Active Assist estimated {float(aa):.0%}" if aa is not None else "Active Assist estimated more"
+        ps["expected_reduction"] = (f"{max_scan_reduction:.0%} of this table's read work "
+                                    f"(capped; {aa_txt})")
 
 
 def confidence(f: Finding, *, table_cv: dict[tuple, float],

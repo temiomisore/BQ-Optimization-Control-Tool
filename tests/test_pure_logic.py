@@ -27,6 +27,43 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(d, 0.5)
         self.assertIn("NATIVE_ESTIMATE_CAPPED_AT_TABLE_SPEND", f["risk_notes"])
 
+    def test_capped_card_text_matches_capped_number(self):
+        # demo_ecommerce.orders case: Active Assist says 100% of $1,562.88/mo; the 68% cap
+        # makes it $1,062.76. "Why this matters" and "Before vs. after" must show the capped
+        # figure (the card's number), not the raw estimate.
+        f = finding(
+            source="NATIVE_RECOMMENDER", gross_monthly_savings_usd=1562.88,
+            finding_summary=("Active Assist recommends CLUSTER BY customer_id, order_status on "
+                             "demo_ecommerce.orders: ~$1,562.88/mo at this table's real billing mix."),
+            evidence={
+                "active_assist_reduction": 1.0,
+                "proposed_state": {
+                    "clustering": "CLUSTER BY customer_id, order_status",
+                    "expected_reduction": "100% of this table's read work (Active Assist estimate)",
+                    "projected_monthly_spend": "$0.00 / month",
+                    "net_monthly_savings": "$1,562.88 / month",
+                },
+                "savings_math": {},
+            })
+        scoring.apply_summation_cap(f, {("p", "d", "t"): 1562.88})
+        ps = f["evidence"]["proposed_state"]
+        self.assertEqual(f["gross_monthly_savings_usd"], 1062.76)
+        self.assertEqual(ps["net_monthly_savings"], "$1,062.76 / month (capped from Active Assist's $1,562.88)")
+        self.assertEqual(ps["projected_monthly_spend"], "$500.12 / month")
+        self.assertEqual(ps["expected_reduction"],
+                         "68% of this table's read work (capped; Active Assist estimated 100%)")
+        self.assertIn("~$1,062.76/mo", f["finding_summary"])
+        self.assertNotIn("~$1,562.88/mo", f["finding_summary"])
+        self.assertIn("Active Assist estimated $1,562.88/mo", f["finding_summary"])
+        self.assertIn("$1,562.88 -> $1,062.76/mo", f["evidence"]["savings_math"]["cap_applied"])
+
+        # Not capped (estimate already below 68% of spend): text is left exactly as it was.
+        g = finding(source="NATIVE_RECOMMENDER", gross_monthly_savings_usd=100.0,
+                    finding_summary="~$100.00/mo", evidence={"proposed_state": {"net_monthly_savings": "$100.00 / month"}})
+        self.assertEqual(scoring.apply_summation_cap(g, {("p", "d", "t"): 1000.0}), 1.0)
+        self.assertEqual(g["finding_summary"], "~$100.00/mo")
+        self.assertEqual(g["evidence"]["proposed_state"]["net_monthly_savings"], "$100.00 / month")
+
     def test_score_math(self):
         f = finding(one_time_apply_cost_usd=120.0)  # amortized 10/mo
         scoring.score(f, CFG, table_spend={}, table_cv={}, rule_history={})
