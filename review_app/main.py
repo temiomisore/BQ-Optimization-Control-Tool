@@ -844,6 +844,17 @@ def _summaries(c, data: dict) -> dict:
         "annual_savings": headline["total"] * 12,
         "monthly_savings_gross_sum": headline["naive_total"],
         "overlap_removed_usd": headline["overlap_removed"],
+        # How the headline is built from the plain sum of the cards (shown under the headline):
+        # cards added up - same spend counted once - capped at the real bill = headline.
+        "headline_breakdown": {
+            "card_count": len(cards),
+            "cards_added_up_usd": headline["naive_total"],
+            "double_counting_removed_usd": headline["double_counting_removed"],
+            "spend_cap_removed_usd": headline["spend_cap_removed"],
+            "query_savings_usd": headline["compute_usd"],
+            "storage_savings_usd": headline["storage_usd"],
+            "total_removed_usd": headline["overlap_removed"],
+        },
         "overlapping_cards": headline["overlapping_cards"],
         "headline_capped_at_spend": bool(headline["ceiling_applied"]),
         "compute_spend_30d_usd": headline["compute_ceiling_usd"],
@@ -933,6 +944,13 @@ def _scope_for_viewer(c, data: dict, ident: dict) -> dict:
         data["kpis"]["compute_spend_30d_usd"] = None
         data["kpis"]["billing_cards_claimed_usd"] = None
         data["kpis"]["billing_cards_counted_usd"] = None
+        # The split below would let a viewer work out the bill (capped query savings == bill),
+        # so non-FinOps viewers only get the plain sum and the combined amount removed.
+        bd = data["kpis"].get("headline_breakdown")
+        if isinstance(bd, dict):
+            for k in ("double_counting_removed_usd", "spend_cap_removed_usd",
+                      "query_savings_usd", "storage_savings_usd"):
+                bd[k] = None
     data["reviewer_email"] = ident["email"]
     data["viewer"] = {
         "email": ident["email"],

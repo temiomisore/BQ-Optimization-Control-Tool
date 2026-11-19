@@ -20,16 +20,11 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
     );
   }
   const k = data.kpis;
-  const overlap = Number(k.overlap_removed_usd || 0);
   const demoCards = Number(k.demo_floor_cards || 0);
   const legacyCards = Number(k.legacy_estimate_cards || 0);
   const spend = k.compute_spend_30d_usd;
   const savingsFoot = [
     `${usd(k.annual_savings)} / year`,
-    overlap > 0 ? `${usd(overlap)} overlap removed (sum of cards ${usd(k.monthly_savings_gross_sum)})` : null,
-    k.headline_capped_at_spend
-      ? spend != null ? `capped at actual 30-day query bill (${usd(spend)})` : "capped at actual 30-day query bill"
-      : null,
     legacyCards > 0 ? `${legacyCards} legacy estimate${legacyCards > 1 ? "s" : ""}` : null,
   ].filter(Boolean).join(" · ");
   const items = [
@@ -122,8 +117,52 @@ export function KpiCards({ data, onTab }: { data?: Dashboard; onTab: (t: TabKey)
             </div>
           </div>
           <div className="mt-2 text-xs text-zinc-500">{it.foot}</div>
+          {i === 0 && <HeadlineBreakdown k={k} spend={spend} />}
         </motion.button>
       ))}
+    </div>
+  );
+}
+
+/** "How we got this number": plain sum of the cards -> same spend counted once -> capped at the
+ *  real bill -> headline. Non-FinOps viewers get one combined line (the split would reveal the bill). */
+function HeadlineBreakdown({ k, spend }: { k: Dashboard["kpis"]; spend?: number | null }) {
+  const b = k.headline_breakdown;
+  if (!b || !(b.total_removed_usd > 0.005)) return null;
+  const split = b.double_counting_removed_usd != null && b.spend_cap_removed_usd != null;
+  const rows: { sign: string; amount: number; label: string; tone?: string }[] = [
+    { sign: "", amount: b.cards_added_up_usd, label: `${b.card_count} card${b.card_count === 1 ? "" : "s"} added up` },
+  ];
+  if (split) {
+    if ((b.double_counting_removed_usd as number) > 0.005) {
+      rows.push({ sign: "−", amount: b.double_counting_removed_usd as number, label: "same spend counted once" });
+    }
+    if ((b.spend_cap_removed_usd as number) > 0.005) {
+      rows.push({
+        sign: "−",
+        amount: b.spend_cap_removed_usd as number,
+        label: spend != null ? `capped at your 30-day query bill (${usd(spend)})` : "capped at your 30-day query bill",
+      });
+    }
+  } else {
+    rows.push({ sign: "−", amount: b.total_removed_usd, label: "same spend counted once & capped at your real bill" });
+  }
+  rows.push({ sign: "=", amount: k.monthly_savings, label: "net monthly savings", tone: "text-emerald-500 dark:text-emerald-400" });
+  const parts =
+    split && b.query_savings_usd != null && b.storage_savings_usd != null && b.storage_savings_usd > 0.005
+      ? `${usd(b.query_savings_usd)} query + ${usd(b.storage_savings_usd)} storage`
+      : null;
+  return (
+    <div className="mt-3 border-t border-zinc-200 pt-2 text-[11px] leading-relaxed text-zinc-500 dark:border-ink-800">
+      <div className="mb-0.5 font-medium text-zinc-600 dark:text-zinc-300">How we got this number</div>
+      {rows.map((r) => (
+        <div key={r.label} className={cn("flex items-baseline gap-2", r.tone)}>
+          <span className="w-3 shrink-0 text-center font-mono">{r.sign}</span>
+          <span className="w-20 shrink-0 text-right font-mono">{usd(r.amount)}</span>
+          <span className="min-w-0">{r.label}</span>
+        </div>
+      ))}
+      {parts && <div className="mt-0.5 pl-[6.5rem] text-zinc-400">{parts}</div>}
     </div>
   );
 }

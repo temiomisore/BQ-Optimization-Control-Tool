@@ -107,6 +107,14 @@ class TestPricing(unittest.TestCase):
         items.append(card(rule="C1-05", target=("p", "d", None), net=50, pool="storage:p.d", spend=200))
         out = pricing.deoverlap_total(items, ceilings={"compute": 1000})
         self.assertEqual((out["total"], out["storage_usd"]), (1050.0, 50.0))
+        # Breakdown adds up: $1,950 of cards - $800 double counting - $100 over the bill = $1,050.
+        # (W-01's $800 counts as $0: the table + query fixes already use up the $1,000 bill.)
+        self.assertEqual(out["naive_total"], 1950.0)
+        self.assertEqual(out["before_cap_total"], 1150.0)      # 600 + 500 + 800 x 0 + 50
+        self.assertEqual(out["double_counting_removed"], 800.0)
+        self.assertEqual(out["spend_cap_removed"], 100.0)
+        self.assertAlmostEqual(out["naive_total"] - out["double_counting_removed"] - out["spend_cap_removed"],
+                               out["total"], places=2)
 
     def test_single_table_query_card_joins_that_tables_pool(self):
         q = card(rule="C4-01", target=("p", "queries", "h1"), net=50)
@@ -428,6 +436,19 @@ class TestReviewAppPermissions(unittest.TestCase):
         self.assertEqual(eng["kpis"]["monthly_savings"], 700.0)
         self.assertIsNone(eng["kpis"]["compute_spend_30d_usd"])
         self.assertNotIn("spend_ceilings", eng)
+
+        # "How we got this number": FinOps sees each step; engineering sees only the combined
+        # amount removed (the split would reveal the bill).
+        fb = fin["kpis"]["headline_breakdown"]
+        self.assertEqual(fb["cards_added_up_usd"], 1600.0)
+        self.assertEqual(fb["card_count"], 2)
+        self.assertAlmostEqual(fb["cards_added_up_usd"] - fb["double_counting_removed_usd"]
+                               - fb["spend_cap_removed_usd"], fin["kpis"]["monthly_savings"], places=2)
+        self.assertEqual(fb["total_removed_usd"], 630.0)
+        eb = eng["kpis"]["headline_breakdown"]
+        self.assertEqual((eb["cards_added_up_usd"], eb["card_count"]), (700.0, 1))
+        for hidden in ("double_counting_removed_usd", "spend_cap_removed_usd", "query_savings_usd", "storage_savings_usd"):
+            self.assertIsNone(eb[hidden], hidden)
 
     def test_api_decision_403_for_non_finops(self):
         client = self.main.app.test_client()

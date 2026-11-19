@@ -201,6 +201,17 @@ export interface Dashboard {
     annual_savings: number;
     monthly_savings_gross_sum?: number;
     overlap_removed_usd?: number;
+    /** cards added up - same spend counted once - capped at the real bill = monthly_savings.
+     *  The split fields are null for non-FinOps viewers (they would reveal the bill). */
+    headline_breakdown?: {
+      card_count: number;
+      cards_added_up_usd: number;
+      double_counting_removed_usd: number | null;
+      spend_cap_removed_usd: number | null;
+      query_savings_usd: number | null;
+      storage_savings_usd: number | null;
+      total_removed_usd: number;
+    };
     overlapping_cards?: number;
     /** True when the headline hit the actual-spend cap. */
     headline_capped_at_spend?: boolean;

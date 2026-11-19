@@ -396,6 +396,10 @@ def deoverlap_total(items: Iterable[Mapping], value_key: str = "net_monthly_valu
             left = 1.0
         billing_counted += b["savings"] * left
     compute_total = compute_fixes + billing_counted
+    # Totals after removing double counting but BEFORE the actual-spend cap, so the UI can
+    # show how much each step took off the plain sum of the cards.
+    compute_before_cap = compute_total
+    storage_before_cap = by_kind.get(STORAGE, 0.0)
 
     capped: list[str] = []
     if compute_ceiling is not None and compute_total > compute_ceiling:
@@ -408,10 +412,15 @@ def deoverlap_total(items: Iterable[Mapping], value_key: str = "net_monthly_valu
         capped.append(STORAGE)
 
     total = round(sum(by_kind.values()), 2)
+    before_cap = round(compute_before_cap + storage_before_cap + by_kind.get(None, 0.0), 2)
     return {
         "total": total,
         "naive_total": round(naive, 2),
         "overlap_removed": round(max(naive - total, 0.0), 2),
+        # naive_total - double_counting_removed - spend_cap_removed == total
+        "before_cap_total": before_cap,
+        "double_counting_removed": round(max(naive - before_cap, 0.0), 2),
+        "spend_cap_removed": round(max(before_cap - total, 0.0), 2),
         "pools": len(pools),
         "overlapping_cards": overlapping,
         "compute_usd": round(by_kind.get(COMPUTE, 0.0), 2),
